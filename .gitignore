@@ -1,0 +1,13 @@
+.DS_Store
+.localized
+*.pkg
+*.log
+~$*
+Screenshot *.png
+download*.png
+
+# BullPit runtime and dependency artifacts
+bullpit/node_modules/
+bullpit/store-backup.json
+bullpit/.DS_Store
+bullpit/public/.DS_Store
