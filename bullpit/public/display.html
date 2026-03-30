@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bull Pit — Central Display</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #020817; overflow: hidden; }
+    #loading {
+      position: fixed; inset: 0; background: #020817;
+      display: flex; align-items: center; justify-content: center;
+      flex-direction: column; gap: 16px;
+      font-family: monospace; color: #475569; font-size: 14px;
+    }
+    #loading .logo { font-size: 48px; font-weight: 900; color: #00f5c4; }
+  </style>
+</head>
+<body>
+  <div id="loading">
+    <div class="logo">BULL PIT</div>
+    <div>Loading central display...</div>
+  </div>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+  <script>
+    window.storage = {
+      async get(key) {
+        try {
+          const r = await fetch(`/store?key=${encodeURIComponent(key)}`);
+          const d = await r.json();
+          return d.value !== null ? { value: d.value } : null;
+        } catch { return null; }
+      },
+      async set(key, value) {
+        try {
+          await fetch("/store", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ key, value }),
+          });
+          return { value };
+        } catch { return null; }
+      },
+      async delete(key) {
+        try {
+          await fetch(`/store?key=${encodeURIComponent(key)}`, { method: "DELETE" });
+          return { deleted: true };
+        } catch { return null; }
+      },
+      async list(prefix) {
+        try {
+          const r = await fetch(`/store?prefix=${encodeURIComponent(prefix || "")}`);
+          const d = await r.json();
+          return { keys: d.keys };
+        } catch { return { keys: [] }; }
+      },
+    };
+  </script>
+
+  <script type="text/javascript" data-presets="react" src="/central-display.js?v=20260330-02"></script>
+
+  <script>
+    window.addEventListener("load", () => {
+      document.getElementById("loading").style.display = "none";
+      const root = document.getElementById("root");
+      if (typeof CentralDisplay !== "undefined") {
+        ReactDOM.createRoot(root).render(React.createElement(CentralDisplay));
+      } else {
+        root.innerHTML = '<div style="color:red;padding:40px;font-family:monospace">Error: CentralDisplay not found. Check console (F12).</div>';
+      }
+    });
+  </script>
+</body>
+</html>
+```
+
+---
+
+## Step 4 — Put your JSX files in the right place
+
+Take the two files you've been working on:
+- `stock-market-sim-v5.jsx`
+- `central-display.js`
+
+Copy both of them into the `public` folder inside `bullpit`.
+
+Your folder should now look exactly like this:
+```
+Desktop/
+└── bullpit/
+    ├── server.js
+    └── public/
+        ├── index.html
+        ├── display.html
+        ├── stock-market-sim-v5.jsx
+        └── central-display.js

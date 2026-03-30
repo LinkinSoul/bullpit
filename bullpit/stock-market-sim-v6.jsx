@@ -1,0 +1,11097 @@
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+const INITIAL_CASH  = 100000;
+const TICK_MS       = 2000;           // faster ticks for 60 teams
+const HISTORY_LEN   = 60;
+const TOTAL_ROUNDS  = 7;
+const BUFFER_SECS         = 90;   // standard between-round buffer
+const POLITICAL_BUFFER_SECS = 30; // shorter buffer after GM political shock
+const DERIVATIVE_SETTLEMENT_VIEW_SECS = 5;
+const PREDICTION_POLL_SECS  = 30;
+const PREDICTION_REVEAL_SECS = 5;
+const BRIEFING_SECS       = 90;   // auto-start countdown on briefing modal
+const TAX_RATE      = 0.20;           // 20% profit tax
+const SCORE_WRITE_INTERVAL = 10000;   // write scores every 10s (60-team optimisation)
+const NEWS_HISTORY_LIMIT = 120;
+const MAX_TEAMS     = 60;
+const BASE_SPREAD_RATE = 0.0015;      // 15 bps base execution spread
+const MARGIN_CALL_GRACE_SECS = 12;
+const CRISIS_ROUNDS = [3, 6, 7];
+const TRADE_FEED_PREFIX = "cd:trade:";
+const ORDER_FLOW_WINDOW_MS = 45000;
+const ORDER_FLOW_POLL_MS = 2000;
+const ORDER_FLOW_MAX_EVENTS = 800;
+const LEADERBOARD_POLL_MS = 8000;
+const STORAGE_SYNC_POLL_MS = 1500;
+const TEAM_STATE_POLL_MS = 2500;
+const SERVER_PORTFOLIO_AUTH = true;
+
+// Per-round durations: R1=8min, R2=10, R3=10, R4=10, R5=10, R6=8, R7=12
+const DEFAULT_ROUND_DURATIONS = [480, 600, 600, 600, 600, 480, 720];
+
+// Round identity: storyline, sentiment, volatility, and funding stress regime
+const ROUND_RULES = [
+  {
+    round:1, name:"The Hawk Returns", color:"#00f5c4", icon:"🏛️",
+    storyline:"A surprise Fed shock resets the cost of capital across America.",
+    volMult:0.8,     sentLock:null,   leaderHidden:false,
+    tax:false,       liquidate:false,
+    initialMargin:0.40, maintenanceMargin:0.35, borrowRate:0.005, fundingRate:0.003, spreadMult:1.00,
+    briefing:"Fed hawkishness reprices risk. Teams can carry positions, but leverage and shorts now incur real costs.",
+    gmNote:"Open with the rate-hike shock. Explain the new regime: no liquidation, no reset, only margin, borrow cost, and funding stress."
+  },
+  {
+    round:2, name:"Silicon Iron Curtain", color:"#fbbf24", icon:"🛰️",
+    storyline:"Washington hardens industrial policy and export controls in the tech war.",
+    volMult:1.1,     sentLock:null,   leaderHidden:false,
+    tax:false,       liquidate:false,
+    initialMargin:0.45, maintenanceMargin:0.40, borrowRate:0.007, fundingRate:0.005, spreadMult:1.10,
+    briefing:"Policy risk rises. Chip, defense, and supply-chain names decouple. Carry costs creep higher.",
+    gmNote:"Frame this round as American industrial policy meeting geopolitical rivalry. Let teams infer winners and losers from the event, not ticker hints."
+  },
+  {
+    round:3, name:"Oil Strait Crisis", color:"#ef4444", icon:"🛢️",
+    storyline:"A Middle East shipping shock drives oil higher and liquidity lower.",
+    volMult:1.35,    sentLock:"bear", leaderHidden:false,
+    tax:false,       liquidate:false,
+    initialMargin:0.55, maintenanceMargin:0.50, borrowRate:0.012, fundingRate:0.009, spreadMult:1.35,
+    briefing:"This is the first true stress test. No liquidation safety net. If teams over-lever, margin calls will force de-risking.",
+    gmNote:"Announce that Round 3 is a liquidity crunch, not a reset. Energy can rip, but funding and spread stress punish reckless exposure."
+  },
+  {
+    round:4, name:"Debt Ceiling Roulette", color:"#f97316", icon:"🏦",
+    storyline:"Treasury stress and Washington brinkmanship rattle funding markets.",
+    volMult:1.25,    sentLock:null,   leaderHidden:false,
+    tax:false,       liquidate:false,
+    initialMargin:0.50, maintenanceMargin:0.45, borrowRate:0.010, fundingRate:0.008, spreadMult:1.25,
+    briefing:"Funding markets wobble. Balance-sheet discipline matters more than raw conviction.",
+    gmNote:"Push the Treasury/funding stress angle. This round should reward teams that preserve optionality and avoid crowded leverage."
+  },
+  {
+    round:5, name:"Election-Year America", color:"#a78bfa", icon:"🗳️",
+    storyline:"Industrial subsidies, regulation, and election rhetoric scramble sector leadership.",
+    volMult:1.15,    sentLock:null,   leaderHidden:true,
+    tax:false,       liquidate:false,
+    initialMargin:0.52, maintenanceMargin:0.46, borrowRate:0.011, fundingRate:0.009, spreadMult:1.15,
+    briefing:"The leaderboard goes dark. Teams must trade the policy narrative, not other teams' behavior.",
+    gmNote:"Keep the board hidden. Make this round about conviction under uncertainty and policy interpretation."
+  },
+  {
+    round:6, name:"Credit Crack", color:"#fb923c", icon:"⚡",
+    storyline:"Credit spreads blow out and recession fear becomes undeniable.",
+    volMult:1.7,     sentLock:null,   leaderHidden:false,
+    tax:false,       liquidate:false,
+    initialMargin:0.60, maintenanceMargin:0.55, borrowRate:0.016, fundingRate:0.013, spreadMult:1.50,
+    briefing:"Credit stress widens spreads and punishes weak balance sheets. Borrowing and leverage become expensive.",
+    gmNote:"Use volatility, but anchor it to credit stress. If anyone is overextended, Round 6 should expose it immediately."
+  },
+  {
+    round:7, name:"America Reprices", color:"#e879f9", icon:"🦅",
+    storyline:"The final round reprices everything: growth, inflation, geopolitics, and policy credibility.",
+    volMult:2.0,     sentLock:null,   leaderHidden:false,
+    tax:false,       liquidate:false,
+    initialMargin:0.65, maintenanceMargin:0.60, borrowRate:0.020, fundingRate:0.017, spreadMult:1.60,
+    briefing:"No reset. No mercy. All prior decisions carry into final settlement under maximum funding stress.",
+    gmNote:"Make the finale feel like a repricing of the entire American macro story. The winner should be the team that managed risk best all game."
+  }
+];
+
+// Power-up cards (GM one-time use)
+const POWERUP_CARDS = [
+  { id:"tsunami",   icon:"🌊", name:"Tsunami",     color:"#ef4444", desc:"Entire market crashes 15% instantly",                effect:{ type:"market",    pct:-15 } },
+  { id:"moonshot",  icon:"🚀", name:"Moon Shot",   color:"#fbbf24", desc:"One random stock surges 40% for 60 seconds",         effect:{ type:"spike",     pct:40, duration:60 } },
+  { id:"circuit",   icon:"⛔", name:"Circuit Breaker", color:"#38bdf8", desc:"Market-wide trading halt for 45 seconds — prices pause as well", effect:{ type:"circuit", duration:45 } },
+  { id:"rotation",  icon:"🔄", name:"Sector Rotation", color:"#e879f9", desc:"One sector rallies 12% while another drops 12% instantly",       effect:{ type:"rotation", pct:12 } },
+  { id:"polshock",  icon:"🏛️", name:"Political Shock", color:"#f97316", desc:"Fire a random macro-economic political event mid-round — immediate sector-wide price impact", effect:{ type:"political" } },
+];
+
+
+// ─── PREDICTION MARKET QUESTIONS ──────────────────────────────────────────────
+// One per round. Tests specific economic concept. No sector hints in question.
+// GM sees correct answer + explanation. Players must reason from first principles.
+const PREDICTION_QUESTIONS = [
+  {
+    round: 1,
+    concept: "Supply and Demand",
+    question: "The central bank signals it may raise interest rates next quarter. What happens to the overall market in the SHORT TERM?",
+    options: [
+      { id:"a", text:"Markets rise — investors celebrate economic strength" },
+      { id:"b", text:"No effect — rates are only relevant to banks" },
+      { id:"c", text:"Markets fall — higher rates mean higher discount rates on future earnings" },
+      { id:"d", text:"Markets are unpredictable — fundamentals don't matter" },
+    ],
+    correct: "c",
+    explanation: "Higher interest rates increase the discount rate in DCF valuation, reducing the present value of future cash flows. Growth stocks with far-future earnings are hit hardest. This is the core inverse relationship between rates and equity valuations.",
+    bonus: 0.08
+  },
+  {
+    round: 2,
+    concept: "Monetary Policy & Asset Bubbles",
+    question: "Central bank has flooded markets with cheap money for 2 years (QE). Sentiment is BULL. Which risk should prudent investors watch for?",
+    options: [
+      { id:"a", text:"Deflation — too much money causes prices to fall" },
+      { id:"b", text:"Currency appreciation — more money means stronger currency" },
+      { id:"c", text:"No risk — bull markets always continue" },
+      { id:"d", text:"Asset bubble — cheap money inflates valuations beyond fundamentals" },
+    ],
+    correct: "d",
+    explanation: "Quantitative easing lowers the risk-free rate and pushes investors into riskier assets (search for yield). This inflates asset prices beyond what fundamentals justify — creating an asset bubble. When rates eventually rise, valuations correct sharply.",
+    bonus: 0.08
+  },
+  {
+    round: 3,
+    concept: "Negative Demand Shock & Defensive vs Cyclical",
+    question: "The economy enters recession. GDP contracts 3%. Which portfolio strategy is most likely to PRESERVE capital?",
+    options: [
+      { id:"a", text:"Concentrate in healthcare and food — inelastic demand sectors" },
+      { id:"b", text:"All-in on manufacturing and logistics — infrastructure is always needed" },
+      { id:"c", text:"Buy more technology — innovation continues regardless of economy" },
+      { id:"d", text:"All-in on ESG — green transition is unstoppable" },
+    ],
+    correct: "a",
+    explanation: "Defensive sectors with price-inelastic demand (healthcare, food staples) are recession-resistant because consumers cannot defer these purchases. Cyclical sectors (manufacturing, logistics, tech) suffer as demand falls and capex is cut.",
+    bonus: 0.08
+  },
+  {
+    round: 4,
+    concept: "Sector Rotation & Comparative Advantage",
+    question: "Capital is visibly rotating between sectors. Two sectors are surging, two are crashing. What economic principle drives sector rotation?",
+    options: [
+      { id:"a", text:"Random walk — markets have no memory or pattern" },
+      { id:"b", text:"Relative valuation and risk-adjusted return — capital flows to better risk/reward" },
+      { id:"c", text:"Insider trading — institutions always know more" },
+      { id:"d", text:"Calendar effects — certain months are always better" },
+    ],
+    correct: "b",
+    explanation: "Sector rotation is driven by rational capital allocation — investors continuously compare risk-adjusted returns across sectors. When macro conditions change (e.g., rate hike), sectors with better relative value attract flows from those with worse outlooks.",
+    bonus: 0.08
+  },
+  {
+    round: 5,
+    concept: "Information Asymmetry & Market Efficiency",
+    question: "DARK POOL ROUND: You cannot see the leaderboard. How does hidden information affect rational decision-making?",
+    options: [
+      { id:"a", text:"No effect — prices already reflect all information (strong-form efficiency)" },
+      { id:"b", text:"Makes trading impossible — you need to know others' positions" },
+      { id:"c", text:"Hidden information benefits everyone equally" },
+      { id:"d", text:"Forces you to trade on fundamentals alone — removes behavioural bias" },
+    ],
+    correct: "d",
+    explanation: "Information asymmetry is a core market failure. When leaderboard data is removed, traders must rely on fundamental analysis rather than anchoring to others' positions. This tests pure economic reasoning — the same condition as trading illiquid assets with no comparable transactions.",
+    bonus: 0.08
+  },
+  {
+    round: 6,
+    concept: "Stagflation — The Policy Dilemma",
+    question: "STAGFLATION: High inflation AND slow growth simultaneously. Why is this the hardest macro regime for policymakers?",
+    options: [
+      { id:"a", text:"Rate hikes cure inflation but worsen growth — no good policy option exists" },
+      { id:"b", text:"Fiscal stimulus solves both problems simultaneously" },
+      { id:"c", text:"Stagflation is impossible — inflation and slow growth cannot coexist" },
+      { id:"d", text:"Central banks should ignore inflation and focus on growth" },
+    ],
+    correct: "a",
+    explanation: "Stagflation creates a policy dilemma: contractionary policy (rate hikes) fights inflation but further suppresses growth and increases unemployment. Expansionary policy boosts growth but worsens inflation. This is why 1970s stagflation was so damaging — no policy tool addresses both simultaneously.",
+    bonus: 0.08
+  },
+  {
+    round: 7,
+    concept: "Full Market Cycle — Capital Allocation",
+    question: "GRAND FINAL: All teams start equal at $100,000. You have 12 minutes. What does modern portfolio theory say about optimal allocation?",
+    options: [
+      { id:"a", text:"Concentrate in one sector — highest conviction gives highest return" },
+      { id:"b", text:"Hold 100% cash — preserve capital when uncertain" },
+      { id:"c", text:"Diversify across uncorrelated assets — maximise Sharpe ratio" },
+      { id:"d", text:"All-in on the market index — passive beats active always" },
+    ],
+    correct: "c",
+    explanation: "Modern Portfolio Theory (Markowitz) shows that diversification across uncorrelated assets improves the risk-adjusted return (Sharpe ratio) without sacrificing expected return. In a competitive simulation, the winner is often the team that balances return AND risk — not just the highest absolute gainer.",
+    bonus: 0.08
+  },
+];
+const ROUND_LABELS = ROUND_RULES.map(rule => `R${rule.round} · ${rule.name}`);
+
+const ROUND_STORYLINES = [
+  {
+    round: 1,
+    arc: "The Hawk Returns",
+    opening: {
+      id: "r1_open_higher_for_longer",
+      round: 1,
+      stage: "opening",
+      theme: "rates",
+      tag: "ROUND STORY",
+      icon: "🏛️",
+      headline: "Fed Signals Higher-for-Longer Rates After Sticky Core PCE",
+      subheadline: "Washington shifts the national conversation back to inflation, yields, and the cost of capital.",
+      concept: "Higher real yields raise discount rates, reward balance-sheet strength, and pressure long-duration equities before they hit defensive cash generators.",
+      question: "If Treasury yields stay elevated, which sector loses valuation support first and which one gains pricing power?",
+      storylineBlurb: "America starts the game with monetary policy back in command. The first question is whether teams understand that higher rates hurt duration and leverage before they hurt headlines.",
+      sectorMap: { banking: 16, tech: -18, esg: -14, manufacturing: -10, logistics: -8, healthcare: -4, food: -3, energy: -4, etf: -12 }
+    },
+    beats: [
+      {
+        id: "r1_beat_front_end",
+        round: 1,
+        stage: "silent",
+        theme: "rates",
+        tag: "YIELD SHOCK",
+        at: 0.30,
+        icon: "📉",
+        headline: "Two-year Treasury yield breaks to a fresh cycle high",
+        subheadline: "Front-end rates jump as traders price fewer cuts and tighter financial conditions.",
+        concept: "Short-end yield shocks hit valuations and refinancing math immediately.",
+        question: "Does this shock hit earnings or multiples first?",
+        storylineBlurb: "The bond market reinforces the Fed message and sharpens the repricing of risk.",
+        sectorMap: { banking: 8, tech: -10, esg: -8, manufacturing: -5, etf: -6 }
+      },
+      {
+        id: "r1_beat_funding_costs",
+        round: 1,
+        stage: "silent",
+        theme: "rates",
+        tag: "FUNDING UPDATE",
+        at: 0.68,
+        icon: "🏦",
+        headline: "Corporate treasurers warn that refinancing windows are narrowing",
+        subheadline: "Debt desks reprice funding spreads for leveraged and rate-sensitive businesses.",
+        concept: "Higher rates translate into tighter private funding conditions before they appear in macro data.",
+        question: "Which sectors can absorb higher financing costs without giving up growth?",
+        storylineBlurb: "America's cost of money is no longer theoretical. The market begins rewarding companies that can self-fund.",
+        sectorMap: { banking: 6, manufacturing: -8, logistics: -7, tech: -6, healthcare: -2, etf: -5 }
+      }
+    ]
+  },
+  {
+    round: 2,
+    arc: "Silicon Iron Curtain",
+    opening: {
+      id: "r2_open_export_controls",
+      round: 2,
+      stage: "opening",
+      theme: "trade",
+      tag: "ROUND STORY",
+      icon: "🛰️",
+      headline: "White House Expands AI Chip Export Controls and Domestic Capacity Mandates",
+      subheadline: "America chooses strategic resilience over frictionless global supply chains.",
+      concept: "Export controls cut addressable markets for some tech leaders, while industrial policy redirects capital toward domestic manufacturing, logistics bottlenecks, and secure financing.",
+      question: "Who wins first from reshoring pressure: domestic capacity builders or global tech champions?",
+      storylineBlurb: "The US moves from talking about industrial policy to enforcing it. Teams now have to trade geopolitics, compliance, and domestic capex together.",
+      sectorMap: { manufacturing: 14, banking: 6, tech: -14, logistics: -8, etf: -8, energy: 3, healthcare: 2, esg: -2, food: -2 }
+    },
+    beats: [
+      {
+        id: "r2_beat_secure_cloud",
+        round: 2,
+        stage: "silent",
+        theme: "trade",
+        tag: "PROCUREMENT",
+        at: 0.34,
+        icon: "🛡️",
+        headline: "Pentagon accelerates secure-cloud and domestic fab procurement",
+        subheadline: "Federal spending shifts toward trusted suppliers and US-based capacity.",
+        concept: "Government procurement can redirect sector cash flows even when the broader market is uncertain.",
+        question: "Does federal demand offset export demand destruction for the same supply chain?",
+        storylineBlurb: "Industrial policy stops being abstract and starts showing up in order books.",
+        sectorMap: { manufacturing: 10, tech: 4, banking: 3, logistics: 2, etf: 2 }
+      },
+      {
+        id: "r2_beat_customs_delay",
+        round: 2,
+        stage: "silent",
+        theme: "trade",
+        tag: "SUPPLY CHAIN",
+        at: 0.71,
+        icon: "🚢",
+        headline: "Customs inspections and licensing checks slow trans-Pacific shipments",
+        subheadline: "Longer clearance times raise inventory risk and delivery uncertainty.",
+        concept: "Trade friction often shows up in logistics and working capital before it hits headline GDP.",
+        question: "Which businesses suffer first when inventories are delayed instead of cancelled?",
+        storylineBlurb: "The geopolitical story spills into freight, inventory timing, and supplier confidence.",
+        sectorMap: { logistics: -10, tech: -6, manufacturing: -6, food: -3, etf: -4 }
+      }
+    ]
+  },
+  {
+    round: 3,
+    arc: "Oil Strait Crisis",
+    opening: {
+      id: "r3_open_strait_crisis",
+      round: 3,
+      stage: "opening",
+      theme: "oil",
+      tag: "ROUND STORY",
+      icon: "🛢️",
+      headline: "US Naval Escorts Begin After Gulf Shipping Attacks Send Crude Soaring",
+      subheadline: "America faces the classic wartime inflation problem: energy security now collides with growth.",
+      concept: "An oil shock boosts producers while squeezing transport, manufacturing margins, and consumer purchasing power through higher input costs.",
+      question: "What gets hit first in an oil shock: cyclical demand, freight costs, or valuation multiples?",
+      storylineBlurb: "Round 3 becomes the first true stress regime. Players have to trade inflation, shipping risk, and liquidity together without a reset.",
+      sectorMap: { energy: 30, esg: 12, logistics: -20, manufacturing: -14, food: -10, tech: -8, banking: -5, healthcare: -4, etf: -10 }
+    },
+    beats: [
+      {
+        id: "r3_beat_spr_release",
+        round: 3,
+        stage: "silent",
+        theme: "oil",
+        tag: "WHITE HOUSE RESPONSE",
+        at: 0.32,
+        icon: "🏛️",
+        headline: "White House authorizes a strategic petroleum reserve release",
+        subheadline: "The administration tries to cap inflation expectations without solving the underlying security problem.",
+        concept: "Policy can smooth spot prices temporarily while leaving structural scarcity and risk premia intact.",
+        question: "Does a reserve release help transport stocks more than it hurts producers?",
+        storylineBlurb: "Washington buys time, not certainty. Relief rallies may not last.",
+        sectorMap: { logistics: 7, manufacturing: 4, food: 3, energy: -8, etf: 3 }
+      },
+      {
+        id: "r3_beat_freight_surcharge",
+        round: 3,
+        stage: "silent",
+        theme: "oil",
+        tag: "COST PASS-THROUGH",
+        at: 0.70,
+        icon: "⛽",
+        headline: "Fuel surcharges spread through trucking, air freight, and packaging",
+        subheadline: "Corporate buyers begin absorbing the second-round effects of higher oil and insurance costs.",
+        concept: "Second-order inflation shocks spread through logistics and consumer staples even after the first energy move.",
+        question: "Which sectors can pass through higher fuel costs fastest?",
+        storylineBlurb: "The market stops trading crude alone and starts trading cost pass-through discipline.",
+        sectorMap: { logistics: -9, food: -6, manufacturing: -5, healthcare: -2, etf: -4 }
+      }
+    ]
+  },
+  {
+    round: 4,
+    arc: "Debt Ceiling Roulette",
+    opening: {
+      id: "r4_open_debt_ceiling",
+      round: 4,
+      stage: "opening",
+      theme: "funding",
+      tag: "ROUND STORY",
+      icon: "🏦",
+      headline: "Treasury Contingency Planning Leaks as Debt-Ceiling Talks Stall in Washington",
+      subheadline: "America's risk-free benchmark suddenly stops looking risk-free to the market.",
+      concept: "Treasury stress widens funding spreads, hits banks and cyclicals first, and rewards businesses seen as cash-rich or recession-resilient.",
+      question: "If Treasury markets wobble, which sector feels the balance-sheet pressure before anyone else?",
+      storylineBlurb: "Round 4 is not about default probabilities alone. It is about what happens when the collateral at the center of the system becomes politically noisy.",
+      sectorMap: { banking: -22, manufacturing: -10, logistics: -8, tech: -7, healthcare: 6, food: 5, energy: 2, esg: -4, etf: -16 }
+    },
+    beats: [
+      {
+        id: "r4_beat_repo_tightness",
+        round: 4,
+        stage: "silent",
+        theme: "funding",
+        tag: "FUNDING MARKET",
+        at: 0.33,
+        icon: "📄",
+        headline: "Repo desks report tighter collateral conditions and elevated haircuts",
+        subheadline: "Dealers ration balance sheet as Washington uncertainty leaks into funding markets.",
+        concept: "Funding stress reduces the market's willingness to warehouse risk even before a macro slowdown appears.",
+        question: "Who suffers more from tighter repo and collateral conditions: banks or levered cyclicals?",
+        storylineBlurb: "The debt-ceiling story migrates from politics into plumbing.",
+        sectorMap: { banking: -10, etf: -6, manufacturing: -5, tech: -4 }
+      },
+      {
+        id: "r4_beat_stopgap",
+        round: 4,
+        stage: "silent",
+        theme: "funding",
+        tag: "CAPITOL HILL",
+        at: 0.72,
+        icon: "🧾",
+        headline: "Congressional leaders signal a stopgap path but funding distrust lingers",
+        subheadline: "The headline relief is real, yet term funding and confidence recover only partially.",
+        concept: "Political relief can tighten spreads, but confidence rarely snaps all the way back at once.",
+        question: "Which assets mean-revert fastest after Washington delivers partial relief?",
+        storylineBlurb: "The tape gets a relief bounce, but the credibility discount remains.",
+        sectorMap: { banking: 8, etf: 6, manufacturing: 4, logistics: 3, healthcare: -1 }
+      }
+    ]
+  },
+  {
+    round: 5,
+    arc: "Election-Year America",
+    opening: {
+      id: "r5_open_election_platform",
+      round: 5,
+      stage: "opening",
+      theme: "election",
+      tag: "ROUND STORY",
+      icon: "🗳️",
+      headline: "Election-Year Tariff, Subsidy, and Drug-Pricing Plans Scramble Sector Leadership",
+      subheadline: "Policy rhetoric becomes tradeable because the White House race now has corporate winners and losers.",
+      concept: "Election policy mixes targeted subsidies, tariff threats, and regulatory headlines that move sectors through cash flow expectations and compliance risk rather than broad market beta.",
+      question: "When campaign rhetoric hardens, which sectors are being taxed by uncertainty and which are being subsidized by narrative?",
+      storylineBlurb: "The leaderboard is hidden because Round 5 is about conviction under incomplete information, not crowd-following.",
+      sectorMap: { manufacturing: 12, energy: 8, logistics: 4, banking: 3, tech: -10, healthcare: -12, esg: -6, food: 2, etf: -5 }
+    },
+    beats: [
+      {
+        id: "r5_beat_drug_pricing",
+        round: 5,
+        stage: "silent",
+        theme: "election",
+        tag: "CAMPAIGN TRAIL",
+        at: 0.36,
+        icon: "💊",
+        headline: "Drug-pricing language hardens as both campaigns chase voter anger",
+        subheadline: "Healthcare margins are repriced as reimbursement and pricing risk move back into focus.",
+        concept: "Election-year rhetoric can compress sector multiples before any law is passed.",
+        question: "How should investors price a policy threat that is not yet legislation?",
+        storylineBlurb: "Healthcare becomes a policy proxy trade rather than a pure defensive asset.",
+        sectorMap: { healthcare: -12, etf: -4, food: 1 }
+      },
+      {
+        id: "r5_beat_factory_credit",
+        round: 5,
+        stage: "silent",
+        theme: "election",
+        tag: "INDUSTRIAL POLICY",
+        at: 0.74,
+        icon: "🏭",
+        headline: "Domestic factory tax credits win new bipartisan support",
+        subheadline: "Capital spending names get fresh life as subsidy risk turns into subsidy probability.",
+        concept: "Targeted fiscal support can overwhelm weak macro sentiment for specific sectors.",
+        question: "Which industries rerate fastest when tax credits improve project economics?",
+        storylineBlurb: "Election noise turns into real capex math for domestic manufacturers.",
+        sectorMap: { manufacturing: 10, logistics: 4, banking: 3, tech: 2, etf: 3 }
+      }
+    ]
+  },
+  {
+    round: 6,
+    arc: "Credit Crack",
+    opening: {
+      id: "r6_open_cre_losses",
+      round: 6,
+      stage: "opening",
+      theme: "credit",
+      tag: "ROUND STORY",
+      icon: "⚡",
+      headline: "Regional-Bank Losses Deepen as Commercial Real Estate Markdowns Spread",
+      subheadline: "America's credit engine starts coughing just as refinancing pressure rises.",
+      concept: "Credit stress widens spreads, starves cyclicals of financing, and pushes capital toward resilience, cash generation, and hedges.",
+      question: "In a credit crack, what breaks first: demand, funding, or confidence?",
+      storylineBlurb: "Round 6 is where weak balance sheets finally meet hard refinancing conditions. Teams that ignored financing risk start paying for it.",
+      sectorMap: { banking: -25, manufacturing: -18, logistics: -14, tech: -12, energy: -8, esg: -5, healthcare: 8, food: 10, etf: -18 }
+    },
+    beats: [
+      {
+        id: "r6_beat_hy_spreads",
+        round: 6,
+        stage: "silent",
+        theme: "credit",
+        tag: "CREDIT MARKETS",
+        at: 0.31,
+        icon: "📉",
+        headline: "High-yield spreads gap wider after a failed refinancing syndication",
+        subheadline: "The market demands more compensation for balance-sheet risk and cyclical exposure.",
+        concept: "Credit spreads punish fragility before equity investors see the full earnings damage.",
+        question: "Which sectors are effectively short liquidity when spreads move like this?",
+        storylineBlurb: "The bond market forces equity traders to confront survival risk.",
+        sectorMap: { banking: -8, manufacturing: -10, logistics: -7, tech: -5, etf: -6 }
+      },
+      {
+        id: "r6_beat_cash_hoarding",
+        round: 6,
+        stage: "silent",
+        theme: "credit",
+        tag: "DEFENSIVE FLOWS",
+        at: 0.69,
+        icon: "🛡️",
+        headline: "Corporate CFOs and households both shift toward cash preservation",
+        subheadline: "Money rotates into resilience as recession math becomes harder to ignore.",
+        concept: "Defensive sectors gain relative support when credit tightness changes behavior across the economy.",
+        question: "Which businesses become relative winners when the economy hoards liquidity?",
+        storylineBlurb: "The market begins rewarding certainty of cash flow over growth optionality.",
+        sectorMap: { healthcare: 5, food: 6, banking: -4, tech: -5, manufacturing: -3, etf: -2 }
+      }
+    ]
+  },
+  {
+    round: 7,
+    arc: "America Reprices",
+    opening: {
+      id: "r7_open_stagflation",
+      round: 7,
+      stage: "opening",
+      theme: "repricing",
+      tag: "ROUND STORY",
+      icon: "🦅",
+      headline: "Inflation Re-accelerates Even as Payroll Growth Misses and Washington Scrambles",
+      subheadline: "America enters the final round with stagflation risk and policy credibility both on trial.",
+      concept: "Stagflation punishes duration and weak balance sheets, supports real-asset cash flow, and makes hedging more valuable than simple directional conviction.",
+      question: "In a stagflation finale, what matters more: being right on direction or being right on risk control?",
+      storylineBlurb: "There is no reset. The final round is the repricing of every macro mistake teams made earlier in the game.",
+      sectorMap: { energy: 18, food: 10, banking: 4, healthcare: 6, tech: -18, manufacturing: -16, logistics: -10, esg: -8, etf: -12 }
+    },
+    beats: [
+      {
+        id: "r7_beat_liquidity_backstop",
+        round: 7,
+        stage: "silent",
+        theme: "repricing",
+        tag: "POLICY RELIEF",
+        at: 0.30,
+        icon: "🏛️",
+        headline: "Treasury officials hint at an emergency market-liquidity backstop",
+        subheadline: "The market gets relief on plumbing even as the macro backdrop stays ugly.",
+        concept: "Liquidity support can lift financial conditions without solving inflation or growth simultaneously.",
+        question: "Which assets bounce hardest when liquidity improves but fundamentals do not?",
+        storylineBlurb: "Final-round relief is real, but incomplete. The good hedge starts mattering more than the hot take.",
+        sectorMap: { banking: 10, etf: 7, tech: 5, manufacturing: 3, energy: -2 }
+      },
+      {
+        id: "r7_beat_tariff_security",
+        round: 7,
+        stage: "silent",
+        theme: "repricing",
+        tag: "FINAL POLICY TWIST",
+        at: 0.73,
+        icon: "🧭",
+        headline: "Security hawks pair new tariff language with domestic build-out promises",
+        subheadline: "The final repricing forces teams to weigh inflation pressure against industrial support.",
+        concept: "The last twist mixes inflationary trade policy with targeted domestic winners, creating a market where hedged portfolios outperform all-in bets.",
+        question: "Who handles a last-minute inflationary policy twist best: hedgers or stock pickers?",
+        storylineBlurb: "The ending is not about a free restart. It is about who still has optionality when America reprices one more time.",
+        sectorMap: { manufacturing: 10, energy: 4, logistics: -6, tech: -5, food: -3, etf: -2 }
+      }
+    ]
+  }
+];
+
+// ─── 7 SECTORS × 5 MNC STOCKS EACH = 35 STOCKS ───────────────────────────────
+const SECTORS = [
+  {
+    id:"healthcare", label:"Healthcare & Pharma", color:"#a78bfa", icon:"⚕️",
+    stocks:[
+      { ticker:"JNJ",  name:"Johnson & Johnson",  basePrice:165, volatility:0.9, mktCap:"$398B", employees:"152K", founded:1886, description:"World's largest healthcare company spanning pharmaceuticals, medical devices, and consumer health products." },
+      { ticker:"PFE",  name:"Pfizer",              basePrice:28,  volatility:1.3, mktCap:"$157B", employees:"83K",  founded:1849, description:"Global biopharmaceutical company known for COVID-19 vaccines, oncology, and rare disease treatments." },
+      { ticker:"NVO",  name:"Novo Nordisk",        basePrice:108, volatility:1.1, mktCap:"$432B", employees:"64K",  founded:1923, description:"Danish pharma leader dominating the global diabetes and obesity drug markets with GLP-1 therapies." },
+      { ticker:"AZN",  name:"AstraZeneca",         basePrice:72,  volatility:1.0, mktCap:"$227B", employees:"83K",  founded:1999, description:"Anglo-Swedish multinational specializing in oncology, cardiovascular, and respiratory medicines." },
+      { ticker:"UNH",  name:"UnitedHealth Group",  basePrice:520, volatility:0.8, mktCap:"$487B", employees:"400K", founded:1977, description:"America's largest health insurer and healthcare services company operating Optum and UnitedHealthcare." },
+      { ticker:"ABBV", name:"AbbVie",              basePrice:172, volatility:1.0, mktCap:"$304B", employees:"50K",  founded:2013, description:"US biopharmaceutical leader known for Humira and Skyrizi, with a strong oncology and immunology pipeline." },
+    ]
+  },
+  {
+    id:"logistics", label:"Logistics", color:"#fb923c", icon:"🚚",
+    stocks:[
+      { ticker:"UPS",  name:"United Parcel Service", basePrice:138, volatility:1.0, mktCap:"$117B", employees:"500K", founded:1907, description:"Global leader in package delivery and supply chain management operating in 220+ countries." },
+      { ticker:"FDX",  name:"FedEx",                 basePrice:245, volatility:1.2, mktCap:"$62B",  employees:"547K", founded:1971, description:"International courier and logistics services with $90B+ revenue serving 220+ countries." },
+      { ticker:"MAER", name:"A.P. Møller-Maersk",    basePrice:112, volatility:1.3, mktCap:"$24B",  employees:"110K", founded:1904, description:"World's largest container shipping company controlling ~17% of global container capacity." },
+      { ticker:"DHER", name:"DHL Group",              basePrice:38,  volatility:1.0, mktCap:"$31B",  employees:"600K", founded:1969, description:"World's leading logistics company with Express, Freight, Supply Chain, and eCommerce divisions." },
+      { ticker:"XPO",  name:"XPO Logistics",          basePrice:92,  volatility:1.4, mktCap:"$11B",  employees:"42K",  founded:2000, description:"Tech-enabled freight transportation company operating the third-largest LTL network in North America." },
+      { ticker:"EXPD", name:"Expeditors International", basePrice:118, volatility:1.1, mktCap:"$18B", employees:"19K", founded:1979, description:"Global logistics company specializing in air and ocean freight forwarding and customs brokerage." },
+    ]
+  },
+  {
+    id:"tech", label:"Tech & Manufacturing", color:"#38bdf8", icon:"💻",
+    stocks:[
+      { ticker:"AAPL", name:"Apple",               basePrice:185, volatility:1.1, mktCap:"$2.9T", employees:"164K", founded:1976, description:"The world's most valuable company, maker of iPhone, Mac, iPad, and Apple Silicon. Leader in premium consumer tech." },
+      { ticker:"MSFT", name:"Microsoft",           basePrice:415, volatility:0.9, mktCap:"$3.1T", employees:"221K", founded:1975, description:"Enterprise software giant powering Azure cloud, Microsoft 365, GitHub, and the Copilot AI ecosystem." },
+      { ticker:"TSLA", name:"Tesla",               basePrice:195, volatility:2.0, mktCap:"$620B", employees:"140K", founded:2003, description:"Electric vehicle and clean energy pioneer with global manufacturing and Full Self-Driving ambitions." },
+      { ticker:"SMSN", name:"Samsung Electronics", basePrice:68,  volatility:1.2, mktCap:"$318B", employees:"270K", founded:1969, description:"South Korea's tech titan dominating memory chips, displays, and flagship Android smartphones globally." },
+      { ticker:"SIEM", name:"Siemens",             basePrice:182, volatility:0.9, mktCap:"$112B", employees:"320K", founded:1847, description:"German industrial conglomerate leading in automation, digitalization, smart infrastructure, and rail systems." },
+      { ticker:"NVDA", name:"NVIDIA",              basePrice:875, volatility:2.2, mktCap:"$2.1T", employees:"29K",  founded:1993, description:"Dominant AI chip and GPU maker whose H100 accelerators power the global artificial intelligence revolution." },
+    ]
+  },
+  {
+    id:"food", label:"Food & Agriculture", color:"#4ade80", icon:"🌾",
+    stocks:[
+      { ticker:"NESN", name:"Nestlé",                  basePrice:105, volatility:0.7, mktCap:"$283B", employees:"275K", founded:1866, description:"World's largest food and beverage company with 2000+ brands across 186 countries including Nescafé and KitKat." },
+      { ticker:"ADM",  name:"Archer-Daniels-Midland",  basePrice:58,  volatility:1.1, mktCap:"$27B",  employees:"41K",  founded:1902, description:"Global agricultural commodities trader processing oilseeds, corn, wheat and producing food ingredients." },
+      { ticker:"MDLZ", name:"Mondelēz International",  basePrice:68,  volatility:0.8, mktCap:"$91B",  employees:"91K",  founded:2012, description:"Snacking powerhouse behind Oreo, Cadbury, Milka, and Toblerone sold in 150+ countries worldwide." },
+      { ticker:"BG",   name:"Bunge Global",            basePrice:92,  volatility:1.2, mktCap:"$11B",  employees:"23K",  founded:1818, description:"Leading agribusiness and food company linking farmers to consumers through grain and oilseed operations." },
+      { ticker:"DANO", name:"Danone",                  basePrice:62,  volatility:0.8, mktCap:"$42B",  employees:"96K",  founded:1919, description:"French multinational in dairy, plant-based foods, waters, and specialized nutrition including Activia and Evian." },
+      { ticker:"KO",   name:"Coca-Cola",               basePrice:62,  volatility:0.6, mktCap:"$267B", employees:"79K",  founded:1892, description:"World's most recognised beverage brand selling 2 billion servings daily across 200+ countries." },
+    ]
+  },
+  {
+    id:"banking", label:"Banking & Finance", color:"#fbbf24", icon:"🏦",
+    stocks:[
+      { ticker:"JPM",  name:"JPMorgan Chase",   basePrice:198, volatility:1.0, mktCap:"$573B", employees:"309K", founded:1799, description:"America's largest bank with $3.9T in assets, spanning investment banking, retail, and asset management." },
+      { ticker:"GS",   name:"Goldman Sachs",    basePrice:468, volatility:1.3, mktCap:"$162B", employees:"45K",  founded:1869, description:"Wall Street's premier investment bank known for M&A advisory, trading, and capital markets." },
+      { ticker:"HSBC", name:"HSBC Holdings",    basePrice:42,  volatility:1.0, mktCap:"$163B", employees:"220K", founded:1865, description:"Asia's largest bank with $3T assets operating across 62 countries in retail and investment banking." },
+      { ticker:"BLK",  name:"BlackRock",        basePrice:808, volatility:0.9, mktCap:"$130B", employees:"21K",  founded:1988, description:"World's largest asset manager with $10T+ AUM, known for iShares ETFs and the Aladdin risk platform." },
+      { ticker:"AXP",  name:"American Express", basePrice:225, volatility:1.1, mktCap:"$168B", employees:"74K",  founded:1850, description:"Premium credit card and financial services company known for Centurion, Platinum, and corporate travel cards." },
+      { ticker:"MS",   name:"Morgan Stanley",   basePrice:102, volatility:1.2, mktCap:"$174B", employees:"80K",  founded:1935, description:"Global investment bank and wealth manager with $5T+ in client assets and top-tier M&A advisory." },
+    ]
+  },
+  {
+    id:"esg", label:"ESG", color:"#00f5c4", icon:"🌱",
+    stocks:[
+      { ticker:"ENPH",  name:"Enphase Energy",      basePrice:108, volatility:2.0, mktCap:"$14B", employees:"4K",  founded:2006, description:"Leading manufacturer of microinverter systems for residential and commercial solar energy generation." },
+      { ticker:"VWSYF", name:"Vestas Wind Systems",  basePrice:24,  volatility:1.6, mktCap:"$17B", employees:"30K", founded:1945, description:"World's leading wind turbine manufacturer having installed 170+ GW across 88 countries worldwide." },
+      { ticker:"BEP",   name:"Brookfield Renewable", basePrice:32,  volatility:1.3, mktCap:"$12B", employees:"4K",  founded:1999, description:"One of the world's largest publicly traded renewable power platforms with 33 GW of installed capacity." },
+      { ticker:"ORSTED",name:"Ørsted",               basePrice:38,  volatility:1.8, mktCap:"$12B", employees:"8K",  founded:2006, description:"Danish energy company transformed from fossil fuels to become the world's top offshore wind developer." },
+      { ticker:"FSLR",  name:"First Solar",          basePrice:188, volatility:1.9, mktCap:"$20B", employees:"8K",  founded:1999, description:"America's largest solar panel manufacturer using thin-film technology for utility-scale projects." },
+      { ticker:"NEE",   name:"NextEra Energy",       basePrice:72,  volatility:1.1, mktCap:"$147B", employees:"15K", founded:1925, description:"America's largest electric utility and the world's leading generator of renewable wind and solar energy." },
+    ]
+  },
+  {
+    id:"energy", label:"Energy", color:"#f472b6", icon:"⚡",
+    stocks:[
+      { ticker:"XOM",  name:"ExxonMobil",    basePrice:108, volatility:1.1, mktCap:"$461B", employees:"61K",  founded:1870, description:"World's largest publicly traded oil and gas company spanning exploration, refining, and chemicals." },
+      { ticker:"CVX",  name:"Chevron",        basePrice:152, volatility:1.0, mktCap:"$282B", employees:"43K",  founded:1879, description:"Integrated energy company with major upstream, downstream, and chemical operations in 180+ countries." },
+      { ticker:"SHEL", name:"Shell",          basePrice:68,  volatility:1.0, mktCap:"$207B", employees:"103K", founded:1907, description:"Anglo-Dutch energy giant leading in LNG, integrated gas, and transitioning toward renewable energy solutions." },
+      { ticker:"BP",   name:"BP",             basePrice:38,  volatility:1.2, mktCap:"$95B",  employees:"90K",  founded:1908, description:"British energy major pivoting toward low-carbon energy while maintaining significant oil and gas production." },
+      { ticker:"TTE",  name:"TotalEnergies",  basePrice:65,  volatility:1.1, mktCap:"$148B", employees:"101K", founded:1924, description:"French multinational energy company integrating oil, gas, renewables and electricity across 130+ countries." },
+      { ticker:"SLB",  name:"SLB (Schlumberger)", basePrice:48, volatility:1.3, mktCap:"$68B", employees:"99K", founded:1926, description:"World's largest oilfield services company providing drilling, evaluation, and production technology globally." },
+    ]
+  },
+  {
+    id:"manufacturing", label:"Manufacturing & Industrials", color:"#f97316", icon:"🏭",
+    stocks:[
+      { ticker:"CAT",  name:"Caterpillar",         basePrice:352, volatility:1.1, mktCap:"$178B", employees:"113K", founded:1925, description:"World's largest construction and mining equipment maker. A bellwether for global infrastructure spend and commodity cycles." },
+      { ticker:"HON",  name:"Honeywell",            basePrice:198, volatility:0.9, mktCap:"$132B", employees:"99K",  founded:1906, description:"Industrial conglomerate spanning aerospace, building automation, safety tech and advanced materials across 100+ countries." },
+      { ticker:"MMM",  name:"3M",                  basePrice:112, volatility:1.1, mktCap:"$61B",  employees:"85K",  founded:1902, description:"Diversified manufacturer behind 60,000+ products from Post-it notes to surgical drapes, N95 masks and optical films." },
+      { ticker:"GE",   name:"GE Aerospace",         basePrice:175, volatility:1.3, mktCap:"$190B", employees:"172K", founded:1892, description:"Spun-off aviation division of General Electric making jet engines for 70% of commercial flights worldwide." },
+      { ticker:"ABB",  name:"ABB",                 basePrice:48,  volatility:1.0, mktCap:"$98B",  employees:"105K", founded:1988, description:"Swiss-Swedish electrification and automation giant powering factories, grids and EV charging infrastructure globally." },
+      { ticker:"EMR",  name:"Emerson Electric",    basePrice:108, volatility:1.0, mktCap:"$62B",  employees:"76K",  founded:1890, description:"Industrial automation leader supplying process control, HVAC and measurement instruments to energy and chemical plants." },
+    ]
+  },
+  {
+    id:"etf", label:"Index Funds & ETFs", color:"#e879f9", icon:"📊",
+    stocks:[
+      {
+        ticker:"BPHX",
+        name:"Bull Pit Healthcare Index",
+        basePrice:95,
+        volatility:0.85,
+        mktCap:"$42B",
+        employees:"N/A",
+        founded:2024,
+        description:"Tracks JNJ, PFE, NVO, AZN, UNH & ABBV. Equal-weighted basket of all 6 healthcare & pharma stocks in the simulation. Defensive, low-drama.",
+        constituents:["JNJ","PFE","NVO","AZN","UNH","ABBV"]
+      },
+      {
+        ticker:"BTEC",
+        name:"Bull Pit Tech Giants Fund",
+        basePrice:350,
+        volatility:1.4,
+        mktCap:"$128B",
+        employees:"N/A",
+        founded:2024,
+        description:"Tracks AAPL, MSFT, NVDA, TSLA & SIEM. Captures the full Bull Pit tech sector. NVDA's 2.2x volatility makes this fund swing hard.",
+        constituents:["AAPL","MSFT","NVDA","TSLA","SIEM"]
+      },
+      {
+        ticker:"BGRN",
+        name:"Bull Pit Green Future ETF",
+        basePrice:88,
+        volatility:1.6,
+        mktCap:"$19B",
+        employees:"N/A",
+        founded:2024,
+        description:"Tracks ENPH, FSLR, NEE, BEP & ORSTED. Pure-play renewable energy basket. Explodes on climate policy events, crashes on rate hikes.",
+        constituents:["ENPH","FSLR","NEE","BEP","ORSTED"]
+      },
+      {
+        ticker:"BFIN",
+        name:"Bull Pit Global Finance Index",
+        basePrice:325,
+        volatility:1.05,
+        mktCap:"$86B",
+        employees:"N/A",
+        founded:2024,
+        description:"Tracks JPM, GS, BLK, MS & HSBC. Covers investment banking, asset management and retail banking. Sensitive to Fed rate shocks and sanctions.",
+        constituents:["JPM","GS","BLK","MS","HSBC"]
+      },
+      {
+        ticker:"BCMD",
+        name:"Bull Pit Commodity & Energy ETF",
+        basePrice:90,
+        volatility:1.15,
+        mktCap:"$31B",
+        employees:"N/A",
+        founded:2024,
+        description:"Tracks XOM, CVX, SLB, ADM & BG. Blends oil majors with agricultural commodity giants. Surges on supply shocks, trade wars and embargoes.",
+        constituents:["XOM","CVX","SLB","ADM","BG"]
+      },
+      {
+        ticker:"BMFG",
+        name:"Bull Pit Industrials Index",
+        basePrice:165,
+        volatility:1.05,
+        mktCap:"$58B",
+        employees:"N/A",
+        founded:2024,
+        description:"Tracks CAT, HON, MMM, GE, ABB & EMR. Equal-weighted basket of all 6 manufacturing & industrial stocks. Surges on infrastructure booms, tanks on supply chain crises.",
+        constituents:["CAT","HON","MMM","GE","ABB","EMR"]
+      },
+      {
+        ticker:"BDEF",
+        name:"Bull Pit Defensive All-Weather Fund",
+        basePrice:168,
+        volatility:0.75,
+        mktCap:"$74B",
+        employees:"N/A",
+        founded:2024,
+        description:"CROSS-SECTOR: Picks the steadiest names from Healthcare, Food, Banking & ESG — JNJ, UNH, KO, NESN, JPM, HSBC & NEE. Lowest volatility fund in the game. Capital preservation over growth.",
+        constituents:["JNJ","UNH","KO","NESN","JPM","HSBC","NEE"],
+        crossSector:true
+      },
+      {
+        ticker:"BCRSH",
+        name:"Bull Pit Crisis Hedge Index",
+        basePrice:82,
+        volatility:1.1,
+        mktCap:"$28B",
+        employees:"N/A",
+        founded:2024,
+        description:"CROSS-SECTOR: Built for storms — draws from Healthcare, Energy & ESG defensives. Tracks NVO, PFE, XOM, BEP, ORSTED, JNJ & ADM. Historically outperforms when political shocks hit.",
+        constituents:["NVO","PFE","XOM","BEP","ORSTED","JNJ","ADM"],
+        crossSector:true
+      },
+      {
+        ticker:"BGROW",
+        name:"Bull Pit Growth Engine ETF",
+        basePrice:265,
+        volatility:1.85,
+        mktCap:"$52B",
+        employees:"N/A",
+        founded:2024,
+        description:"CROSS-SECTOR: High-octane growth across Tech & ESG. Tracks NVDA, TSLA, ENPH, FSLR, AAPL, VWSYF & MSFT. Highest upside of any fund — and highest downside.",
+        constituents:["NVDA","TSLA","ENPH","FSLR","AAPL","VWSYF","MSFT"],
+        crossSector:true
+      },
+      {
+        ticker:"BALL",
+        name:"Bull Pit Total Market Index",
+        basePrice:155,
+        volatility:0.95,
+        mktCap:"$420B",
+        employees:"N/A",
+        founded:2024,
+        description:"TOTAL MARKET: Tracks every single stock in the Bull Pit universe — all 53 stocks across all 9 sectors, equal weighted. The ultimate diversified play. If the whole market moves, so do you.",
+        constituents:["JNJ","PFE","NVO","AZN","UNH","ABBV","UPS","FDX","MAER","DHER","XPO","EXPD","AAPL","MSFT","TSLA","SMSN","SIEM","NVDA","NESN","ADM","MDLZ","BG","DANO","KO","JPM","GS","HSBC","BLK","AXP","MS","ENPH","VWSYF","BEP","ORSTED","FSLR","NEE","XOM","CVX","SHEL","BP","TTE","SLB","CAT","HON","MMM","GE","ABB","EMR","BPHX","BTEC","BGRN","BFIN","BCMD"],
+        crossSector:true,
+        totalMarket:true
+      },
+    ]
+  }
+];
+
+// Flatten all stocks with sector info
+const ALL_STOCKS = SECTORS.flatMap(s =>
+  s.stocks.map(st => ({ ...st, sectorId: s.id, sectorLabel: s.label, color: s.color }))
+);
+
+// ETF constituent map — ticker → array of constituent tickers
+const ETF_CONSTITUENTS = Object.fromEntries(
+  ALL_STOCKS
+    .filter(s => s.constituents)
+    .map(s => [s.ticker, s.constituents])
+);
+
+const GM_ORDER_FLOW_KEY = "gm:orderflow";
+const DERIVATIVE_FUTURE_WEIGHT = 0.60;
+const DERIVATIVE_DEFAULT_MULTIPLIER = 10;
+const DERIVATIVE_OPTION_SPREAD_MULT = 1.8;
+const DERIVATIVE_FUTURE_SPREAD_MULT = 1.2;
+const DERIVATIVE_OPTION_STRIKE_STEPS = [-0.18, -0.12, -0.06, 0, 0.06, 0.12, 0.18];
+const DERIVATIVE_SHORT_OPTION_WEIGHT = 0.24;
+const DERIVATIVE_SHORT_OPTION_PREMIUM_MULT = 1.35;
+const DERIVATIVE_SHORT_OPTION_OTM_CREDIT = 0.45;
+
+// ─── POLITICAL DISRUPTION CATALOG ────────────────────────────────────────────
+// Each event hits multiple sectors simultaneously with sector-specific impacts
+// ─── MACRO ECONOMIC EVENT LIBRARY ────────────────────────────────────────────
+// DESIGN PRINCIPLE: Teams see ONLY the headline — no hints about which stocks/
+// sectors will move. They must apply economic knowledge to infer consequences.
+// 'concept' is shown only in the GM Rulebook for facilitator reference.
+// 'sectors' is the hidden impact vector — never displayed to players.
+const POLITICAL_EVENTS = [
+
+  // ── MONETARY POLICY EVENTS ────────────────────────────────────────────────
+  {
+    id:"rate_hike_emergency",
+    icon:"📈",
+    headline:"Central Bank Raises Interest Rates by 200 Basis Points",
+    subheadline:"Emergency monetary tightening announced to combat runaway inflation",
+    concept:"Contractionary monetary policy — higher rates increase cost of capital, hurt growth stocks, help banks via NIM expansion, crush bond-proxy equities",
+    sectors:{ banking:22, healthcare:-8, esg:-32, tech:-20, food:-6, logistics:-10, energy:-5, manufacturing:-14, etf:-18 }
+  },
+  {
+    id:"rate_cut_pivot",
+    icon:"📉",
+    headline:"Central Bank Pivots — Cuts Rates to Near-Zero",
+    subheadline:"Dovish pivot signals end of tightening cycle; liquidity flooding markets",
+    concept:"Expansionary monetary policy — cheap money boosts growth stocks, ESG, tech; banks lose NIM; risk-on environment drives equities broadly",
+    sectors:{ banking:-15, esg:35, tech:28, manufacturing:18, logistics:12, food:8, healthcare:5, energy:10, etf:20 }
+  },
+  {
+    id:"quantitative_easing",
+    icon:"💵",
+    headline:"Central Bank Launches $2 Trillion Quantitative Easing Programme",
+    subheadline:"Asset purchase programme injects liquidity into financial system",
+    concept:"QE expands money supply, inflates asset prices, devalues currency — benefits real assets, equities; hurts cash holders; creates inflationary pressure",
+    sectors:{ esg:30, tech:22, manufacturing:15, banking:10, energy:18, food:12, healthcare:8, logistics:10, etf:25 }
+  },
+  {
+    id:"inflation_cpi_shock",
+    icon:"🔥",
+    headline:"Consumer Price Index Hits 40-Year High",
+    subheadline:"Inflation at 12.4% forces emergency economic summit",
+    concept:"Cost-push and demand-pull inflation — commodity producers win, manufacturers squeezed on margins, consumers reduce discretionary spend, real wages fall",
+    sectors:{ energy:28, food:22, banking:-10, esg:-18, tech:-15, manufacturing:-20, logistics:-12, healthcare:-5, etf:-14 }
+  },
+  {
+    id:"deflation_spiral",
+    icon:"❄️",
+    headline:"Economy Enters Deflationary Spiral — Prices Fall Third Consecutive Month",
+    subheadline:"Falling prices trigger demand destruction and corporate earnings warnings",
+    concept:"Deflation causes consumers to defer spending, hurts corporate revenues, increases real debt burden — defensives outperform, commodities crash",
+    sectors:{ healthcare:15, food:10, banking:-18, energy:-25, manufacturing:-22, logistics:-15, tech:-12, esg:-8, etf:-16 }
+  },
+
+  // ── FISCAL POLICY EVENTS ──────────────────────────────────────────────────
+  {
+    id:"fiscal_stimulus",
+    icon:"🏗️",
+    headline:"Government Announces $5 Trillion Infrastructure Spending Package",
+    subheadline:"Multi-year public investment programme passed with bipartisan support",
+    concept:"Expansionary fiscal policy via government expenditure — multiplier effect boosts aggregate demand, benefits capital goods producers, creates jobs",
+    sectors:{ manufacturing:40, logistics:28, energy:18, banking:15, esg:14, tech:10, food:5, healthcare:3, etf:16 }
+  },
+  {
+    id:"austerity_measures",
+    icon:"✂️",
+    headline:"Government Announces Emergency Austerity — Cuts Spending by 30%",
+    subheadline:"Sovereign debt crisis forces drastic fiscal consolidation",
+    concept:"Contractionary fiscal policy reduces aggregate demand — government contractors suffer, healthcare spending cut, defensive sectors stabilise",
+    sectors:{ manufacturing:-28, logistics:-20, healthcare:-22, banking:-10, esg:-15, tech:-8, food:5, energy:2, etf:-18 }
+  },
+  {
+    id:"carbon_tax",
+    icon:"🌡️",
+    headline:"Landmark Carbon Pricing Legislation Enacted — $150 Per Tonne",
+    subheadline:"Polluters face immediate compliance costs; exemptions denied",
+    concept:"Pigouvian tax corrects negative externality — increases costs for polluters, creates competitive advantage for clean producers, drives substitution",
+    sectors:{ energy:-32, manufacturing:-20, esg:42, logistics:-12, food:-8, tech:15, banking:5, healthcare:3, etf:8 }
+  },
+  {
+    id:"sovereign_default",
+    icon:"💀",
+    headline:"Major Economy Declares Sovereign Debt Default",
+    subheadline:"Government unable to service $3.2 trillion in outstanding obligations",
+    concept:"Debt default triggers contagion — banking sector exposed via bond holdings, capital flight from risk assets, safe-haven demand spikes",
+    sectors:{ banking:-38, esg:-20, tech:-15, manufacturing:-18, logistics:-15, healthcare:12, food:8, energy:5, etf:-28 }
+  },
+
+  // ── SUPPLY-SIDE SHOCKS ────────────────────────────────────────────────────
+  {
+    id:"oil_supply_shock",
+    icon:"🛢️",
+    headline:"OPEC+ Announces Coordinated 40% Production Cut",
+    subheadline:"Cartel exercises pricing power as inventories hit multi-decade lows",
+    concept:"Negative supply shock — cost-push inflation, energy windfall, manufacturing margin compression, transport costs surge, substitution to renewables",
+    sectors:{ energy:38, esg:22, food:-18, logistics:-24, manufacturing:-16, banking:-8, tech:-10, healthcare:-6, etf:-12 }
+  },
+  {
+    id:"semiconductor_shortage",
+    icon:"💾",
+    headline:"Global Semiconductor Shortage Reaches Critical Level",
+    subheadline:"Lead times extend to 52 weeks as fab capacity exhausted",
+    concept:"Bottleneck in complementary goods — industries requiring chips face production halts; chip producers gain pricing power; substitution impossible in short run",
+    sectors:{ tech:-18, manufacturing:-30, logistics:-12, banking:-8, energy:5, esg:-5, healthcare:-10, food:-3, etf:-16 }
+  },
+  {
+    id:"labour_strike",
+    icon:"✊",
+    headline:"Global Dockworkers Strike Enters Third Week",
+    subheadline:"Port shutdowns across 40 countries halting $800B in trade",
+    concept:"Labour market shock reduces productive capacity — supply constrained, inventories depleted, input costs rise for manufacturers and retailers",
+    sectors:{ logistics:-35, manufacturing:-25, food:-18, energy:10, tech:-10, banking:-8, healthcare:-5, esg:-5, etf:-15 }
+  },
+  {
+    id:"commodity_supercycle",
+    icon:"⛏️",
+    headline:"Commodity Supercycle Declared — Raw Material Prices at Record Highs",
+    subheadline:"Synchronised global demand surge exhausts commodity inventories",
+    concept:"Commodity supercycle driven by underinvestment in supply meeting demand surge — resource producers profit, downstream industries face margin compression",
+    sectors:{ energy:32, manufacturing:-22, food:18, logistics:-15, esg:10, banking:8, tech:-8, healthcare:-3, etf:5 }
+  },
+
+  // ── TRADE AND GLOBALISATION ───────────────────────────────────────────────
+  {
+    id:"trade_war_escalation",
+    icon:"⚔️",
+    headline:"Sweeping Tariffs Announced — 60% on All Imported Manufactured Goods",
+    subheadline:"Retaliatory measures expected from trading partners within 48 hours",
+    concept:"Trade protectionism raises costs of imported inputs, disrupts global value chains, domestic producers benefit temporarily but overall welfare falls",
+    sectors:{ manufacturing:-20, logistics:-22, tech:-18, food:-14, banking:-12, energy:8, healthcare:5, esg:-8, etf:-16 }
+  },
+  {
+    id:"free_trade_agreement",
+    icon:"🤝",
+    headline:"Historic Multilateral Free Trade Agreement Signed by 80 Nations",
+    subheadline:"Largest trade liberalisation in history eliminates barriers across $28T in trade",
+    concept:"Trade liberalisation increases comparative advantage specialisation, lowers consumer prices, expands market access — logistics and exporting industries benefit most",
+    sectors:{ logistics:28, manufacturing:22, food:15, tech:18, banking:12, energy:10, esg:8, healthcare:5, etf:16 }
+  },
+  {
+    id:"currency_crisis",
+    icon:"💱",
+    headline:"Reserve Currency Loses 25% of Value in 48-Hour Flash Crash",
+    subheadline:"Currency intervention fails as speculative attack overwhelms reserves",
+    concept:"Currency devaluation makes exports cheap, imports expensive — exporters win, import-dependent industries lose; foreign debt becomes more expensive",
+    sectors:{ tech:18, energy:15, food:-14, manufacturing:10, logistics:-16, banking:-22, healthcare:5, esg:-10, etf:-8 }
+  },
+
+  // ── MARKET STRUCTURE EVENTS ───────────────────────────────────────────────
+  {
+    id:"antitrust_breakup",
+    icon:"⚖️",
+    headline:"Antitrust Authorities Order Forced Breakup of Dominant Market Players",
+    subheadline:"Monopoly power dismantled — divestiture mandated within 90 days",
+    concept:"Antitrust intervention corrects monopoly market failure — competitive entry increases, prices fall, incumbent loses pricing power, innovation accelerates",
+    sectors:{ tech:-30, banking:12, healthcare:10, esg:5, logistics:-5, food:3, energy:2, manufacturing:-8, etf:-15 }
+  },
+  {
+    id:"market_failure_fraud",
+    icon:"🚨",
+    headline:"Information Asymmetry Crisis — Systemic Accounting Fraud Uncovered",
+    subheadline:"Regulators freeze trading in 40 major companies pending investigation",
+    concept:"Market failure from information asymmetry — rational market impossible without accurate pricing; trust collapses, adverse selection, regulatory overreach follows",
+    sectors:{ banking:-32, tech:-18, esg:-24, manufacturing:-15, logistics:-12, healthcare:-8, food:-5, energy:-6, etf:-26 }
+  },
+  {
+    id:"natural_monopoly_regulation",
+    icon:"🏛️",
+    headline:"Regulators Impose Price Caps on Essential Services Sector",
+    subheadline:"Price ceiling set 40% below market rate citing public interest",
+    concept:"Price ceiling below equilibrium creates shortage — producers exit, quality falls, black markets emerge; regulation often produces unintended consequences",
+    sectors:{ healthcare:-28, energy:-15, logistics:-10, manufacturing:-8, banking:5, tech:5, food:-12, esg:3, etf:-12 }
+  },
+  {
+    id:"mega_merger",
+    icon:"🏢",
+    headline:"Largest Corporate Merger in History Announced — $900B Deal",
+    subheadline:"Consolidation creates entity controlling 35% of global market share",
+    concept:"Horizontal merger creates economies of scale but reduces competition — merger arbitrage opportunity, industry rationalisation, regulatory uncertainty",
+    sectors:{ manufacturing:25, logistics:18, banking:15, tech:10, energy:8, food:5, healthcare:5, esg:3, etf:14 }
+  },
+
+  // ── DEMAND-SIDE SHOCKS ────────────────────────────────────────────────────
+  {
+    id:"recession_declaration",
+    icon:"📊",
+    headline:"Economy Officially Enters Recession — Two Consecutive Quarters of Negative GDP",
+    subheadline:"Unemployment rises to 9.2%; consumer confidence at historic low",
+    concept:"Recessionary demand shock — Keynesian multiplier in reverse; income effect reduces all spending; defensive sectors maintain but cyclicals collapse",
+    sectors:{ healthcare:18, food:12, banking:-20, manufacturing:-28, logistics:-22, tech:-15, energy:-18, esg:-12, etf:-20 }
+  },
+  {
+    id:"consumer_boom",
+    icon:"🛒",
+    headline:"Consumer Confidence Hits All-Time High — Household Spending Surges 18%",
+    subheadline:"Post-recession pent-up demand unleashed as employment recovers",
+    concept:"Positive demand shock via increased consumer spending — multiplier effect boosts aggregate demand; cyclical sectors outperform; capacity utilisation rises",
+    sectors:{ food:22, tech:18, manufacturing:20, logistics:25, banking:15, healthcare:8, energy:12, esg:10, etf:18 }
+  },
+  {
+    id:"demographic_shift",
+    icon:"👥",
+    headline:"Ageing Population Report: One in Three Citizens Over 65 by 2030",
+    subheadline:"Structural demographic shift redraws economic demand landscape",
+    concept:"Demographic demand shift — secular increase in healthcare demand; pension fund behaviour changes bond/equity allocation; labour supply contracts",
+    sectors:{ healthcare:28, food:12, banking:10, esg:5, tech:-8, manufacturing:-15, logistics:-5, energy:-8, etf:5 }
+  },
+
+  // ── TECHNOLOGICAL DISRUPTION ──────────────────────────────────────────────
+  {
+    id:"ai_productivity_leap",
+    icon:"🤖",
+    headline:"AI Breakthrough Promises 40% Productivity Gains Across Knowledge Industries",
+    subheadline:"Autonomous systems deployed in professional services and manufacturing",
+    concept:"Technological progress shifts production possibility frontier — labour-saving tech increases output per worker, creative destruction displaces incumbents",
+    sectors:{ tech:35, manufacturing:15, banking:10, logistics:12, healthcare:8, food:5, energy:-5, esg:8, etf:20 }
+  },
+  {
+    id:"energy_transition",
+    icon:"⚡",
+    headline:"Renewable Energy Achieves Grid Parity — Cost Equals Fossil Fuels",
+    subheadline:"Structural shift in energy economics as renewables become cost-competitive",
+    concept:"Technological disruption via substitute goods — renewables become viable substitute for fossil fuels, stranded asset risk emerges, creative destruction of oil majors",
+    sectors:{ esg:40, energy:-30, manufacturing:12, tech:10, banking:5, food:3, logistics:-5, healthcare:2, etf:8 }
+  },
+];
+
+const POLITICAL_SHOCK_QUESTIONS = [
+  { id:"psq_01", prompt:"Which sector should react first to this macro shock, and why?" },
+  { id:"psq_02", prompt:"Is this primarily a demand shock, supply shock, policy shock, or market-structure shock?" },
+  { id:"psq_03", prompt:"Which companies gain pricing power immediately after this event?" },
+  { id:"psq_04", prompt:"Which sector is most likely to suffer a margin squeeze first?" },
+  { id:"psq_05", prompt:"Does this event favor defensive sectors or cyclical sectors in the short run?" },
+  { id:"psq_06", prompt:"Which ETF in Bull Pit is most exposed to this event?" },
+  { id:"psq_07", prompt:"Will the first-order effect hit earnings, valuations, or funding costs hardest?" },
+  { id:"psq_08", prompt:"Which businesses benefit because consumers substitute away from something more expensive?" },
+  { id:"psq_09", prompt:"If rates or yields move after this event, who benefits and who gets hurt?" },
+  { id:"psq_10", prompt:"Which sector faces the biggest inventory or supply-chain bottleneck from this news?" },
+  { id:"psq_11", prompt:"What second-order effect should traders watch after the initial headline reaction?" },
+  { id:"psq_12", prompt:"Which companies are likely to gain market share because of regulation or compliance burdens?" },
+  { id:"psq_13", prompt:"Would this event strengthen or weaken aggregate consumer spending?" },
+  { id:"psq_14", prompt:"Which stocks in this event are most likely to mean-revert after the first move?" },
+  { id:"psq_15", prompt:"Does this macro shock help exporters more than import-dependent firms?" },
+  { id:"psq_16", prompt:"Which sector should see valuation multiple expansion, and which should see compression?" },
+  { id:"psq_17", prompt:"Who wins if the market shifts from growth expectations to cash-flow resilience?" },
+  { id:"psq_18", prompt:"Which businesses benefit if this event changes relative input costs across sectors?" },
+  { id:"psq_19", prompt:"Where would you expect the strongest spillover into logistics, finance, or energy?" },
+  { id:"psq_20", prompt:"What is the smartest hedge against the sector most damaged by this event?" },
+];
+
+function getRandomPoliticalShockQuestion(lastQuestionId = null) {
+  const pool = POLITICAL_SHOCK_QUESTIONS.filter(q => q.id !== lastQuestionId);
+  const source = pool.length > 0 ? pool : POLITICAL_SHOCK_QUESTIONS;
+  return source[Math.floor(Math.random() * source.length)] || POLITICAL_SHOCK_QUESTIONS[0];
+}
+
+function getRoundTransitionPortfolioReset(currentRound, nextRound) {
+  return null;
+}
+
+
+const DEFAULT_TEAMS = [
+  { id:"t1", name:"Alpha Squad",      color:"#00f5c4" },
+  { id:"t2", name:"Bull Runners",     color:"#fbbf24" },
+  { id:"t3", name:"Bear Force",       color:"#f472b6" },
+  { id:"t4", name:"Quantum Traders",  color:"#a78bfa" },
+  { id:"t5", name:"Solar Surge",      color:"#38bdf8" },
+  { id:"t6", name:"Dark Pool",        color:"#fb923c" },
+];
+
+const AI_BOTS = [
+  { id:"bot_m", name:"MOMENTUM", avatar:"M", color:"#00f5c4",
+    personality:"aggressive momentum trader who chases breakouts and hot sectors" },
+  { id:"bot_w", name:"WARREN.AI", avatar:"W", color:"#fbbf24",
+    personality:"patient value investor buying MNC blue chips and holding through volatility" },
+  { id:"bot_s", name:"SCALP-3",  avatar:"S", color:"#f472b6",
+    personality:"high-frequency scalper making many small trades across different sectors" },
+];
+
+// ─── LEADERBOARD SCORING FORMULA ─────────────────────────────────────────────
+// Composite score from 5 pillars:
+//   1. Total Return %        (35%) – raw performance
+//   2. Sharpe-proxy          (25%) – return per unit of max-drawdown risk
+//   3. Diversification       (20%) – unique sectors held (max 7)
+//   4. Win Rate              (10%) – % of closed trades in profit
+//   5. Capital Efficiency    (10%) – deployed capital ratio (1 - cash%)
+// ─── 10-INDICATOR SCORING ENGINE ─────────────────────────────────────────────
+// Three tiers: Performance (50pts), Risk Management (30pts), Trading Quality (25pts)
+// Total: 105 points maximum
+// Tiebreaker chain: Calmar → MaxDD → Alpha → Sectors → LastTradeTs
+// ─────────────────────────────────────────────────────────────────────────────
+
+// BALL index base price used to compute portfolio beta / alpha
+const BALL_BASE = 155;
+
+function createEmptyScoreLedger() {
+  return {
+    version: 2,
+    completedRounds: [],
+    maxDrawdownOverall: 0,
+  };
+}
+
+function normalizeLedgerRoundSnapshot(snapshot = {}) {
+  return {
+    round: Number.isFinite(snapshot.round) ? snapshot.round : null,
+    startingCapital: Number.isFinite(snapshot.startingCapital) ? snapshot.startingCapital : null,
+    endingValue: Number.isFinite(snapshot.endingValue) ? snapshot.endingValue : null,
+    returnPct: Number.isFinite(snapshot.returnPct) ? snapshot.returnPct : 0,
+    ballReturn: Number.isFinite(snapshot.ballReturn) ? snapshot.ballReturn : 0,
+    assetBeta: Number.isFinite(snapshot.assetBeta) ? snapshot.assetBeta : null,
+    portfolioBeta: Number.isFinite(snapshot.portfolioBeta) ? snapshot.portfolioBeta : null,
+    borrowCost: Number.isFinite(snapshot.borrowCost) ? snapshot.borrowCost : 0,
+    fundingCost: Number.isFinite(snapshot.fundingCost) ? snapshot.fundingCost : 0,
+    avgMarginBufferPct: Number.isFinite(snapshot.avgMarginBufferPct) ? snapshot.avgMarginBufferPct : 0,
+    marginBreaches: Number.isFinite(snapshot.marginBreaches) ? snapshot.marginBreaches : 0,
+    closedTrades: Number.isFinite(snapshot.closedTrades) ? snapshot.closedTrades : 0,
+    wins: Number.isFinite(snapshot.wins) ? snapshot.wins : 0,
+    sectors: Array.isArray(snapshot.sectors) ? snapshot.sectors.filter(Boolean) : [],
+    predShown: snapshot.predShown ? 1 : 0,
+    predAnswered: snapshot.predAnswered ? 1 : 0,
+    predCorrect: snapshot.predCorrect ? 1 : 0,
+    lastTradeTs: Number.isFinite(snapshot.lastTradeTs) ? snapshot.lastTradeTs : 0,
+  };
+}
+
+function sanitizeScoreLedger(rawLedger) {
+  if (!rawLedger || typeof rawLedger !== "object") return createEmptyScoreLedger();
+  return {
+    version: rawLedger.version || 2,
+    completedRounds: Array.isArray(rawLedger.completedRounds)
+      ? rawLedger.completedRounds.map(normalizeLedgerRoundSnapshot)
+      : [],
+    maxDrawdownOverall: Number.isFinite(rawLedger.maxDrawdownOverall)
+      ? rawLedger.maxDrawdownOverall
+      : 0,
+  };
+}
+
+function normalizePredictionSessionId(value) {
+  if (value === null || value === undefined || value === "") return null;
+  return String(value);
+}
+
+function normalizePredictionSession(session) {
+  if (!session || typeof session !== "object") return session;
+  return {
+    ...session,
+    id: normalizePredictionSessionId(session.id),
+  };
+}
+
+function finiteValues(values = []) {
+  return (values || []).filter(value => Number.isFinite(value));
+}
+
+function averageFinite(values = []) {
+  const nums = finiteValues(values);
+  if (!nums.length) return null;
+  return nums.reduce((sum, value) => sum + value, 0) / nums.length;
+}
+
+function compoundPercentSeries(values = []) {
+  const nums = finiteValues(values);
+  if (!nums.length) return null;
+  const compounded = nums.reduce((prod, value) => prod * (1 + value / 100), 1);
+  return (compounded - 1) * 100;
+}
+
+function geometricMeanPercent(values = []) {
+  const nums = finiteValues(values);
+  if (!nums.length) return 0;
+  const compounded = nums.reduce((prod, value) => prod * (1 + value / 100), 1);
+  if (compounded <= 0) return -100;
+  return (Math.pow(compounded, 1 / nums.length) - 1) * 100;
+}
+
+function uniqueTruthy(values = []) {
+  return [...new Set((values || []).filter(Boolean))];
+}
+
+function getDerivativeUnderlyings() {
+  return ALL_STOCKS;
+}
+
+function buildRoundDerivativeBases(prices = {}) {
+  return Object.fromEntries(
+    getDerivativeUnderlyings().map(stock => [
+      stock.ticker,
+      prices[stock.ticker] || stock.basePrice || 100
+    ])
+  );
+}
+
+function calcRoundTimeFraction(timeLeft, roundDur, gamePhase) {
+  if (gamePhase !== "running" || !Number.isFinite(timeLeft) || !Number.isFinite(roundDur) || roundDur <= 0) return 0;
+  return clamp(timeLeft / roundDur, 0, 1);
+}
+
+function getDerivativeContractMultiplier(ticker) {
+  return ticker === "BALL" ? 12 : DERIVATIVE_DEFAULT_MULTIPLIER;
+}
+
+function normalizeDerivativeStrike(strike) {
+  return Math.round(Math.max(0.25, Number(strike) || 0.25) * 100) / 100;
+}
+
+function getDerivativeStrikeIncrement(baseStrike) {
+  if (baseStrike < 40) return 1;
+  if (baseStrike < 90) return 2.5;
+  if (baseStrike < 180) return 5;
+  if (baseStrike < 350) return 10;
+  return 20;
+}
+
+function buildDerivativeStrikeLadder(baseStrike) {
+  const normalizedBase = normalizeDerivativeStrike(baseStrike);
+  const increment = getDerivativeStrikeIncrement(normalizedBase);
+  const seen = new Set();
+  return DERIVATIVE_OPTION_STRIKE_STEPS.reduce((ladder, step) => {
+    const rawStrike = step === 0
+      ? normalizedBase
+      : Math.max(increment, Math.round((normalizedBase * (1 + step)) / increment) * increment);
+    const strike = normalizeDerivativeStrike(rawStrike);
+    const key = strike.toFixed(2);
+    if (seen.has(key)) return ladder;
+    seen.add(key);
+    ladder.push({ strike, strikeStep: step });
+    return ladder;
+  }, []);
+}
+
+function formatDerivativeStrikeCode(strike) {
+  return Math.round(normalizeDerivativeStrike(strike) * 100);
+}
+
+function formatDerivativeStrikeLabel(strike) {
+  return normalizeDerivativeStrike(strike).toLocaleString("en-US", {
+    minimumFractionDigits: Number.isInteger(normalizeDerivativeStrike(strike)) ? 0 : 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+function getDerivativeRiskEquivalent(quote, side = "long") {
+  if (!quote) return 0;
+  return side === "short"
+    ? (quote.shortRiskEquivalent ?? quote.riskEquivalent ?? 0)
+    : (quote.longRiskEquivalent ?? quote.riskEquivalent ?? 0);
+}
+
+function getDerivativeTradeFlowDirection(kind, side = "long", action = "open") {
+  const normalizedAction = action === "close" ? "close" : "open";
+  if (kind === "future") {
+    const direction = side === "short" ? -1 : 1;
+    return normalizedAction === "close" ? -direction : direction;
+  }
+  const optionDirection = kind === "put" ? -1 : 1;
+  const direction = side === "short" ? -optionDirection : optionDirection;
+  return normalizedAction === "close" ? -direction : direction;
+}
+
+function getDerivativeOpenActionLabel(kind, side = "long") {
+  if (kind === "future") return side === "short" ? "FUT SHORT" : "FUT LONG";
+  return `${kind.toUpperCase()} ${side === "short" ? "SELL" : "BUY"}`;
+}
+
+function formatDerivativePositionLabel(position) {
+  if (!position) return "";
+  const sideLabel = position.side === "short" ? "SHORT" : "LONG";
+  if (position.kind === "future") return `${sideLabel} FUTURE`;
+  return `${sideLabel} ${position.kind.toUpperCase()}`;
+}
+
+function makeDerivativeInstrument({ round, kind, stock, strike, strikeStep = null }) {
+  const normalizedStrike = normalizeDerivativeStrike(strike);
+  const isAtmOption = kind !== "future" && Math.abs(Number(strikeStep || 0)) < 1e-9;
+  const labelBase = kind === "future"
+    ? `${stock.ticker} Round Future`
+    : kind === "call"
+      ? `${stock.ticker} Round Call ${formatDerivativeStrikeLabel(normalizedStrike)}`
+      : `${stock.ticker} Round Put ${formatDerivativeStrikeLabel(normalizedStrike)}`;
+  return {
+    id: kind === "future" || isAtmOption
+      ? `${kind.toUpperCase()}:${stock.ticker}:R${round}`
+      : `${kind.toUpperCase()}:${stock.ticker}:R${round}:K${formatDerivativeStrikeCode(normalizedStrike)}`,
+    round,
+    kind,
+    underlyingTicker: stock.ticker,
+    underlyingName: stock.name,
+    sectorId: stock.sectorId,
+    multiplier: getDerivativeContractMultiplier(stock.ticker),
+    strike: normalizedStrike,
+    strikeStep: kind === "future" ? null : strikeStep,
+    isAtm: kind === "future" ? false : isAtmOption,
+    label: labelBase,
+  };
+}
+
+function calcDerivativeQuote(instrument, {
+  prices = {},
+  roundRule = null,
+  timeLeft = 0,
+  roundDur = 1,
+  gamePhase = "idle",
+} = {}) {
+  if (!instrument?.underlyingTicker) return null;
+  const underlying = ALL_STOCKS.find(stock => stock.ticker === instrument.underlyingTicker);
+  const spot = prices[instrument.underlyingTicker] || instrument.strike || underlying?.basePrice || 100;
+  const multiplier = instrument.multiplier || getDerivativeContractMultiplier(instrument.underlyingTicker);
+  const timeFrac = calcRoundTimeFraction(timeLeft, roundDur, gamePhase);
+  const vol = Math.max(0.65, (underlying?.volatility || 1) * (roundRule?.volMult || 1));
+  const baseSpread = BASE_SPREAD_RATE * (roundRule?.spreadMult || 1);
+
+  if (instrument.kind === "future") {
+    const carryBasis = spot * (0.0025 * timeFrac * (1 + (vol * 0.6)));
+    const mark = Math.max(0.25, spot + carryBasis);
+    const bid = Math.max(0.01, mark * (1 - (baseSpread * DERIVATIVE_FUTURE_SPREAD_MULT)));
+    const ask = mark * (1 + (baseSpread * DERIVATIVE_FUTURE_SPREAD_MULT));
+    const notional = spot * multiplier;
+    return {
+      mark,
+      bid,
+      ask,
+      spot,
+      multiplier,
+      notional,
+      riskEquivalent: notional * DERIVATIVE_FUTURE_WEIGHT,
+      intrinsic: 0,
+      timeValue: carryBasis,
+    };
+  }
+
+  const strike = instrument.strike || spot;
+  const intrinsic = instrument.kind === "call"
+    ? Math.max(0, spot - strike)
+    : Math.max(0, strike - spot);
+  const moneyness = Math.exp(-Math.abs(spot - strike) / Math.max(strike, 1));
+  const timeValue = spot * (0.014 + (vol * 0.006)) * timeFrac * (0.55 + (moneyness * 0.45));
+  const mark = Math.max(0.05, intrinsic + timeValue);
+  const bid = Math.max(0.01, mark * (1 - (baseSpread * DERIVATIVE_OPTION_SPREAD_MULT)));
+  const ask = mark * (1 + (baseSpread * DERIVATIVE_OPTION_SPREAD_MULT));
+  const longRiskEquivalent = ask * multiplier;
+  const outOfTheMoney = instrument.kind === "call"
+    ? Math.max(0, strike - spot)
+    : Math.max(0, spot - strike);
+  const shortMarginPerShare = Math.max(
+    ask * DERIVATIVE_SHORT_OPTION_PREMIUM_MULT,
+    (spot * DERIVATIVE_SHORT_OPTION_WEIGHT) + intrinsic - (outOfTheMoney * DERIVATIVE_SHORT_OPTION_OTM_CREDIT),
+    ask * 1.15
+  );
+  const shortRiskEquivalent = Math.max(
+    longRiskEquivalent * DERIVATIVE_SHORT_OPTION_PREMIUM_MULT,
+    shortMarginPerShare * multiplier
+  );
+  return {
+    mark,
+    bid,
+    ask,
+    spot,
+    strike,
+    multiplier,
+    notional: spot * multiplier,
+    riskEquivalent: longRiskEquivalent,
+    longRiskEquivalent,
+    shortRiskEquivalent,
+    intrinsic,
+    timeValue,
+  };
+}
+
+function buildDerivativeCatalog({
+  round,
+  prices = {},
+  roundRule = null,
+  timeLeft = 0,
+  roundDur = 1,
+  gamePhase = "idle",
+  roundBases = {},
+} = {}) {
+  return getDerivativeUnderlyings().flatMap(stock => {
+    const baseStrike = roundBases?.[stock.ticker] || prices[stock.ticker] || stock.basePrice || 100;
+    const optionStrikes = buildDerivativeStrikeLadder(baseStrike);
+    const instruments = [
+      makeDerivativeInstrument({ round, kind:"future", stock, strike: baseStrike }),
+      ...optionStrikes.flatMap(({ strike, strikeStep }) => [
+        makeDerivativeInstrument({ round, kind:"call", stock, strike, strikeStep }),
+        makeDerivativeInstrument({ round, kind:"put", stock, strike, strikeStep }),
+      ]),
+    ];
+    return instruments.map(instrument => ({
+      ...instrument,
+      quote: calcDerivativeQuote(instrument, { prices, roundRule, timeLeft, roundDur, gamePhase }),
+    }));
+  });
+}
+
+function getDerivativeQuoteMap(catalog = []) {
+  return Object.fromEntries((catalog || []).map(instrument => [instrument.id, instrument.quote]));
+}
+
+function buildDerivativeQuoteMapForRound({
+  round,
+  prices = {},
+  roundRule = null,
+  timeLeft = 0,
+  roundDur = 1,
+  gamePhase = "idle",
+  roundBases = {},
+} = {}) {
+  return getDerivativeQuoteMap(buildDerivativeCatalog({
+    round,
+    prices,
+    roundRule,
+    timeLeft,
+    roundDur,
+    gamePhase,
+    roundBases,
+  }));
+}
+
+function calcDerivativePositionValue(position, quote) {
+  if (!position || !quote) return 0;
+  const qty = position.qty || 0;
+  const multiplier = position.multiplier || quote.multiplier || 1;
+  if (!qty) return 0;
+  if (position.kind === "future") {
+    const direction = position.side === "short" ? -1 : 1;
+    return (quote.mark - (position.avgCost || 0)) * qty * multiplier * direction;
+  }
+  return quote.mark * qty * multiplier * (position.side === "short" ? -1 : 1);
+}
+
+function calcDerivativeCloseValue(position, quote) {
+  if (!position || !quote) return 0;
+  const qty = position.qty || 0;
+  const multiplier = position.multiplier || quote.multiplier || 1;
+  if (!qty) return 0;
+  if (position.kind === "future") {
+    const closePrice = position.side === "short" ? quote.ask : quote.bid;
+    const direction = position.side === "short" ? -1 : 1;
+    return (closePrice - (position.avgCost || 0)) * qty * multiplier * direction;
+  }
+  const closePrice = position.side === "short" ? quote.ask : quote.bid;
+  return closePrice * qty * multiplier * (position.side === "short" ? -1 : 1);
+}
+
+function calcDerivativeExposure(position, quote) {
+  if (!position || !quote) return 0;
+  const qty = Math.abs(position.qty || 0);
+  if (!qty) return 0;
+  return getDerivativeRiskEquivalent(quote, position.side) * qty;
+}
+
+function calcDerivativePortfolioMetrics(derivativePositions = {}, derivativeQuoteMap = {}) {
+  const entries = Object.entries(derivativePositions || {})
+    .filter(([, position]) => (position?.qty || 0) > 0);
+
+  const openPnL = {};
+  let totalValue = 0;
+  let totalUnrealized = 0;
+  let futuresExposure = 0;
+  let optionExposure = 0;
+
+  entries.forEach(([id, position]) => {
+    const quote = derivativeQuoteMap[id];
+    if (!quote) return;
+    const currentValue = calcDerivativePositionValue(position, quote);
+    const direction = position.side === "short" ? -1 : 1;
+    const unrealized = position.kind === "future"
+      ? currentValue
+      : ((quote.mark - (position.avgCost || 0)) * (position.qty || 0) * (position.multiplier || quote.multiplier || 1) * direction);
+    const exposure = calcDerivativeExposure(position, quote);
+    totalValue += currentValue;
+    totalUnrealized += unrealized;
+    if (position.kind === "future") futuresExposure += exposure;
+    else optionExposure += exposure;
+    openPnL[id] = {
+      ...position,
+      currentValue,
+      unrealized,
+      closeValue: calcDerivativeCloseValue(position, quote),
+      exposure,
+      mark: quote.mark,
+      bid: quote.bid,
+      ask: quote.ask,
+      intrinsic: quote.intrinsic || 0,
+      timeValue: quote.timeValue || 0,
+      spot: quote.spot,
+    };
+  });
+
+  return {
+    openPnL,
+    totalValue,
+    totalUnrealized,
+    futuresExposure,
+    optionExposure,
+    grossExposure: futuresExposure + optionExposure,
+  };
+}
+
+function sumPositionValue(holdings = {}, prices = {}, predicate = () => true) {
+  return Object.entries(holdings).reduce((sum, [ticker, pos]) => {
+    if (!predicate(pos, ticker)) return sum;
+    const price = prices[ticker] || pos?.avgCost || 0;
+    return sum + (price * (pos?.qty || 0));
+  }, 0);
+}
+
+function calcNetEquityFromState({
+  cash = 0,
+  restrictedCash = 0,
+  holdings = {},
+  prices = {},
+  derivativePositions = {},
+  derivativeQuoteMap = {},
+  accruedBorrowCost = 0,
+  accruedFundingCost = 0,
+}) {
+  const derivativeMetrics = calcDerivativePortfolioMetrics(derivativePositions, derivativeQuoteMap);
+  return (
+    (cash || 0)
+    + (restrictedCash || 0)
+    + calcHoldingsValue(holdings, prices)
+    + (derivativeMetrics.totalValue || 0)
+    - (accruedBorrowCost || 0)
+    - (accruedFundingCost || 0)
+  );
+}
+
+function calcScore(entry, initCash, allEntries) {
+  const ic    = initCash || INITIAL_CASH;
+  const total = entry.total || ic;
+  const cash  = entry.cash  || ic;
+  const ledger = sanitizeScoreLedger(entry.scoreLedger);
+  const liveRound = entry.liveRound ? normalizeLedgerRoundSnapshot(entry.liveRound) : null;
+  const roundSnapshots = [...ledger.completedRounds, ...(liveRound ? [liveRound] : [])];
+  const roundReturns = roundSnapshots.map(round => round.returnPct);
+  const legacyRoundReturns = Array.isArray(entry.roundReturns) ? entry.roundReturns : [];
+  const effectiveRoundReturns = roundReturns.length > 0 ? roundReturns : legacyRoundReturns;
+  const compoundedReturn = compoundPercentSeries(roundReturns);
+  const compoundedBallReturn = compoundPercentSeries(roundSnapshots.map(round => round.ballReturn));
+  const closedTradesTotal = roundSnapshots.reduce((sum, round) => sum + (round.closedTrades || 0), 0);
+  const winsTotal = roundSnapshots.reduce((sum, round) => sum + (round.wins || 0), 0);
+  const sectorsTotal = uniqueTruthy(roundSnapshots.flatMap(round => round.sectors || [])).length;
+  const predShownTotal = roundSnapshots.reduce((sum, round) => sum + (round.predShown || 0), 0);
+  const predAnsweredTotal = roundSnapshots.reduce((sum, round) => sum + (round.predAnswered || 0), 0);
+  const predCorrectTotal = roundSnapshots.reduce((sum, round) => sum + (round.predCorrect || 0), 0);
+  const lastTradeFromLedger = roundSnapshots.reduce((maxTs, round) => Math.max(maxTs, round.lastTradeTs || 0), 0);
+  const totalBorrowCost = roundSnapshots.reduce((sum, round) => sum + (round.borrowCost || 0), 0);
+  const totalFundingCost = roundSnapshots.reduce((sum, round) => sum + (round.fundingCost || 0), 0);
+  const totalCarryCost = totalBorrowCost + totalFundingCost;
+  const avgMarginBufferPct = averageFinite(roundSnapshots.map(round => round.avgMarginBufferPct));
+  const marginBreaches = roundSnapshots.reduce((sum, round) => sum + (round.marginBreaches || 0), 0);
+  const netEquity = entry.netEquity != null
+    ? entry.netEquity
+    : (roundSnapshots[roundSnapshots.length - 1]?.endingValue ?? total);
+
+  // ── TIER 1: PERFORMANCE (35 pts) ──────────────────────────────────────────
+  const absoluteReturn = compoundedReturn != null
+    ? compoundedReturn
+    : ((netEquity - ic) / ic) * 100;
+  const ballReturn  = compoundedBallReturn != null ? compoundedBallReturn : (entry.ballReturn || 0);
+  const alpha       = absoluteReturn - ballReturn;
+  const consistency = effectiveRoundReturns.length > 0
+    ? geometricMeanPercent(effectiveRoundReturns)
+    : 0;
+  const maxDrawdown = Math.max(0.5, ledger.maxDrawdownOverall || entry.maxDrawdown || 0.5);
+  const sharpe = absoluteReturn / maxDrawdown;
+  const calmar = maxDrawdown > 0 ? absoluteReturn / maxDrawdown : 0;
+
+  const t1a = clamp((absoluteReturn + 20) / 120 * 20, 0, 20); // compounded net return
+  const t1b = clamp((alpha + 15) / 45 * 15, 0, 15);            // alpha vs BALL
+  const tier1 = t1a + t1b;  // max 35
+
+  // ── TIER 2: CAPITAL DISCIPLINE (40 pts) ──────────────────────────────────
+  const marginBufferPct = avgMarginBufferPct != null
+    ? avgMarginBufferPct
+    : (entry.marginBufferPct != null ? entry.marginBufferPct : 0);
+  const capitalBase = Math.max(1, roundSnapshots[0]?.startingCapital || ic || INITIAL_CASH);
+  const carryDragPct = (totalCarryCost / capitalBase) * 100;
+  const marginDisciplineRaw = clamp(((marginBufferPct + 5) / 25) * 15, 0, 15) - Math.min(12, marginBreaches * 3);
+  const fundingEfficiency = clamp(((8 - carryDragPct) / 8) * 10, 0, 10);
+
+  const t2a = clamp((1 - maxDrawdown / 40) * 15, 0, 15);       // drawdown control
+  const t2b = clamp(marginDisciplineRaw, 0, 15);               // margin discipline
+  const t2c = fundingEfficiency;                               // funding / borrow efficiency
+  const tier2 = t2a + t2b + t2c;  // max 40
+
+  // ── TIER 3: MARKET CRAFT (30 pts) ────────────────────────────────────────
+  const crisisSnapshots = roundSnapshots.filter(round => CRISIS_ROUNDS.includes(round.round));
+  const crisisAlpha = averageFinite(crisisSnapshots.map(round => (round.returnPct || 0) - (round.ballReturn || 0)))
+    ?? alpha;
+  const effectiveClosedTrades = closedTradesTotal > 0 ? closedTradesTotal : (entry.closedTrades || 0);
+  const effectiveWins = winsTotal > 0 ? winsTotal : (entry.wins || 0);
+  const winRate = effectiveClosedTrades > 0
+    ? (effectiveWins / effectiveClosedTrades) * 100
+    : 50;
+  const sectors = Math.min(9, sectorsTotal || entry.uniqueSectors || 0);
+  const predAnswered = predAnsweredTotal > 0 ? predAnsweredTotal : (entry.predTotal || 0);
+  const predCorrect = predCorrectTotal > 0 ? predCorrectTotal : (entry.predCorrect || 0);
+  const predRate    = predAnswered > 0 ? predCorrect / predAnswered : 0;
+  const predShown = predShownTotal > 0
+    ? predShownTotal
+    : (entry.predAsked != null ? entry.predAsked : (entry.currentRound || 0));
+  const roundsReached = clamp(
+    Math.max(entry.currentRound || 0, roundSnapshots.length || 0, predShown || predAnswered || 1),
+    1,
+    TOTAL_ROUNDS
+  );
+  const predParticipation = predShown > 0
+    ? clamp(predAnswered / predShown, 0, 1)
+    : (predAnswered > 0 ? clamp(predAnswered / roundsReached, 0, 1) : 0);
+
+  const t3a = clamp((crisisAlpha + 10) / 30 * 10, 0, 10);      // crisis alpha
+  const t3b = clamp(winRate / 100 * 5, 0, 5);                  // execution win rate
+  const t3c = clamp((sectors / 9) * 5, 0, 5);                  // diversification
+  const t3d = predRate * 5;                                    // prediction accuracy
+  const t3e = predParticipation * 5;                           // prediction participation
+  const tier3 = t3a + t3b + t3c + t3d + t3e;  // max 30
+
+  const score = tier1 + tier2 + tier3;
+
+  // ── TIEBREAKER FIELDS (sequential) ────────────────────────────────────────
+  // TB1: Higher ending net equity
+  // TB2: Higher crisis alpha
+  // TB3: Fewer margin breaches
+  // TB4: Lower max drawdown
+  // TB5: Earlier last trade timestamp
+  const tb1 = +(netEquity || 0).toFixed(2);
+  const tb2 = +crisisAlpha.toFixed(4);
+  const tb3 = -(marginBreaches || 0);
+  const tb4 = -maxDrawdown;
+  const tb5 = -((lastTradeFromLedger || entry.lastTradeTs || Date.now()));
+
+  let assetBetaRaw = averageFinite(roundSnapshots.map(round => round.assetBeta));
+  if (assetBetaRaw == null) {
+    assetBetaRaw = entry.assetBeta != null
+      ? entry.assetBeta
+      : (entry.beta != null ? entry.beta : 0.5);
+  }
+  let portfolioBetaRaw = averageFinite(roundSnapshots.map(round => round.portfolioBeta));
+  if (portfolioBetaRaw == null) {
+    portfolioBetaRaw = entry.portfolioBeta != null
+      ? entry.portfolioBeta
+      : (entry.beta != null ? entry.beta : 0.5);
+  }
+
+  return {
+    score:         +score.toFixed(3),
+    // Tier scores
+    tier1, tier2, tier3,
+    // Individual indicators
+    netEquity:      +netEquity.toFixed(2),
+    absoluteReturn: +absoluteReturn.toFixed(2),
+    sharpe:         +sharpe.toFixed(3),
+    alpha:          +alpha.toFixed(2),
+    consistency:    +consistency.toFixed(2),
+    maxDrawdown:    +maxDrawdown.toFixed(2),
+    calmar:         +calmar.toFixed(3),
+    carryDragPct:   +carryDragPct.toFixed(2),
+    fundingEfficiency:+fundingEfficiency.toFixed(2),
+    marginBufferPct:+(marginBufferPct || 0).toFixed(2),
+    marginBreaches: marginBreaches || 0,
+    crisisAlpha:    +crisisAlpha.toFixed(2),
+    totalBorrowCost:+totalBorrowCost.toFixed(2),
+    totalFundingCost:+totalFundingCost.toFixed(2),
+    totalCarryCost: +totalCarryCost.toFixed(2),
+    assetBeta:      +assetBetaRaw.toFixed(3),
+    portfolioBeta:  +portfolioBetaRaw.toFixed(3),
+    beta:           +portfolioBetaRaw.toFixed(3),
+    winRate:        +winRate.toFixed(1),
+    sectors,
+    predRate:       +(predRate * 100).toFixed(1),
+    predParticipation: +(predParticipation * 100).toFixed(1),
+    predShownTotal: predShown,
+    predAnsweredTotal: predAnswered,
+    predCorrectTotal: predCorrect,
+    roundsCount:    roundSnapshots.length,
+    // Point contributions (for scorecard transparency)
+    t1a: +t1a.toFixed(2), t1b: +t1b.toFixed(2), t1c: 0, t1d: 0,
+    t2a: +t2a.toFixed(2), t2b: +t2b.toFixed(2), t2c: +t2c.toFixed(2),
+    t3a: +t3a.toFixed(2), t3b: +t3b.toFixed(2), t3c: +t3c.toFixed(2), t3d: +t3d.toFixed(2), t3e: +t3e.toFixed(2),
+    // Tiebreaker values
+    tb1, tb2, tb3, tb4, tb5,
+    // Legacy fields (kept for compatibility)
+    totalReturn: +absoluteReturn.toFixed(2),
+    deployed: netEquity > 0 ? +((Math.min(1,(netEquity-cash)/netEquity))*100).toFixed(1) : 0,
+    roundReturns: effectiveRoundReturns,
+  };
+}
+
+// Sort final leaderboard with tiebreaker chain
+function sortLeaderboard(entries) {
+  return [...entries].sort((a, b) => {
+    if (Math.abs(b.score - a.score) > 0.001) return b.score - a.score;  // primary
+    if (Math.abs(b.tb1 - a.tb1) > 0.01) return b.tb1 - a.tb1;          // TB1: Net equity
+    if (Math.abs(b.tb2 - a.tb2) > 0.0001) return b.tb2 - a.tb2;        // TB2: Crisis alpha
+    if (b.tb3 !== a.tb3) return b.tb3 - a.tb3;                          // TB3: Fewer breaches
+    if (Math.abs(b.tb4 - a.tb4) > 0.0001) return b.tb4 - a.tb4;        // TB4: Lower drawdown
+    return b.tb5 - a.tb5;                                                // TB5: Earlier final trade
+  });
+}
+
+function sortLiveLeaderboard(entries) {
+  return [...entries].sort((a, b) => {
+    const eqA = a.netEquity != null ? a.netEquity : (a.total || 0);
+    const eqB = b.netEquity != null ? b.netEquity : (b.total || 0);
+    if (Math.abs(eqB - eqA) > 0.01) return eqB - eqA;
+    if (Math.abs((b.crisisAlpha || 0) - (a.crisisAlpha || 0)) > 0.001) return (b.crisisAlpha || 0) - (a.crisisAlpha || 0);
+    if ((a.marginBreaches || 0) !== (b.marginBreaches || 0)) return (a.marginBreaches || 0) - (b.marginBreaches || 0);
+    if (Math.abs((a.maxDrawdown || 0) - (b.maxDrawdown || 0)) > 0.001) return (a.maxDrawdown || 0) - (b.maxDrawdown || 0);
+    return (a.lastTradeTs || Date.now()) - (b.lastTradeTs || Date.now());
+  });
+}
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+const fmt      = (n, d=2) => Number(n).toLocaleString("en-US", { minimumFractionDigits:d, maximumFractionDigits:d });
+const fmtUSD   = n => "$" + fmt(n);
+const fmtK     = n => Math.abs(n) >= 1000 ? (n<0?"-":"") + "$" + fmt(Math.abs(n)/1000,1) + "K" : fmtUSD(n);
+const clamp    = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const rnd      = (lo, hi) => lo + Math.random() * (hi - lo);
+const fmtTS    = ts => new Date(ts).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
+const fmtDT    = (ts, tf) => {
+  const d = new Date(ts);
+  if (tf==="5m"||tf==="15m") return d.toLocaleDateString([],{weekday:"short",month:"short",day:"numeric"})+" "+fmtTS(ts);
+  if (tf==="1h"||tf==="4h")  return d.toLocaleDateString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
+  if (tf==="1D")              return d.toLocaleDateString([],{month:"long",day:"numeric",year:"numeric"});
+  return d.toLocaleDateString([],{month:"short",year:"numeric"});
+};
+const nowShort = () => new Date().toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" });
+const nowFull  = () => new Date().toLocaleTimeString([], { hour:"2-digit", minute:"2-digit", second:"2-digit" });
+const positionSide = pos => (pos?.qty || 0) < 0 ? "short" : "long";
+const longQty = pos => Math.max(0, pos?.qty || 0);
+const shortQty = pos => Math.max(0, -(pos?.qty || 0));
+
+function getMacroInferenceClues({ theme = "", isStoryline = false } = {}) {
+  const clueMap = {
+    rates: [
+      "Trace the move through discount rates, refinancing pressure, and balance-sheet resilience.",
+      "The first winners are not always the same as the second-order beneficiaries.",
+      "Watch who can fund growth internally versus who needs cheap capital."
+    ],
+    trade: [
+      "Think through compliance friction, procurement shifts, and supply-chain bottlenecks.",
+      "The most exposed names may be one step removed from the headline itself.",
+      "Domestic capacity and import dependence will not react the same way."
+    ],
+    oil: [
+      "Separate direct commodity beneficiaries from businesses absorbing higher transport and insurance costs.",
+      "Second-round margin pressure can matter more than the first crude-price spike.",
+      "Look for pricing power versus pure input-cost exposure."
+    ],
+    funding: [
+      "Watch collateral quality, refinancing risk, and sensitivity to tighter liquidity.",
+      "A relief headline does not always fix the balance-sheet plumbing underneath it.",
+      "The cleanest trade may be in resilience, not raw beta."
+    ],
+    election: [
+      "Policy rhetoric changes subsidy math, regulation risk, and tariff expectations at the same time.",
+      "Follow who gains probability-adjusted policy support and who becomes a political target.",
+      "The headline matters less than the cash-flow channel it opens or closes."
+    ],
+    credit: [
+      "Repricing usually starts with refinancing risk before it shows up in earnings.",
+      "Cash-flow certainty and balance-sheet durability become relative advantages in stress.",
+      "The most fragile capital structures are rarely the only losers."
+    ],
+    repricing: [
+      "A late-round macro repricing can reward hedges more than hot takes.",
+      "Distinguish liquidity relief from a true improvement in fundamentals.",
+      "The best inference often comes from what stops falling first."
+    ],
+  };
+  if (clueMap[theme]) return clueMap[theme];
+  return isStoryline
+    ? [
+        "Work from first-order and second-order effects instead of waiting for direct ticker hints.",
+        "Price action, order flow, and balance-sheet exposure should help confirm your read.",
+        "The strongest trade may sit one link away from the headline."
+      ]
+    : [
+        "Translate the macro bulletin into financing costs, demand shifts, and pricing power.",
+        "Look for second-order winners and losers instead of only the obvious first move.",
+        "Use the tape to confirm your thesis rather than expecting the bulletin to name names."
+      ];
+}
+
+function buildMacroNewsEntry(events = [], { sourceLabel = "MACRO EVENT", targetRound = null, tagOverride = null } = {}) {
+  const lead = events[0];
+  if (!lead) return null;
+  return {
+    ticker: "MARKET",
+    hideTicker: true,
+    headline: lead.eventName
+      ? `${lead.eventIcon ? `${lead.eventIcon} ` : ""}${lead.eventName}`
+      : (lead.headline || "Macro bulletin"),
+    detail: lead.storylineBlurb || lead.eventSubheadline || lead.detail || "Markets are repricing a macro bulletin. Teams must infer the exposed names from first principles.",
+    sentiment: "neutral",
+    tag: tagOverride || lead.eventTag || (lead.political ? sourceLabel : "MARKET UPDATE"),
+    time: nowShort(),
+    round: Number.isFinite(lead.storylineRound) ? lead.storylineRound : targetRound,
+    storylineStage: lead.storylineStage || null,
+    playerClues: Array.isArray(lead.playerClues) && lead.playerClues.length
+      ? lead.playerClues
+      : getMacroInferenceClues({ theme: lead.theme, isStoryline: !!lead.storyline }),
+    macroQuestion: lead.macroQuestion || null,
+  };
+}
+const DERIVATIVE_STRATEGY_PRESETS = [
+  { id:"protective_put", label:"Protective Put", tone:"#22c55e", description:"Buy downside insurance under shares you already own.", needsLongShares:true },
+  { id:"collar", label:"Collar", tone:"#38bdf8", description:"Buy a put and finance it by selling an upside call.", needsLongShares:true },
+  { id:"bull_put_spread", label:"Bull Put Spread", tone:"#fbbf24", description:"Collect premium while defining downside risk below the market." },
+  { id:"bear_call_spread", label:"Bear Call Spread", tone:"#f97316", description:"Fade upside with a capped-risk call credit spread." },
+  { id:"iron_condor", label:"Iron Condor", tone:"#a78bfa", description:"Sell a range-bound volatility structure with defined wings." },
+  { id:"bull_iron_condor", label:"Bull Iron Condor", tone:"#00f5c4", description:"Skew the condor slightly bullish by moving the call wing higher." },
+];
+
+function buildDerivativeOptionChain(catalog = [], ticker = "") {
+  const options = (catalog || [])
+    .filter(instrument => instrument.underlyingTicker === ticker && instrument.kind !== "future");
+  return {
+    calls: [...options.filter(instrument => instrument.kind === "call")].sort((a, b) => (a.strike - b.strike) || ((a.strikeStep || 0) - (b.strikeStep || 0))),
+    puts: [...options.filter(instrument => instrument.kind === "put")].sort((a, b) => (a.strike - b.strike) || ((a.strikeStep || 0) - (b.strikeStep || 0))),
+    future: (catalog || []).find(instrument => instrument.underlyingTicker === ticker && instrument.kind === "future") || null,
+  };
+}
+
+function pickDerivativeContractByStep(contracts = [], targetStep = 0) {
+  if (!contracts.length) return null;
+  const exact = contracts.find(contract => Math.abs((contract.strikeStep || 0) - targetStep) < 1e-9);
+  if (exact) return exact;
+  const preferredSign = Math.sign(targetStep);
+  const filtered = targetStep === 0
+    ? contracts
+    : contracts.filter(contract => Math.sign(contract.strikeStep || 0) === preferredSign || contract.isAtm);
+  const pool = filtered.length ? filtered : contracts;
+  return pool.reduce((best, contract) => {
+    if (!best) return contract;
+    const bestDistance = Math.abs((best.strikeStep || 0) - targetStep);
+    const contractDistance = Math.abs((contract.strikeStep || 0) - targetStep);
+    if (contractDistance !== bestDistance) return contractDistance < bestDistance ? contract : best;
+    return Math.abs(contract.strike) < Math.abs(best.strike) ? contract : best;
+  }, null);
+}
+
+function getDerivativeStrategyPackageMetrics({
+  strategyId = "protective_put",
+  legs = [],
+  netCashflow = 0,
+  coveredShares = 0,
+} = {}) {
+  if (!legs.length) {
+    return {
+      totalRisk: 0,
+      maxGain: Math.max(0, netCashflow),
+      maxLoss: Math.max(0, -netCashflow),
+    };
+  }
+
+  if (strategyId === "protective_put" || strategyId === "collar") {
+    const maxLoss = Math.max(0, -netCashflow);
+    return {
+      totalRisk: maxLoss,
+      maxGain: Math.max(0, netCashflow),
+      maxLoss,
+    };
+  }
+
+  if (strategyId === "bull_put_spread" || strategyId === "bear_call_spread") {
+    const shortLeg = legs.find(leg => leg.side === "short");
+    const longLeg = legs.find(leg => leg.side === "long");
+    const width = Math.abs((shortLeg?.instrument.strike || 0) - (longLeg?.instrument.strike || 0)) * coveredShares;
+    const maxGain = Math.max(0, netCashflow);
+    const maxLoss = Math.max(0, width - maxGain);
+    return { totalRisk: maxLoss, maxGain, maxLoss, width };
+  }
+
+  if (strategyId === "iron_condor" || strategyId === "bull_iron_condor") {
+    const shortPut = legs.find(leg => leg.side === "short" && leg.instrument.kind === "put");
+    const longPut = legs.find(leg => leg.side === "long" && leg.instrument.kind === "put");
+    const shortCall = legs.find(leg => leg.side === "short" && leg.instrument.kind === "call");
+    const longCall = legs.find(leg => leg.side === "long" && leg.instrument.kind === "call");
+    const putWidth = Math.max(0, ((shortPut?.instrument.strike || 0) - (longPut?.instrument.strike || 0)) * coveredShares);
+    const callWidth = Math.max(0, ((longCall?.instrument.strike || 0) - (shortCall?.instrument.strike || 0)) * coveredShares);
+    const maxGain = Math.max(0, netCashflow);
+    const maxLoss = Math.max(0, Math.max(putWidth, callWidth) - maxGain);
+    return { totalRisk: maxLoss, maxGain, maxLoss, putWidth, callWidth };
+  }
+
+  const grossRisk = legs.reduce((sum, leg) => sum + Math.max(0, leg.risk || 0), 0);
+  return {
+    totalRisk: grossRisk,
+    maxGain: Math.max(0, netCashflow),
+    maxLoss: grossRisk,
+  };
+}
+
+function buildDerivativeStrategyPreview({
+  catalog = [],
+  derivativeQuoteMap = {},
+  holdings = {},
+  ticker = "",
+  strategyId = "protective_put",
+  lots = 1,
+} = {}) {
+  const preset = DERIVATIVE_STRATEGY_PRESETS.find(entry => entry.id === strategyId) || DERIVATIVE_STRATEGY_PRESETS[0];
+  if (!ticker) return { error:"Select an underlying for the hedge builder.", preset };
+  const chain = buildDerivativeOptionChain(catalog, ticker);
+  const contractMultiplier = chain.future?.multiplier || getDerivativeContractMultiplier(ticker);
+  const bundleLots = Math.max(1, Number(lots) || 1);
+  const coveredShares = bundleLots * contractMultiplier;
+  const longShares = longQty(holdings[ticker]);
+  if (preset.needsLongShares && longShares < coveredShares) {
+    return {
+      preset,
+      error:`${preset.label} needs ${coveredShares} long shares of ${ticker}. Current inventory: ${longShares}.`,
+      coveredShares,
+      longShares,
+      multiplier: contractMultiplier,
+    };
+  }
+
+  const optionPicker = (kind, step) => pickDerivativeContractByStep(kind === "call" ? chain.calls : chain.puts, step);
+  let rawLegs = [];
+
+  if (strategyId === "protective_put") {
+    rawLegs = [
+      { instrument: optionPicker("put", -0.06) || optionPicker("put", 0), side:"long" },
+    ];
+  } else if (strategyId === "collar") {
+    rawLegs = [
+      { instrument: optionPicker("put", -0.06) || optionPicker("put", 0), side:"long" },
+      { instrument: optionPicker("call", 0.06) || optionPicker("call", 0.12), side:"short" },
+    ];
+  } else if (strategyId === "bull_put_spread") {
+    rawLegs = [
+      { instrument: optionPicker("put", -0.06), side:"short" },
+      { instrument: optionPicker("put", -0.12), side:"long" },
+    ];
+  } else if (strategyId === "bear_call_spread") {
+    rawLegs = [
+      { instrument: optionPicker("call", 0.06), side:"short" },
+      { instrument: optionPicker("call", 0.12), side:"long" },
+    ];
+  } else if (strategyId === "iron_condor") {
+    rawLegs = [
+      { instrument: optionPicker("put", -0.12), side:"long" },
+      { instrument: optionPicker("put", -0.06), side:"short" },
+      { instrument: optionPicker("call", 0.06), side:"short" },
+      { instrument: optionPicker("call", 0.12), side:"long" },
+    ];
+  } else if (strategyId === "bull_iron_condor") {
+    rawLegs = [
+      { instrument: optionPicker("put", -0.12), side:"long" },
+      { instrument: optionPicker("put", -0.06), side:"short" },
+      { instrument: optionPicker("call", 0.12), side:"short" },
+      { instrument: optionPicker("call", 0.18), side:"long" },
+    ];
+  }
+
+  if (rawLegs.some(leg => !leg.instrument)) {
+    return {
+      preset,
+      error:"This underlying does not have enough distinct strikes for that structure yet.",
+      coveredShares,
+      longShares,
+      multiplier: contractMultiplier,
+    };
+  }
+  if (new Set(rawLegs.map(leg => leg.instrument.id)).size !== rawLegs.length) {
+    return {
+      preset,
+      error:"That strategy needs wider strike spacing than this option chain currently offers.",
+      coveredShares,
+      longShares,
+      multiplier: contractMultiplier,
+    };
+  }
+
+  const legs = rawLegs.map((leg, index) => {
+    const quote = derivativeQuoteMap[leg.instrument.id] || leg.instrument.quote;
+    const multiplier = leg.instrument.multiplier || quote?.multiplier || contractMultiplier;
+    const unitPrice = leg.side === "short" ? (quote?.bid || 0) : (quote?.ask || 0);
+    const cashflow = leg.instrument.kind === "future"
+      ? 0
+      : unitPrice * bundleLots * multiplier * (leg.side === "short" ? 1 : -1);
+    const risk = getDerivativeRiskEquivalent(quote, leg.side) * bundleLots;
+    return {
+      ...leg,
+      id: `${leg.instrument.id}:${leg.side}:${index}`,
+      qty: bundleLots,
+      multiplier,
+      quote,
+      unitPrice,
+      cashflow,
+      risk,
+    };
+  });
+
+  const netCashflow = legs.reduce((sum, leg) => sum + leg.cashflow, 0);
+  const packageMetrics = getDerivativeStrategyPackageMetrics({
+    strategyId,
+    legs,
+    netCashflow,
+    coveredShares,
+  });
+  const totalRisk = packageMetrics.totalRisk;
+  const highlightBase = [
+    { label:"NET ENTRY", value:`${netCashflow >= 0 ? "CREDIT" : "DEBIT"} ${fmtUSD(Math.abs(netCashflow))}`, tone: netCashflow >= 0 ? "#00f5c4" : "#fbbf24" },
+    { label:"RISK LOAD", value:fmtUSD(totalRisk), tone:"#f97316" },
+    { label:"LOTS", value:`${bundleLots} x ${contractMultiplier} share lot`, tone:"#94a3b8" },
+  ];
+  const profile = [];
+
+  if (strategyId === "protective_put") {
+    const putLeg = legs[0];
+    profile.push(
+      { label:"HEDGE FLOOR", value:fmtUSD(putLeg.instrument.strike || 0), tone:"#22c55e" },
+      { label:"COVERS", value:`${coveredShares} shares`, tone:"#38bdf8" }
+    );
+  } else if (strategyId === "collar") {
+    const putLeg = legs.find(leg => leg.instrument.kind === "put");
+    const callLeg = legs.find(leg => leg.instrument.kind === "call");
+    profile.push(
+      { label:"FLOOR", value:fmtUSD(putLeg?.instrument.strike || 0), tone:"#22c55e" },
+      { label:"CAP", value:fmtUSD(callLeg?.instrument.strike || 0), tone:"#ef4444" }
+    );
+  } else if (strategyId === "bull_put_spread" || strategyId === "bear_call_spread") {
+    profile.push(
+      { label:"MAX GAIN", value:fmtUSD(packageMetrics.maxGain || 0), tone:"#00f5c4" },
+      { label:"MAX LOSS", value:fmtUSD(packageMetrics.maxLoss || 0), tone:"#ef4444" }
+    );
+  } else {
+    const shortPut = legs.find(leg => leg.side === "short" && leg.instrument.kind === "put");
+    const longPut = legs.find(leg => leg.side === "long" && leg.instrument.kind === "put");
+    const shortCall = legs.find(leg => leg.side === "short" && leg.instrument.kind === "call");
+    const longCall = legs.find(leg => leg.side === "long" && leg.instrument.kind === "call");
+    profile.push(
+      { label:"MAX GAIN", value:fmtUSD(packageMetrics.maxGain || 0), tone:"#00f5c4" },
+      { label:"MAX LOSS", value:fmtUSD(packageMetrics.maxLoss || 0), tone:"#ef4444" },
+      { label:"WIN ZONE", value:`${fmtUSD(shortPut?.instrument.strike || 0)} to ${fmtUSD(shortCall?.instrument.strike || 0)}`, tone:"#a78bfa" }
+    );
+  }
+
+  return {
+    preset,
+    ticker,
+    lots: bundleLots,
+    legs,
+    orderLegs: legs.map(leg => ({
+      instrumentId: leg.instrument.id,
+      qty: leg.qty,
+      side: leg.side,
+    })),
+    coveredShares,
+    longShares,
+    multiplier: contractMultiplier,
+    netCashflow,
+    totalRisk,
+    highlights: [...highlightBase, ...profile].slice(0, 5),
+  };
+}
+const grossPositionValue = (price, pos) => Math.abs((price || pos?.avgCost || 0) * (pos?.qty || 0));
+const calcBallReturn = prices => {
+  const ballPrice = prices?.BALL || BALL_BASE;
+  return ((ballPrice - BALL_BASE) / BALL_BASE) * 100;
+};
+
+function calcVariance(values) {
+  if (!values || values.length < 2) return 0;
+  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  return values.reduce((sum, value) => sum + Math.pow(value - mean, 2), 0) / values.length;
+}
+
+function calcCovariance(xs, ys) {
+  if (!xs || !ys) return 0;
+  const len = Math.min(xs.length, ys.length);
+  if (len < 2) return 0;
+  const xSlice = xs.slice(xs.length - len);
+  const ySlice = ys.slice(ys.length - len);
+  const xMean = xSlice.reduce((sum, value) => sum + value, 0) / len;
+  const yMean = ySlice.reduce((sum, value) => sum + value, 0) / len;
+  return xSlice.reduce((sum, value, index) => sum + (value - xMean) * (ySlice[index] - yMean), 0) / len;
+}
+
+function priceSeriesReturns(series = []) {
+  const returns = [];
+  for (let i = 1; i < series.length; i++) {
+    const prev = series[i - 1];
+    const next = series[i];
+    if (!prev || !next) continue;
+    returns.push((next - prev) / prev);
+  }
+  return returns;
+}
+
+function getTickerLiquidityProxy(stock) {
+  if (!stock) return 150000;
+  if (stock.totalMarket) return 420000;
+  if (stock.crossSector) return 280000;
+  const volAdj = clamp(1.35 - (((stock.volatility || 1) - 1) * 0.22), 0.65, 1.4);
+  const priceAdj = clamp((stock.basePrice || 100) / 120, 0.55, 1.8);
+  return 150000 * volAdj * priceAdj;
+}
+
+function getOrderFlowDisplay(summary = null) {
+  const pressure = summary?.pressure || 0;
+  const absPressure = Math.abs(pressure);
+  if (absPressure >= 0.35) {
+    return {
+      label: pressure > 0 ? "HEAVY BUY" : "HEAVY SELL",
+      color: pressure > 0 ? "#00f5c4" : "#ef4444",
+    };
+  }
+  if (absPressure >= 0.18) {
+    return {
+      label: pressure > 0 ? "BUY PRESSURE" : "SELL PRESSURE",
+      color: pressure > 0 ? "#4ade80" : "#fb923c",
+    };
+  }
+  if (absPressure >= 0.08) {
+    return {
+      label: pressure > 0 ? "BUY TILT" : "SELL TILT",
+      color: pressure > 0 ? "#86efac" : "#fdba74",
+    };
+  }
+  return { label:"BALANCED", color:"#64748b" };
+}
+
+function finalizeOrderFlowSnapshotEntries(entries = {}) {
+  return Object.fromEntries(
+    Object.entries(entries || {}).map(([ticker, rawEntry]) => {
+      const entry = rawEntry || {};
+      const liquidity = Math.max(1, entry.liquidity || 1);
+      const buyNotional = Math.max(0, entry.buyNotional || 0);
+      const sellNotional = Math.max(0, entry.sellNotional || 0);
+      const grossNotional = Math.max(1, buyNotional + sellNotional || entry.grossNotional || 0);
+      const imbalance = grossNotional > 0 ? ((buyNotional - sellNotional) / grossNotional) : 0;
+      const participation = Number.isFinite(entry.participation)
+        ? clamp(entry.participation, 0, 1.25)
+        : clamp(grossNotional / liquidity, 0, 1.25);
+      const pressure = Number.isFinite(entry.pressure)
+        ? clamp(entry.pressure, -1, 1)
+        : clamp(imbalance * participation, -1, 1);
+      const buyPct = Math.round((buyNotional / grossNotional) * 100);
+      const sellPct = 100 - buyPct;
+      const display = getOrderFlowDisplay({ pressure });
+      return [ticker, {
+        ticker,
+        liquidity,
+        buyNotional,
+        sellNotional,
+        grossNotional,
+        netNotional: buyNotional - sellNotional,
+        buyCount: Math.max(0, Math.round(entry.buyCount || 0)),
+        sellCount: Math.max(0, Math.round(entry.sellCount || 0)),
+        imbalance,
+        participation,
+        pressure,
+        buyPct,
+        sellPct,
+        label: display.label,
+        color: display.color,
+      }];
+    }).filter(([, entry]) => entry.grossNotional > 0)
+  );
+}
+
+function inferTradeFlowDirection(trade = {}) {
+  if (Number.isFinite(trade.flowDirection)) return clamp(trade.flowDirection, -1, 1);
+  const action = String(trade.action || trade.type || "").toUpperCase();
+  if (trade.assetType === "derivative" && trade.derivativeKind) {
+    if (action.includes("CLOSE") || trade.type === "DERIV_CLOSE" || trade.type === "DERIV_EXPIRE") {
+      return getDerivativeTradeFlowDirection(trade.derivativeKind, trade.derivativeSide || "long", "close");
+    }
+    return getDerivativeTradeFlowDirection(trade.derivativeKind, trade.derivativeSide || "long", "open");
+  }
+  if (action === "BUY" || action === "COVER" || action === "FUT LONG" || action === "CALL BUY") return 1;
+  if (action === "SELL" || action === "SHORT" || action === "FUT SHORT" || action === "PUT BUY" || action === "CALL SELL") return -1;
+  if (action === "PUT SELL") return 1;
+  if (action === "FUT CLOSE") return trade.derivativeSide === "short" ? 1 : -1;
+  if (action === "OPT CLOSE") return trade.derivativeKind === "put" ? 1 : -1;
+  return 0;
+}
+
+function inferTradeFlowWeight(trade = {}) {
+  if (Number.isFinite(trade.flowWeight)) return Math.abs(trade.flowWeight);
+  const qty = Math.max(1, Math.abs(trade.qty || 1));
+  const price = Math.max(1, Math.abs(trade.price || 0));
+  const multiplier = Math.max(1, Math.abs(trade.multiplier || 1));
+  const notional = qty * price * multiplier;
+  return trade.assetType === "derivative" ? notional * 1.25 : notional;
+}
+
+function normalizeTradeFeedItem(item = {}) {
+  const underlyingTicker = item.underlyingTicker || item.ticker;
+  if (!underlyingTicker) return null;
+  const ts = Number.isFinite(item.ts) ? item.ts : (Number.isFinite(item.id) ? item.id : Date.now());
+  return {
+    ...item,
+    ticker: underlyingTicker,
+    underlyingTicker,
+    ts,
+    flowDirection: inferTradeFlowDirection(item),
+    flowWeight: inferTradeFlowWeight(item),
+  };
+}
+
+function buildOrderFlowSnapshot(events = [], now = Date.now()) {
+  const snapshot = {};
+  (events || []).forEach(evt => {
+    if (!evt?.underlyingTicker || !Number.isFinite(evt.ts)) return;
+    if ((now - evt.ts) > ORDER_FLOW_WINDOW_MS) return;
+    const stock = ALL_STOCKS.find(item => item.ticker === evt.underlyingTicker);
+    if (!stock) return;
+    const age = Math.max(0, now - evt.ts);
+    const decay = clamp(1 - (age / ORDER_FLOW_WINDOW_MS), 0.15, 1);
+    const weightedFlow = Math.max(0, evt.flowWeight || 0) * decay;
+    if (weightedFlow <= 0) return;
+    const entry = snapshot[evt.underlyingTicker] || {
+      ticker: evt.underlyingTicker,
+      buyNotional: 0,
+      sellNotional: 0,
+      buyCount: 0,
+      sellCount: 0,
+      grossNotional: 0,
+      netNotional: 0,
+      liquidity: getTickerLiquidityProxy(stock),
+    };
+    if ((evt.flowDirection || 0) >= 0) {
+      entry.buyNotional += weightedFlow;
+      entry.buyCount += 1;
+    } else {
+      entry.sellNotional += weightedFlow;
+      entry.sellCount += 1;
+    }
+    entry.grossNotional += weightedFlow;
+    entry.netNotional += weightedFlow * (evt.flowDirection || 0);
+    snapshot[evt.underlyingTicker] = entry;
+  });
+
+  return finalizeOrderFlowSnapshotEntries(snapshot);
+}
+
+function mergeOrderFlowSnapshots(...snapshots) {
+  const merged = {};
+  (snapshots || []).forEach(snapshot => {
+    Object.entries(snapshot || {}).forEach(([ticker, entry]) => {
+      if (!entry) return;
+      const target = merged[ticker] || {
+        ticker,
+        liquidity: entry.liquidity || 1,
+        buyNotional: 0,
+        sellNotional: 0,
+        buyCount: 0,
+        sellCount: 0,
+      };
+      target.liquidity = Math.max(target.liquidity || 1, entry.liquidity || 1);
+      target.buyNotional += Math.max(0, entry.buyNotional || 0);
+      target.sellNotional += Math.max(0, entry.sellNotional || 0);
+      target.buyCount += Math.max(0, entry.buyCount || 0);
+      target.sellCount += Math.max(0, entry.sellCount || 0);
+      merged[ticker] = target;
+    });
+  });
+  return finalizeOrderFlowSnapshotEntries(merged);
+}
+
+function buildSyntheticOrderFlowSnapshot({
+  prices = {},
+  history = {},
+  sentiment = "neutral",
+  sectorBiases = {},
+  previousSnapshot = {},
+  tradeSnapshot = {},
+} = {}) {
+  const globalBias = sentiment === "bull"
+    ? 0.16
+    : sentiment === "bear"
+      ? -0.16
+      : 0;
+
+  const synthetic = {};
+  ALL_STOCKS.forEach(stock => {
+    const spot = prices[stock.ticker] || stock.basePrice || 100;
+    const series = history[stock.ticker] || [];
+    const lookback = series[Math.max(0, series.length - 6)] || spot;
+    const momentum = lookback > 0 ? clamp((spot - lookback) / lookback, -0.18, 0.18) : 0;
+    const sectorBias = sectorBiases?.[stock.sectorId] || "neutral";
+    const sectorPressure = sectorBias === "bull"
+      ? 0.2
+      : sectorBias === "bear"
+        ? -0.2
+        : sectorBias === "volatile"
+          ? rnd(-0.14, 0.14)
+          : globalBias;
+    const tradePressure = tradeSnapshot[stock.ticker]?.pressure || 0;
+    const prevPressure = previousSnapshot[stock.ticker]?.pressure || 0;
+    const targetPressure = clamp(
+      (momentum * 1.7) +
+      sectorPressure +
+      (tradePressure * 0.7) +
+      rnd(-0.12, 0.12),
+      -0.9,
+      0.9
+    );
+    const pressure = clamp((prevPressure * 0.58) + (targetPressure * 0.42), -0.9, 0.9);
+    const participation = clamp(
+      0.22 + (Math.abs(pressure) * 0.48) + (Math.abs(momentum) * 0.35) + rnd(0, 0.08),
+      0.18,
+      0.95
+    );
+    const liquidity = getTickerLiquidityProxy(stock);
+    const grossNotional = liquidity * participation;
+    const buyShare = clamp(0.5 + (pressure / 2), 0.04, 0.96);
+    const buyCountBase = Math.round(8 + (participation * 18));
+    synthetic[stock.ticker] = {
+      ticker: stock.ticker,
+      liquidity,
+      buyNotional: grossNotional * buyShare,
+      sellNotional: grossNotional * (1 - buyShare),
+      buyCount: Math.max(1, Math.round(buyCountBase * buyShare)),
+      sellCount: Math.max(1, Math.round(buyCountBase * (1 - buyShare))),
+    };
+  });
+
+  return finalizeOrderFlowSnapshotEntries(synthetic);
+}
+
+function calcAssetBetaFromSeries(assetSeries = [], marketSeries = []) {
+  const assetReturns = priceSeriesReturns(assetSeries);
+  const marketReturns = priceSeriesReturns(marketSeries);
+  const len = Math.min(assetReturns.length, marketReturns.length);
+  if (len < 2) return null;
+  const assetSlice = assetReturns.slice(assetReturns.length - len);
+  const marketSlice = marketReturns.slice(marketReturns.length - len);
+  const marketVariance = calcVariance(marketSlice);
+  if (marketVariance <= 0) return null;
+  return calcCovariance(assetSlice, marketSlice) / marketVariance;
+}
+
+function calcTickerAssetBeta(ticker, history = {}) {
+  if (!ticker) return null;
+  if (ticker === "BALL") return 1;
+  return calcAssetBetaFromSeries(history?.[ticker] || [], history?.BALL || []);
+}
+
+function calcHoldingAssetBetas(holdings = {}, history = {}) {
+  return Object.fromEntries(
+    Object.entries(holdings)
+      .filter(([, pos]) => (pos?.qty || 0) !== 0)
+      .map(([ticker]) => [ticker, calcTickerAssetBeta(ticker, history)])
+  );
+}
+
+function calcAverageAssetBeta(holdings = {}, prices = {}, history = {}, assetBetas = null) {
+  const entries = Object.entries(holdings).filter(([, pos]) => (pos?.qty || 0) !== 0);
+  if (entries.length === 0) return 0.5;
+
+  const betaMap = assetBetas || calcHoldingAssetBetas(holdings, history);
+  const grossExposure = entries.reduce((sum, [ticker, pos]) => (
+    sum + grossPositionValue(prices[ticker], pos)
+  ), 0);
+
+  if (grossExposure <= 0) return 0.5;
+
+  let beta = 0;
+  let weightedCoverage = 0;
+  entries.forEach(([ticker, pos]) => {
+    const assetBeta = betaMap[ticker];
+    if (assetBeta == null || !Number.isFinite(assetBeta)) return;
+    const weight = grossPositionValue(prices[ticker], pos) / grossExposure;
+    beta += weight * assetBeta;
+    weightedCoverage += weight;
+  });
+
+  if (weightedCoverage <= 0) return 0.5;
+  return beta / weightedCoverage;
+}
+
+function calcPortfolioBeta(holdings = {}, prices = {}, history = {}, assetBetas = null) {
+  const entries = Object.entries(holdings).filter(([, pos]) => (pos?.qty || 0) !== 0);
+  if (entries.length === 0) return 0.5;
+
+  const betaMap = assetBetas || calcHoldingAssetBetas(holdings, history);
+  const grossExposure = entries.reduce((sum, [ticker, pos]) => (
+    sum + grossPositionValue(prices[ticker], pos)
+  ), 0);
+
+  if (grossExposure <= 0) return 0.5;
+
+  let beta = 0;
+  let weightedCoverage = 0;
+  entries.forEach(([ticker, pos]) => {
+    const assetBeta = betaMap[ticker];
+    if (assetBeta == null || !Number.isFinite(assetBeta)) return;
+    const weight = grossPositionValue(prices[ticker], pos) / grossExposure;
+    beta += weight * assetBeta * (positionSide(pos) === "short" ? -1 : 1);
+    weightedCoverage += weight;
+  });
+
+  if (weightedCoverage <= 0) return 0.5;
+  return beta / weightedCoverage;
+}
+
+function initPrices()  { return Object.fromEntries(ALL_STOCKS.map(s => [s.ticker, s.basePrice * (0.85 + Math.random() * 0.3)])); }
+function initHistory(p){ return Object.fromEntries(ALL_STOCKS.map(s => [s.ticker, Array(HISTORY_LEN).fill(p[s.ticker])])); }
+function initBots()    { return AI_BOTS.map(b => ({ ...b, cash:INITIAL_CASH, holdings:{}, pnl:0, trades:0, wins:0, closedTrades:0, maxDrawdown:1, uniqueSectors:0, peakValue:INITIAL_CASH })); }
+
+// ─── PORTFOLIO ANALYTICS ─────────────────────────────────────────────────────
+function PortfolioAnalytics({
+  holdings,
+  transactions,
+  prices,
+  cash,
+  restrictedCash = 0,
+  derivativePositions = {},
+  derivativeQuoteMap = {},
+  accruedBorrowCost = 0,
+  accruedFundingCost = 0,
+  initCash,
+  history,
+  roundRule = null,
+}) {
+  const assetBetas = calcHoldingAssetBetas(holdings, history);
+  const derivativeMetrics = calcDerivativePortfolioMetrics(derivativePositions, derivativeQuoteMap);
+  const openPnL = {};
+  Object.entries(holdings).forEach(([ticker, pos]) => {
+    const cur = prices[ticker] || pos.avgCost;
+    const direction = pos.qty < 0 ? -1 : 1;
+    openPnL[ticker] = {
+      unrealized: (cur - pos.avgCost) * pos.qty,
+      pct: ((cur - pos.avgCost) / pos.avgCost) * 100 * direction,
+      qty: pos.qty, avgCost: pos.avgCost, curPrice: cur,
+      value: cur * pos.qty,
+      side: positionSide(pos),
+      assetBeta: assetBetas[ticker] ?? null,
+    };
+  });
+  const totalHoldingsValue = Object.values(openPnL).reduce((s,p) => s + p.value, 0);
+  const longExposure       = Object.values(openPnL).reduce((s,p) => s + (p.side === "long" ? Math.abs(p.value) : 0), 0);
+  const shortExposure      = Object.values(openPnL).reduce((s,p) => s + (p.side === "short" ? Math.abs(p.value) : 0), 0);
+  const grossExposure      = longExposure + shortExposure + (derivativeMetrics.grossExposure || 0);
+  const totalUnrealized    = Object.values(openPnL).reduce((s,p) => s + p.unrealized, 0) + (derivativeMetrics.totalUnrealized || 0);
+  const realizedByTicker = {};
+  let totalRealized = 0, wins = 0, losses = 0;
+  transactions.filter(t => t.type === "SELL" || t.type === "COVER" || t.type === "DERIV_CLOSE" || t.type === "DERIV_EXPIRE").forEach(t => {
+    const gain = calcClosedTradeGain(t);
+    const realizedKey = t.ticker || t.underlyingTicker || t.instrumentId || "DERIV";
+    if (!realizedByTicker[realizedKey]) realizedByTicker[realizedKey] = 0;
+    realizedByTicker[realizedKey] += gain;
+    totalRealized += gain;
+    if (gain > 0) wins++; else losses++;
+  });
+  const totalCarryCost = (accruedBorrowCost || 0) + (accruedFundingCost || 0);
+  const markedToMarketEquity = (cash || 0) + (restrictedCash || 0) + totalHoldingsValue + (derivativeMetrics.totalValue || 0);
+  const netEquity = markedToMarketEquity - totalCarryCost;
+  const leverageUsed = Math.max(0, grossExposure - netEquity);
+  const initialMarginRate = roundRule?.initialMargin || 0.40;
+  const maintenanceMarginRate = roundRule?.maintenanceMargin || 0.35;
+  const initialRequirement = grossExposure * initialMarginRate;
+  const maintenanceRequirement = grossExposure * maintenanceMarginRate;
+  const marginBuffer = netEquity - maintenanceRequirement;
+  const marginBufferPct = grossExposure > 0 ? (marginBuffer / grossExposure) * 100 : 100;
+  const buyingPower = netEquity > 0 ? Math.max(0, (netEquity / initialMarginRate) - grossExposure) : 0;
+  const totalPnL = totalUnrealized + totalRealized - totalCarryCost;
+  const totalVal = netEquity;
+  const roi      = initCash > 0 ? ((netEquity - initCash) / initCash) * 100 : 0;
+  const averageAssetBeta = calcAverageAssetBeta(holdings, prices, history, assetBetas);
+  const portfolioBeta = calcPortfolioBeta(holdings, prices, history, assetBetas);
+  return { openPnL, totalHoldingsValue, totalUnrealized, totalRealized,
+           totalPnL, roi, totalVal, wins, losses, realizedByTicker,
+           grossExposure, longExposure, shortExposure, restrictedCash,
+           markedToMarketEquity, netEquity, totalCarryCost, accruedBorrowCost, accruedFundingCost,
+           leverageUsed, initialRequirement, maintenanceRequirement, marginBuffer, marginBufferPct,
+           buyingPower, assetBetas, averageAssetBeta, portfolioBeta,
+           derivativeOpenPnL: derivativeMetrics.openPnL,
+           derivativeValue: derivativeMetrics.totalValue || 0,
+           derivativeUnrealized: derivativeMetrics.totalUnrealized || 0,
+           futuresExposure: derivativeMetrics.futuresExposure || 0,
+           optionExposure: derivativeMetrics.optionExposure || 0 };
+}
+
+function calcHoldingsValue(holdings = {}, prices = {}) {
+  return Object.entries(holdings).reduce((sum, [ticker, pos]) => (
+    sum + ((prices[ticker] || pos?.avgCost || 0) * (pos?.qty || 0))
+  ), 0);
+}
+
+function calcClosedTradeGain(trade = {}) {
+  if (trade.gain != null && Number.isFinite(trade.gain)) return trade.gain;
+  if (trade.type === "DERIV_CLOSE" || trade.type === "DERIV_EXPIRE") {
+    if (Number.isFinite(trade.realizedValue) && Number.isFinite(trade.entryValue)) {
+      return trade.realizedValue - trade.entryValue;
+    }
+    return 0;
+  }
+  if (trade.type === "COVER") {
+    return ((trade.avgCostAtCover || 0) - (trade.price || 0)) * (trade.qty || 0);
+  }
+  if (trade.type === "SELL") {
+    return ((trade.price || 0) - (trade.avgCostAtSell || 0)) * (trade.qty || 0);
+  }
+  return 0;
+}
+
+function buildRoundScoreSnapshot({
+  round,
+  startingCapital,
+  cash,
+  restrictedCash,
+  holdings,
+  derivativePositions,
+  derivativeQuoteMap,
+  prices,
+  history,
+  transactions,
+  ballStartPrice,
+  prediction,
+  accruedBorrowCost = 0,
+  accruedFundingCost = 0,
+  roundBorrowCost = 0,
+  roundFundingCost = 0,
+  avgMarginBufferPct = 0,
+  marginBreaches = 0,
+}) {
+  const roundRule = ROUND_RULES[Math.max(0, (round || 1) - 1)] || ROUND_RULES[0];
+  const analytics = PortfolioAnalytics({
+    holdings,
+    transactions: transactions || [],
+    prices,
+    cash,
+    restrictedCash,
+    derivativePositions,
+    derivativeQuoteMap,
+    accruedBorrowCost,
+    accruedFundingCost,
+    initCash: startingCapital,
+    history,
+    roundRule,
+  });
+  const closingValue = analytics.netEquity;
+  const baseline = Number.isFinite(startingCapital) && startingCapital > 0
+    ? startingCapital
+    : (closingValue || INITIAL_CASH);
+  const currentBallPrice = prices?.BALL || BALL_BASE;
+  const ballBase = Number.isFinite(ballStartPrice) && ballStartPrice > 0
+    ? ballStartPrice
+    : BALL_BASE;
+  const closedTrades = (transactions || []).filter(t =>
+    t.type === "SELL" || t.type === "COVER" || t.type === "DERIV_CLOSE" || t.type === "DERIV_EXPIRE"
+  );
+  const sectors = uniqueTruthy((transactions || []).map(t => {
+    const refTicker = t.ticker || t.underlyingTicker;
+    return ALL_STOCKS.find(s => s.ticker === refTicker)?.sectorId;
+  }));
+  return normalizeLedgerRoundSnapshot({
+    round,
+    startingCapital: baseline,
+    endingValue: closingValue,
+    returnPct: baseline > 0 ? ((closingValue - baseline) / baseline) * 100 : 0,
+    ballReturn: ballBase > 0 ? ((currentBallPrice - ballBase) / ballBase) * 100 : 0,
+    assetBeta: analytics.averageAssetBeta,
+    portfolioBeta: analytics.portfolioBeta,
+    borrowCost: roundBorrowCost,
+    fundingCost: roundFundingCost,
+    avgMarginBufferPct,
+    marginBreaches,
+    closedTrades: closedTrades.length,
+    wins: closedTrades.filter(trade => calcClosedTradeGain(trade) > 0).length,
+    sectors,
+    predShown: !!prediction?.shown,
+    predAnswered: !!prediction?.answered,
+    predCorrect: !!prediction?.correct,
+    lastTradeTs: closedTrades.reduce((maxTs, trade) => Math.max(maxTs, Number(trade.id) || 0), 0),
+  });
+}
+
+function summarizeScoreSnapshots(snapshots = []) {
+  const rounds = (snapshots || []).map(normalizeLedgerRoundSnapshot);
+  return {
+    closedTrades: rounds.reduce((sum, round) => sum + (round.closedTrades || 0), 0),
+    wins: rounds.reduce((sum, round) => sum + (round.wins || 0), 0),
+    uniqueSectors: uniqueTruthy(rounds.flatMap(round => round.sectors || [])).length,
+    predShown: rounds.reduce((sum, round) => sum + (round.predShown || 0), 0),
+    predAnswered: rounds.reduce((sum, round) => sum + (round.predAnswered || 0), 0),
+    predCorrect: rounds.reduce((sum, round) => sum + (round.predCorrect || 0), 0),
+    totalBorrowCost: rounds.reduce((sum, round) => sum + (round.borrowCost || 0), 0),
+    totalFundingCost: rounds.reduce((sum, round) => sum + (round.fundingCost || 0), 0),
+    avgMarginBufferPct: averageFinite(rounds.map(round => round.avgMarginBufferPct)) ?? 0,
+    marginBreaches: rounds.reduce((sum, round) => sum + (round.marginBreaches || 0), 0),
+    assetBeta: averageFinite(rounds.map(round => round.assetBeta)),
+    portfolioBeta: averageFinite(rounds.map(round => round.portfolioBeta)),
+    lastTradeTs: rounds.reduce((maxTs, round) => Math.max(maxTs, round.lastTradeTs || 0), 0),
+    roundReturns: rounds.map(round => round.returnPct),
+  };
+}
+
+// ─── SPARKLINE ───────────────────────────────────────────────────────────────
+function Spark({ data, color, w=100, h=32 }) {
+  if (!data || data.length < 2) return <div style={{ width:w, height:h }} />;
+  const mn = Math.min(...data), mx = Math.max(...data), rng = mx - mn || 1;
+  const pts = data.map((v,i) => `${(i/(data.length-1))*w},${h - ((v-mn)/rng)*(h-3) + 1}`).join(" ");
+  const up = data[data.length-1] >= data[0];
+  const c  = up ? color : "#ef4444";
+  return (
+    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} style={{ display:"block", width:"100%" }}>
+      <polygon points={`0,${h} ${pts} ${w},${h}`} fill={`${c}22`} />
+      <polyline points={pts} fill="none" stroke={c} strokeWidth="1.8" strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+// ─── SECTOR BADGE ─────────────────────────────────────────────────────────────
+function SectorBadge({ sectorId, small }) {
+  const s = SECTORS.find(x => x.id === sectorId);
+  if (!s) return null;
+  return (
+    <span style={{
+      display:"inline-flex", alignItems:"center", gap:3,
+      fontSize: small ? 9 : 10, padding: small ? "1px 5px" : "2px 7px",
+      borderRadius:4, border:`1px solid ${s.color}44`,
+      background:`${s.color}18`, color:s.color, fontWeight:700,
+      letterSpacing:"0.04em", whiteSpace:"nowrap"
+    }}>
+      {s.icon} {s.label}
+    </span>
+  );
+}
+
+// ─── LEADERBOARD PANEL ────────────────────────────────────────────────────────
+function LeaderboardPanel({ entries, teams, initCash, highlight, showDetail, leaderHidden, mode="live" }) {
+  const [expandedRow, setExpandedRow] = useState(null);
+
+  if (!entries || entries.length === 0)
+    return <div style={{ color:"#334155", fontSize:12, padding:"12px 0" }}>No players yet.</div>;
+
+  if (leaderHidden) return (
+    <div style={{ background:"#0a0f1e", border:"1px solid #a78bfa44", borderRadius:12,
+      padding:"24px", textAlign:"center" }}>
+      <div style={{ fontSize:32, marginBottom:8 }}>🌑</div>
+      <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:800, fontSize:14,
+        color:"#a78bfa", marginBottom:6 }}>DARK POOL ROUND</div>
+      <div style={{ fontSize:11, color:"#475569" }}>Leaderboard hidden — trade on conviction alone.</div>
+    </div>
+  );
+
+  const ic = initCash || INITIAL_CASH;
+  const scored  = entries.map(e => ({ ...e, ...calcScore(e, ic, entries) }));
+  const ranked  = mode === "final" ? sortLeaderboard(scored) : sortLiveLeaderboard(scored);
+  const maxPrimary = Math.max(...ranked.map(e => Math.max(1, mode === "final" ? (e.score || 0) : (e.netEquity || e.total || 0))), 1);
+
+  // Rank each team on each individual indicator for percentile display
+  const rankOn = (field, higherBetter=true) => {
+    const sorted = [...ranked].sort((a,b) => higherBetter ? b[field]-a[field] : a[field]-b[field]);
+    return Object.fromEntries(sorted.map((e,i) => [e.name, i+1]));
+  };
+  const rankReturn   = rankOn("absoluteReturn");
+  const rankAlpha    = rankOn("alpha");
+  const rankDD       = rankOn("maxDrawdown", false); // lower DD = better rank
+  const rankMargin   = rankOn("marginBufferPct");
+  const rankFunding  = rankOn("fundingEfficiency");
+  const rankCrisis   = rankOn("crisisAlpha");
+  const rankWinRate  = rankOn("winRate");
+  const rankSectors  = rankOn("sectors");
+  const rankPred     = rankOn("predRate");
+  const rankPredPart = rankOn("predParticipation");
+
+  const n = ranked.length;
+  const medalColor = (rank) => rank===1?"#fbbf24":rank===2?"#94a3b8":rank===3?"#cd7c2f":"#334155";
+  const indColor   = (pts, max) => pts >= max*0.8 ? "#00f5c4" : pts >= max*0.5 ? "#fbbf24" : pts >= max*0.25 ? "#f97316" : "#ef4444";
+  const rankBadge  = (rank) => rank <= 3
+    ? <span style={{ fontSize:9, padding:"1px 5px", borderRadius:3, fontWeight:800,
+        background:medalColor(rank)+"22", color:medalColor(rank) }}>#{rank}</span>
+    : <span style={{ fontSize:9, color:"#334155" }}>#{rank}</span>;
+
+  return (
+    <div>
+      {ranked.map((e, i) => {
+        const team    = teams?.find(t => t.name === e.name);
+        const color   = team?.color || e.color || "#64748b";
+        const isMe    = e.name === highlight;
+        const primaryMetric = mode === "final" ? (e.score || 0) : (e.netEquity || e.total || 0);
+        const barPct  = clamp((primaryMetric / maxPrimary) * 100, 0, 100);
+        const isExpanded = expandedRow === e.name;
+        // Detect if tiebreaker was used
+        const tieWithPrev = i > 0 && Math.abs((mode === "final" ? ranked[i-1].score : (ranked[i-1].netEquity || ranked[i-1].total || 0)) - primaryMetric) < 0.001;
+
+        return (
+          <div key={e.name + i} style={{
+            background: isMe ? "rgba(0,245,196,0.06)" : "#0a0f1e",
+            border: `1px solid ${isMe ? "#00f5c460" : "#111827"}`,
+            borderRadius:10, marginBottom:7, overflow:"hidden", transition:"all 0.3s"
+          }}>
+            {/* Main row */}
+            <div style={{ padding:"11px 14px", cursor:"pointer" }}
+              onClick={() => setExpandedRow(isExpanded ? null : e.name)}>
+              <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:6 }}>
+                {/* Rank */}
+                <div style={{ width:24, textAlign:"center",
+                  fontFamily:"'Bebas Neue',sans-serif", fontSize:18,
+                  color: i===0?"#fbbf24":i===1?"#94a3b8":i===2?"#cd7c2f":"#475569" }}>
+                  {i+1}
+                </div>
+                {/* Name + color */}
+                <div style={{ width:10, height:10, borderRadius:"50%",
+                  background:color, flexShrink:0 }}/>
+                <div style={{ flex:1, fontWeight:700, fontSize:12, color:isMe?"#00f5c4":color,
+                  overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                  {e.name}{isMe ? " (YOU)" : ""}
+                </div>
+                {tieWithPrev && (
+                  <span style={{ fontSize:8, padding:"1px 5px", borderRadius:3,
+                    background:"#fbbf2415", color:"#fbbf24", border:"1px solid #fbbf2430" }}>
+                    TIE→TB
+                  </span>
+                )}
+                {/* Score */}
+                <div style={{ textAlign:"right" }}>
+                  <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:20,
+                    color: mode === "final"
+                      ? (e.score >= 60 ? "#00f5c4" : e.score >= 40 ? "#fbbf24" : e.score >= 20 ? "#f97316" : "#ef4444")
+                      : (e.marginBreaches > 0 ? "#f97316" : "#f1f5f9") }}>
+                    {mode === "final" ? e.score.toFixed(1) : fmtUSD(e.netEquity || e.total || 0)}
+                  </div>
+                  <div style={{ fontSize:8, color:"#334155" }}>
+                    {mode === "final" ? "/105 pts" : `Score ${e.score.toFixed(1)} /105`}
+                  </div>
+                </div>
+                <div style={{ color:"#334155", fontSize:10 }}>{isExpanded?"▲":"▼"}</div>
+              </div>
+              {/* Score bar */}
+              <div style={{ height:3, background:"#0f172a", borderRadius:2, marginBottom:5 }}>
+                <div style={{ width:`${barPct}%`, height:"100%", background:color,
+                  borderRadius:2, transition:"width 0.5s ease" }}/>
+              </div>
+              {/* Tier summary chips */}
+              <div style={{ display:"flex", gap:5, flexWrap:"wrap" }}>
+                {[
+                  { label:"Performance", pts:e.tier1, max:35, color:"#38bdf8" },
+                  { label:"Capital Disc.",  pts:e.tier2, max:40, color:"#a78bfa" },
+                  { label:"Market Craft",    pts:e.tier3, max:30, color:"#00f5c4" },
+                ].map(tier => (
+                  <span key={tier.label} style={{ fontSize:8, padding:"1px 6px", borderRadius:3,
+                    background:`${tier.color}15`, color:tier.color, fontWeight:700 }}>
+                    {tier.label} {tier.pts?.toFixed(1)}/{tier.max}
+                  </span>
+                ))}
+                <span style={{ fontSize:8, color:"#475569", marginLeft:"auto" }}>
+                  {mode === "final"
+                    ? `${e.absoluteReturn >= 0 ? "+" : ""}${e.absoluteReturn}% return`
+                    : `${e.marginBreaches || 0} margin breach${(e.marginBreaches || 0) === 1 ? "" : "es"} · ${e.marginBufferPct >= 0 ? "+" : ""}${fmt(e.marginBufferPct || 0, 1)}% buffer`}
+                </span>
+              </div>
+            </div>
+
+            {/* Expanded scorecard */}
+            {isExpanded && (
+              <div style={{ borderTop:"1px solid #1e293b", padding:"14px",
+                background:"#060c18", animation:"fadein 0.2s" }}>
+
+                {/* Tier 1: Performance */}
+                <div style={{ marginBottom:12 }}>
+                  <div style={{ fontSize:9, color:"#38bdf8", fontWeight:800,
+                    letterSpacing:"0.1em", marginBottom:8 }}>
+                    TIER 1 — PERFORMANCE ({e.tier1?.toFixed(1)}/35 pts)
+                  </div>
+                  {[
+                    { label:"Net Return", formula:"Compounded locked round return after carry", value:`${e.absoluteReturn >= 0?"+":""}${e.absoluteReturn}%`, pts:e.t1a, max:20, rank:rankReturn[e.name], n, tip:"Your compounded return after borrow and funding drag across locked rounds" },
+                    { label:"Alpha vs BALL", formula:"Compounded return − compounded BALL return", value:`${e.alpha >= 0?"+":""}${e.alpha}%`, pts:e.t1b, max:15, rank:rankAlpha[e.name], n, tip:"Did you beat the broad benchmark after the full storyline played out?" },
+                  ].map(ind => renderIndicator(ind, color))}
+                </div>
+
+                {/* Tier 2: Capital Discipline */}
+                <div style={{ marginBottom:12 }}>
+                  <div style={{ fontSize:9, color:"#a78bfa", fontWeight:800,
+                    letterSpacing:"0.1em", marginBottom:8 }}>
+                    TIER 2 — CAPITAL DISCIPLINE ({e.tier2?.toFixed(1)}/40 pts)
+                  </div>
+                  {[
+                    { label:"Drawdown Control", formula:"Lower max drawdown = more points", value:`${fmt(e.maxDrawdown, 1)}% DD`, pts:e.t2a, max:15, rank:rankDD[e.name], n, tip:"Rewards capital preservation during the whole campaign" },
+                    { label:"Margin Discipline", formula:"Average locked margin buffer % minus breach penalties", value:`${e.marginBufferPct >= 0 ? "+" : ""}${fmt(e.marginBufferPct || 0, 1)}% buffer`, pts:e.t2b, max:15, rank:rankMargin[e.name], n, tip:"Teams that stay above maintenance margin keep more score and avoid forced deleveraging" },
+                    { label:"Funding Efficiency", formula:"Carry drag from borrow + funding costs", value:`${fmt(e.carryDragPct || 0, 2)}% carry drag`, pts:e.t2c, max:10, rank:rankFunding[e.name], n, tip:"Low carry drag means the team used leverage and shorts efficiently" },
+                  ].map(ind => renderIndicator(ind, color))}
+                  <div style={{ marginTop:8, padding:"8px 10px", borderRadius:6,
+                    background:"#0a0f1e", border:"1px solid #1e293b" }}>
+                    <div style={{ display:"grid", gridTemplateColumns:"repeat(2,minmax(0,1fr))", gap:8, fontSize:9 }}>
+                      <div style={{ display:"flex", justifyContent:"space-between", gap:10 }}>
+                        <span style={{ color:"#ddd6fe", fontWeight:700 }}>Net Equity</span>
+                        <span style={{ color:"#f1f5f9" }}>{fmtUSD(e.netEquity || e.total || 0)}</span>
+                      </div>
+                      <div style={{ display:"flex", justifyContent:"space-between", gap:10 }}>
+                        <span style={{ color:"#ddd6fe", fontWeight:700 }}>Carry Cost</span>
+                        <span style={{ color:"#f1f5f9" }}>{fmtUSD(e.totalCarryCost || 0)}</span>
+                      </div>
+                      <div style={{ display:"flex", justifyContent:"space-between", gap:10 }}>
+                        <span style={{ color:"#ddd6fe", fontWeight:700 }}>Asset Beta</span>
+                        <span style={{ color:"#f1f5f9" }}>{e.assetBeta?.toFixed(3)}</span>
+                      </div>
+                      <div style={{ display:"flex", justifyContent:"space-between", gap:10 }}>
+                        <span style={{ color:"#ddd6fe", fontWeight:700 }}>Portfolio Beta</span>
+                        <span style={{ color:"#f1f5f9" }}>{e.portfolioBeta?.toFixed(3)}</span>
+                      </div>
+                    </div>
+                    <div style={{ fontSize:8, color:"#475569", marginTop:4 }}>
+                      Asset beta uses cov(asset, BALL) / var(BALL). Portfolio beta is the weighted sum of asset betas from each locked round snapshot.
+                    </div>
+                  </div>
+                </div>
+
+                {/* Tier 3: Market Craft */}
+                <div style={{ marginBottom:12 }}>
+                  <div style={{ fontSize:9, color:"#00f5c4", fontWeight:800,
+                    letterSpacing:"0.1em", marginBottom:8 }}>
+                    TIER 3 — MARKET CRAFT ({e.tier3?.toFixed(1)}/30 pts)
+                  </div>
+                  {[
+                    { label:"Crisis Alpha", formula:"Average alpha in R3, R6, R7 stress rounds", value:`${e.crisisAlpha >= 0 ? "+" : ""}${fmt(e.crisisAlpha, 2)}%`, pts:e.t3a, max:10, rank:rankCrisis[e.name], n, tip:"Shows whether the team added value when the macro storyline turned hostile" },
+                    { label:"Win Rate", formula:"Profitable closes ÷ Total closes × 100", value:`${e.winRate}%`, pts:e.t3b, max:5, rank:rankWinRate[e.name], n, tip:"Closed-trade execution quality across longs and shorts" },
+                    { label:"Diversification", formula:"Unique sectors traded across all rounds (max 9)", value:`${e.sectors}/9 sectors`, pts:e.t3c, max:5, rank:rankSectors[e.name], n, tip:"Rewards spreading macro bets across industries instead of one narrow trade" },
+                    { label:"Prediction Accuracy", formula:"Correct economic predictions ÷ Answered", value:`${e.predRate}%`, pts:e.t3d, max:5, rank:rankPred[e.name], n, tip:"Measures whether the team read the storyline correctly" },
+                    { label:"Prediction Participation", formula:"Answered predictions ÷ Questions shown", value:`${e.predParticipation}%`, pts:e.t3e, max:5, rank:rankPredPart[e.name], n, tip:"Rewards teams that consistently commit to a view when the market asks for one" },
+                  ].map(ind => renderIndicator(ind, color))}
+                </div>
+
+                {/* Tiebreaker info */}
+                {tieWithPrev && (
+                  <div style={{ background:"#fbbf2408", border:"1px solid #fbbf2430",
+                    borderRadius:6, padding:"8px 10px", fontSize:9, color:"#fbbf24" }}>
+                    <div style={{ fontWeight:700, marginBottom:4 }}>TIEBREAKER APPLIED</div>
+                    <div style={{ color:"#94a3b8", lineHeight:1.7 }}>
+                      Same composite score as the team above. Resolved by:
+                      Net Equity ({fmtUSD(e.netEquity || e.total || 0)}) →
+                      Crisis Alpha ({fmt(e.crisisAlpha, 2)}%) →
+                      Margin Breaches ({e.marginBreaches || 0}) →
+                      Max Drawdown ({fmt(e.maxDrawdown, 1)}%) →
+                      Last Trade ({e.tb5 ? fmtTS(-e.tb5) : "—"})
+                    </div>
+                  </div>
+                )}
+
+                {/* Plain English summary */}
+                <div style={{ marginTop:10, padding:"8px 10px", background:"#0a0f1e",
+                  borderRadius:6, border:"1px solid #1e293b", fontSize:10,
+                  color:"#64748b", lineHeight:1.7 }}>
+                  <span style={{ color:"#f1f5f9", fontWeight:700 }}>Summary: </span>
+                  Net equity stands at {fmtUSD(e.netEquity || e.total || 0)} with {fmtUSD(e.totalCarryCost || 0)} paid in borrow and funding costs.
+                  {" "}Alpha rank is #{rankAlpha[e.name] || "?"}, crisis-alpha rank is #{rankCrisis[e.name] || "?"},
+                  {" "}and drawdown rank is #{rankDD[e.name] || "?"}.
+                  {" "}Margin discipline is {e.marginBreaches ? `under pressure with ${e.marginBreaches} breach${e.marginBreaches === 1 ? "" : "es"}` : "clean with no breaches"}.
+                  {" "}Prediction participation sits at {e.predParticipation}%.
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Helper: render a single indicator row in the scorecard
+function renderIndicator({ label, formula, value, pts, max, rank, n, tip }, teamColor) {
+  const pct = max > 0 ? (pts / max) * 100 : 0;
+  const barCol = pct >= 80 ? "#00f5c4" : pct >= 50 ? "#fbbf24" : pct >= 25 ? "#f97316" : "#ef4444";
+  return (
+    <div key={label} style={{ marginBottom:8 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
+        <div style={{ flex:1 }}>
+          <span style={{ fontSize:10, color:"#f1f5f9", fontWeight:600 }}>{label}</span>
+          {rank && n && (
+            <span style={{ fontSize:8, color:"#475569", marginLeft:6 }}>
+              #{rank} of {n}
+            </span>
+          )}
+        </div>
+        <div style={{ textAlign:"right", flexShrink:0 }}>
+          <span style={{ fontSize:10, color:barCol, fontWeight:700 }}>
+            {pts?.toFixed(1)}/{max}
+          </span>
+          <span style={{ fontSize:9, color:"#475569", marginLeft:6 }}>{value}</span>
+        </div>
+      </div>
+      <div style={{ height:4, background:"#0f172a", borderRadius:2, marginBottom:2 }}>
+        <div style={{ width:`${Math.min(100,pct)}%`, height:"100%",
+          background:barCol, borderRadius:2, transition:"width 0.4s ease" }}/>
+      </div>
+      <div style={{ fontSize:8, color:"#334155" }}>{formula}</div>
+    </div>
+  );
+}
+// ─── EMERGENCY NEWS MODAL ─────────────────────────────────────────────────────
+// Auto-applies disruption and starts next round without GM permission.
+// For R1 briefing: 90s countdown then auto-start.
+// For R2+ buffer: uses bufferLeft countdown then auto-starts.
+function EmergencyModal({ events, bufferLeft, onApply, onClose, isFirstRound, passive=false, showConcept=true }) {
+  const [applied, setApplied] = useState(false);
+  const [briefingLeft, setBriefingLeft] = useState(isFirstRound ? BRIEFING_SECS : null);
+  const appliedRef = useRef(false);
+  const closedRef  = useRef(false);
+
+  const bm = Math.floor(Math.max(0, bufferLeft||0)/60);
+  const bs = Math.max(0, bufferLeft||0) % 60;
+
+  // R1: 90s briefing countdown, then auto-start
+  useEffect(() => {
+    if (passive) return;
+    if (!isFirstRound) return;
+    const id = setInterval(() => {
+      setBriefingLeft(prev => {
+        if (prev == null) return prev;
+        const next = Math.max(0, prev - 1);
+        if (next <= 0 && !appliedRef.current) {
+          clearInterval(id);
+          appliedRef.current = true;
+          setApplied(true);
+          setTimeout(() => {
+            if (!closedRef.current) { closedRef.current = true; onApply(); onClose(); }
+          }, 300);
+        }
+        return next;
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, [isFirstRound, onApply, onClose, passive]);
+
+  // R2+: when bufferLeft reaches 0, auto-apply + auto-start
+  useEffect(() => {
+    if (passive) return;
+    if (isFirstRound) return;
+    if (bufferLeft === 0 && !appliedRef.current) {
+      appliedRef.current = true;
+      setApplied(true);
+      setTimeout(() => {
+        if (!closedRef.current) { closedRef.current = true; onApply(); onClose(); }
+      }, 400);
+    }
+  }, [bufferLeft, isFirstRound, onApply, onClose, passive]);
+
+  const countdown = isFirstRound ? briefingLeft : bufferLeft;
+  const cm = Math.floor(Math.max(0, countdown||0)/60);
+  const cs = Math.max(0, countdown||0) % 60;
+  const countdownLabel = isFirstRound ? "AUTO-START IN" : "NEXT ROUND IN";
+  const countdownUrgent = (countdown||0) < 10;
+  const isStoryline = !!events[0]?.storyline;
+  const showPlayerMacroBrief = passive && events.length > 0;
+  const showSectorBreakdown = isStoryline && !passive;
+  const sectorPressure = isStoryline
+    ? Object.entries(events[0]?.sectorMap || {}).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+    : [];
+  const positiveSectors = sectorPressure.filter(([, impact]) => impact > 0).slice(0, 4);
+  const negativeSectors = sectorPressure.filter(([, impact]) => impact < 0).slice(0, 4);
+  const passiveSummary = events[0]?.storylineBlurb || events[0]?.eventSubheadline || events[0]?.detail || "Teams must infer the most exposed names from the macro bulletin and market reaction.";
+  const passiveClues = Array.isArray(events[0]?.playerClues) && events[0]?.playerClues.length
+    ? events[0].playerClues
+    : getMacroInferenceClues({ theme: events[0]?.theme, isStoryline });
+
+  return (
+    <div style={{ position:"fixed", inset:0, zIndex:9999, background:"rgba(2,8,23,0.97)",
+      display:"flex", alignItems:"center", justifyContent:"center",
+      fontFamily:"'JetBrains Mono','Courier New',monospace" }}>
+      <div style={{ position:"absolute", inset:0,
+        backgroundImage:"repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.12) 2px,rgba(0,0,0,0.12) 4px)",
+        pointerEvents:"none" }}/>
+      <div style={{ width:"min(680px,95vw)", background:"#0a0f1e",
+        border:`2px solid ${isFirstRound?"#00f5c4":"#ef4444"}`, borderRadius:16,
+        boxShadow:`0 0 80px ${isFirstRound?"rgba(0,245,196,0.25)":"rgba(239,68,68,0.3)"}`, overflow:"hidden", position:"relative" }}>
+        <div style={{ background: isFirstRound ? "linear-gradient(135deg,#0c2a1a,#064e3b)" : "linear-gradient(135deg,#7f1d1d,#450a0a)", padding:"16px 22px",
+          borderBottom:`1px solid ${isFirstRound?"#00f5c440":"#ef444440"}`, display:"flex", alignItems:"center", gap:12 }}>
+          <div style={{ fontSize:26, animation: isFirstRound ? "none" : "blink 0.8s step-end infinite" }}>
+            {isFirstRound ? "📊" : "🚨"}
+          </div>
+          <div style={{ flex:1 }}>
+            <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:900, fontSize:20, color:"#fef2f2" }}>
+              {isFirstRound ? "PRE-ROUND MARKET BRIEFING" : "MARKET DISRUPTION BULLETIN"}
+            </div>
+            <div style={{ fontSize:10, color: isFirstRound ? "#6ee7b7" : "#fca5a5", letterSpacing:"0.15em", marginTop:2 }}>
+              {isFirstRound
+                ? "STUDY THE CONDITIONS — ROUND STARTS AUTOMATICALLY"
+                : "TAKING EFFECT NEXT ROUND — STARTS AUTOMATICALLY"}
+            </div>
+          </div>
+          {/* Countdown timer — always visible */}
+          {countdown != null && (
+            <div style={{ textAlign:"right" }}>
+              <div style={{ fontSize:10, color: isFirstRound?"#6ee7b7":"#fca5a5", marginBottom:2, letterSpacing:"0.1em" }}>
+                {countdownLabel}
+              </div>
+              <div style={{ fontFamily:"'Syne',sans-serif", fontSize:28, fontWeight:900,
+                color: countdownUrgent ? "#ef4444" : isFirstRound ? "#00f5c4" : "#f1f5f9",
+                animation: countdownUrgent ? "blink 0.6s step-end infinite" : "none" }}>
+                {String(cm).padStart(2,"0")}:{String(cs).padStart(2,"0")}
+              </div>
+            </div>
+          )}
+        </div>
+        <div style={{ padding:"16px 22px", maxHeight:"55vh", overflowY:"auto" }}>
+          {/* Political event banner */}
+          {events[0]?.political && (
+            <div style={{ background:"linear-gradient(135deg,#0c1a2e,#0a1628)",
+              border:"1px solid #1e40af", borderRadius:10, padding:"12px 14px",
+              marginBottom:12 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:8 }}>
+                <span style={{ fontSize:24 }}>{events[0].eventIcon}</span>
+                <div style={{ flex:1 }}>
+                  <div style={{ fontSize:9, color:"#60a5fa", fontWeight:800, letterSpacing:"0.1em", marginBottom:3 }}>
+                    {isStoryline ? "AMERICA ROUND STORYLINE" : "MACRO ECONOMIC EVENT"}
+                  </div>
+                  <div style={{ fontSize:13, color:"#e2e8f0", fontWeight:700, lineHeight:1.4 }}>
+                    {events[0].eventName}
+                  </div>
+                </div>
+                <div style={{ textAlign:"right", fontSize:9, color:"#475569" }}>
+                  {showPlayerMacroBrief
+                    ? "TEAM INFERENCE WINDOW"
+                    : showSectorBreakdown
+                    ? `${positiveSectors.length + negativeSectors.length} key sectors`
+                    : isStoryline
+                      ? "ROUND BULLETIN"
+                      : `${events.length} stocks · ${new Set(events.map(e=>e.sectorId)).size} sectors`}
+                </div>
+              </div>
+              {isStoryline && (
+                <div style={{ background:"#111827", borderRadius:7, padding:"8px 10px",
+                  border:"1px solid #374151", marginBottom:showConcept ? 8 : 0 }}>
+                  <div style={{ fontSize:8, color:"#fbbf24", fontWeight:800, letterSpacing:"0.12em", marginBottom:3 }}>
+                    ROUND ARC
+                  </div>
+                  <div style={{ fontSize:10, color:"#e5e7eb", lineHeight:1.6 }}>
+                    {events[0]?.storylineBlurb || events[0]?.detail}
+                  </div>
+                </div>
+              )}
+              {showConcept && (
+                <div style={{ background:"#0f172a", borderRadius:7, padding:"8px 10px",
+                  border:"1px solid #1e3a5f" }}>
+                  <div style={{ fontSize:8, color:"#3b82f6", fontWeight:800, letterSpacing:"0.12em", marginBottom:3 }}>
+                    💡 ECONOMIC CONCEPT TO REASON FROM
+                  </div>
+                  <div style={{ fontSize:10, color:"#94a3b8", lineHeight:1.6 }}>
+                    {events[0].concept}
+                  </div>
+                </div>
+              )}
+              {events[0]?.macroQuestion && (
+                <div style={{ background:"#111827", borderRadius:7, padding:"8px 10px",
+                  border:"1px solid #374151", marginTop:showConcept ? 8 : 0 }}>
+                  <div style={{ fontSize:8, color:"#fbbf24", fontWeight:800, letterSpacing:"0.12em", marginBottom:3 }}>
+                    ❓ TEAM CHALLENGE QUESTION
+                  </div>
+                  <div style={{ fontSize:10, color:"#e5e7eb", lineHeight:1.6 }}>
+                    {events[0].macroQuestion}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+          {showPlayerMacroBrief ? (
+            <div style={{ display:"grid", gap:10 }}>
+              <div style={{ background:"#0f172a", border:"1px solid #1e293b", borderRadius:10, padding:"12px 14px" }}>
+                <div style={{ fontSize:8, color:"#fbbf24", fontWeight:800, letterSpacing:"0.12em", marginBottom:6 }}>
+                  INFERENCE BRIEF
+                </div>
+                <div style={{ fontSize:11, color:"#e2e8f0", lineHeight:1.7 }}>
+                  {passiveSummary}
+                </div>
+              </div>
+              <div style={{ background:"#0f172a", border:"1px solid #1e293b", borderRadius:10, padding:"12px 14px" }}>
+                <div style={{ fontSize:8, color:"#38bdf8", fontWeight:800, letterSpacing:"0.12em", marginBottom:8 }}>
+                  WHAT TEAMS SHOULD INFER
+                </div>
+                <div style={{ display:"grid", gap:7 }}>
+                  {passiveClues.map((clue, index) => (
+                    <div key={`${index}:${clue}`} style={{ display:"flex", gap:8, fontSize:10, color:"#94a3b8", lineHeight:1.6 }}>
+                      <span style={{ color:"#38bdf8", fontWeight:800, flexShrink:0 }}>{index + 1}.</span>
+                      <span>{clue}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div style={{ background:"#020817", border:"1px solid #111827", borderRadius:10, padding:"10px 12px", fontSize:9, color:"#475569", lineHeight:1.7 }}>
+                No direct ticker or sector hints are shown here. Teams must read the macro bulletin, then confirm their thesis through market reaction and order flow.
+              </div>
+            </div>
+          ) : showSectorBreakdown ? (
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+              <div style={{ background:"#0f172a", border:"1px solid #1e293b", borderRadius:10, padding:"12px 14px" }}>
+                <div style={{ fontSize:8, color:"#00f5c4", fontWeight:800, letterSpacing:"0.12em", marginBottom:8 }}>
+                  SECTORS WITH POLICY TAILWIND
+                </div>
+                <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                  {positiveSectors.map(([sectorId, impact]) => {
+                    const sector = SECTORS.find(item => item.id === sectorId);
+                    if (!sector) return null;
+                    return (
+                      <span key={sectorId} style={{ fontSize:10, padding:"5px 8px", borderRadius:999,
+                        background:"#022c22", border:"1px solid #166534", color:"#86efac", fontWeight:700 }}>
+                        {sector.icon} {sector.label}
+                      </span>
+                    );
+                  })}
+                </div>
+                <div style={{ fontSize:10, color:"#64748b", lineHeight:1.6, marginTop:8 }}>
+                  These sectors should be watched for stronger cash-flow support, policy demand, or pricing power.
+                </div>
+              </div>
+              <div style={{ background:"#0f172a", border:"1px solid #1e293b", borderRadius:10, padding:"12px 14px" }}>
+                <div style={{ fontSize:8, color:"#ef4444", fontWeight:800, letterSpacing:"0.12em", marginBottom:8 }}>
+                  SECTORS UNDER PRESSURE
+                </div>
+                <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                  {negativeSectors.map(([sectorId, impact]) => {
+                    const sector = SECTORS.find(item => item.id === sectorId);
+                    if (!sector) return null;
+                    return (
+                      <span key={sectorId} style={{ fontSize:10, padding:"5px 8px", borderRadius:999,
+                        background:"#450a0a", border:"1px solid #7f1d1d", color:"#fca5a5", fontWeight:700 }}>
+                        {sector.icon} {sector.label}
+                      </span>
+                    );
+                  })}
+                </div>
+                <div style={{ fontSize:10, color:"#64748b", lineHeight:1.6, marginTop:8 }}>
+                  These sectors face the first-order hit from the macro bulletin. Teams still need to infer the ticker-level winners and losers.
+                </div>
+              </div>
+            </div>
+          ) : events.map((evt, i) => {
+            const stock = ALL_STOCKS.find(s => s.ticker === evt.ticker);
+            const up = evt.impact > 0;
+            return (
+              <div key={i} style={{ background:"#0f172a",
+                border:`1px solid ${up?"#16653440":"#7f1d1d40"}`,
+                borderLeft:`4px solid ${up?"#00f5c4":"#ef4444"}`,
+                borderRadius:10, padding:"14px 16px", marginBottom:10 }}>
+                <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:7 }}>
+                  <span style={{ color:stock?.color||"#94a3b8", fontWeight:800, fontSize:15 }}>{evt.ticker}</span>
+                  <span style={{ color:"#64748b", fontSize:12 }}>{stock?.name}</span>
+                  {stock && <SectorBadge sectorId={stock.sectorId} small />}
+                  <div style={{ marginLeft:"auto", display:"flex", gap:8 }}>
+                    <span style={{ fontSize:15, fontWeight:900, color:up?"#00f5c4":"#ef4444" }}>
+                      {up?"▲":"▼"} {Math.abs(evt.impact)}%
+                    </span>
+                    <span style={{ fontSize:11, padding:"2px 8px", borderRadius:4, fontWeight:700,
+                      background:up?"rgba(0,245,196,0.12)":"rgba(239,68,68,0.12)",
+                      color:up?"#00f5c4":"#ef4444" }}>{up?"BULLISH":"BEARISH"}</span>
+                  </div>
+                </div>
+                <div style={{ fontSize:13, color:"#f1f5f9", fontWeight:600, lineHeight:1.5, marginBottom:5 }}>{evt.headline}</div>
+                {evt.detail && <div style={{ fontSize:11, color:"#64748b", fontStyle:"italic" }}>{evt.detail}</div>}
+              </div>
+            );
+          })}
+        </div>
+        <div style={{ padding:"14px 22px", borderTop:"1px solid #1e293b",
+          display:"flex", gap:10, justifyContent:"space-between", alignItems:"center" }}>
+          <div style={{ fontSize:9, color:"#334155", letterSpacing:"0.1em" }}>
+            {passive
+              ? "⏳ LIVE ON ALL TEAM SCREENS UNTIL THE BUFFER ENDS"
+              : applied
+                ? "✓ DISRUPTION APPLIED — LAUNCHING ROUND…"
+                : "⏳ AUTO-STARTING WHEN COUNTDOWN REACHES 0"}
+          </div>
+          <div style={{ display:"flex", gap:8 }}>
+            {!passive && !applied && (
+              <button onClick={() => { if (!appliedRef.current) { appliedRef.current = true; setApplied(true); setTimeout(() => { if (!closedRef.current) { closedRef.current = true; onApply(); onClose(); } }, 300); } }}
+                style={{ padding:"10px 22px", background:"linear-gradient(135deg,#7f1d1d,#dc2626)",
+                  border:"none", borderRadius:8, color:"#fff", fontWeight:700,
+                  cursor:"pointer", fontFamily:"inherit", fontSize:12 }}>
+                ⚡ START NOW
+              </button>
+            )}
+            {!passive && applied && (
+              <div style={{ padding:"10px 22px", background:"#166534", border:"none",
+                borderRadius:8, color:"#4ade80", fontWeight:700, fontSize:12 }}>
+                🚀 LAUNCHING…
+              </div>
+            )}
+            {passive && (
+              <div style={{ padding:"10px 22px", background:"#0f172a", border:"1px solid #1e293b",
+                borderRadius:8, color:"#94a3b8", fontWeight:700, fontSize:12 }}>
+                TEAM VIEW
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DerivativeSettlementModal({ teamName, round, secondsLeft, settlements = [] }) {
+  const totalGain = settlements.reduce((sum, item) => sum + (item.gain || 0), 0);
+  const totalCashEffect = settlements.reduce((sum, item) => sum + (item.cashEffect || 0), 0);
+
+  return (
+    <div style={{ position:"fixed", inset:0, zIndex:10001, background:"rgba(2,8,23,0.97)",
+      display:"flex", alignItems:"center", justifyContent:"center",
+      fontFamily:"'JetBrains Mono','Courier New',monospace" }}>
+      <div style={{ width:"min(760px,95vw)", background:"#0a0f1e", border:"2px solid #38bdf8",
+        borderRadius:16, boxShadow:"0 0 80px rgba(56,189,248,0.22)", overflow:"hidden" }}>
+        <div style={{ background:"linear-gradient(135deg,#0c1a2e,#0a0f1e)", padding:"16px 22px",
+          borderBottom:"1px solid #1e3a5f", display:"flex", alignItems:"center", gap:12 }}>
+          <div style={{ fontSize:26 }}>⏳</div>
+          <div style={{ flex:1 }}>
+            <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:900, fontSize:20, color:"#e0f2fe" }}>
+              DERIVATIVE SETTLEMENT WINDOW
+            </div>
+            <div style={{ fontSize:10, color:"#7dd3fc", letterSpacing:"0.12em", marginTop:2 }}>
+              TEAM-SPECIFIC ROUND {round} EXPIRY RESULTS
+            </div>
+          </div>
+          <div style={{ textAlign:"right" }}>
+            <div style={{ fontSize:10, color:"#64748b", marginBottom:2 }}>CONTINUES IN</div>
+            <div style={{ fontFamily:"'Syne',sans-serif", fontSize:28, fontWeight:900, color:"#38bdf8" }}>
+              {String(Math.max(0, secondsLeft || 0)).padStart(2, "0")}s
+            </div>
+          </div>
+        </div>
+        <div style={{ padding:"16px 22px", maxHeight:"56vh", overflowY:"auto" }}>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(3,minmax(0,1fr))", gap:8, marginBottom:12 }}>
+            <div style={{ background:"#020817", border:"1px solid #1e293b", borderRadius:10, padding:"10px 12px" }}>
+              <div style={{ fontSize:8, color:"#334155", letterSpacing:"0.12em", marginBottom:4 }}>TEAM</div>
+              <div style={{ fontSize:12, color:"#f1f5f9", fontWeight:800 }}>{teamName || "Current Team"}</div>
+            </div>
+            <div style={{ background:"#020817", border:"1px solid #1e293b", borderRadius:10, padding:"10px 12px" }}>
+              <div style={{ fontSize:8, color:"#334155", letterSpacing:"0.12em", marginBottom:4 }}>NET P&L</div>
+              <div style={{ fontSize:12, color:totalGain >= 0 ? "#00f5c4" : "#ef4444", fontWeight:800 }}>
+                {totalGain >= 0 ? "+" : "-"}{fmtUSD(Math.abs(totalGain))}
+              </div>
+            </div>
+            <div style={{ background:"#020817", border:"1px solid #1e293b", borderRadius:10, padding:"10px 12px" }}>
+              <div style={{ fontSize:8, color:"#334155", letterSpacing:"0.12em", marginBottom:4 }}>CASH EFFECT</div>
+              <div style={{ fontSize:12, color:totalCashEffect >= 0 ? "#00f5c4" : "#ef4444", fontWeight:800 }}>
+                {totalCashEffect >= 0 ? "+" : "-"}{fmtUSD(Math.abs(totalCashEffect))}
+              </div>
+            </div>
+          </div>
+
+          {settlements.length === 0 ? (
+            <div style={{ background:"#020817", border:"1px solid #1e293b", borderRadius:10, padding:"16px 18px", color:"#94a3b8", lineHeight:1.7 }}>
+              No derivative positions expired for your team at the end of Round {round}.
+            </div>
+          ) : (
+            <div style={{ display:"grid", gap:8 }}>
+              {settlements.map((tx, index) => (
+                <div key={`${tx.instrumentId || tx.label || index}:${tx.id || index}`} style={{ background:"#020817", border:"1px solid #1e293b", borderRadius:10, padding:"12px 14px" }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", gap:12, marginBottom:6 }}>
+                    <div>
+                      <div style={{ fontSize:12, color:"#f1f5f9", fontWeight:800 }}>{tx.label}</div>
+                      <div style={{ fontSize:10, color:"#64748b", marginTop:3 }}>
+                        {tx.underlyingTicker} · {tx.side === "short" ? "SHORT" : "LONG"} {tx.kind?.toUpperCase()} · Qty {tx.qty}
+                      </div>
+                    </div>
+                    <div style={{ textAlign:"right" }}>
+                      <div style={{ fontSize:12, color:(tx.gain || 0) >= 0 ? "#00f5c4" : "#ef4444", fontWeight:800 }}>
+                        {(tx.gain || 0) >= 0 ? "+" : "-"}{fmtUSD(Math.abs(tx.gain || 0))}
+                      </div>
+                      <div style={{ fontSize:10, color:"#64748b", marginTop:3 }}>
+                        Cash {((tx.cashEffect || 0) >= 0 ? "+" : "-") + fmtUSD(Math.abs(tx.cashEffect || 0))}
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ display:"grid", gridTemplateColumns:"repeat(4,minmax(0,1fr))", gap:8, fontSize:10 }}>
+                    <div style={{ color:"#64748b" }}>Settlement: <span style={{ color:"#94a3b8" }}>{fmtUSD(tx.price || 0)}</span></div>
+                    <div style={{ color:"#64748b" }}>Entry: <span style={{ color:"#94a3b8" }}>{fmtUSD(tx.avgCostAtOpen || 0)}</span></div>
+                    <div style={{ color:"#64748b" }}>Entry Value: <span style={{ color:"#94a3b8" }}>{fmtUSD(tx.entryValue || 0)}</span></div>
+                    <div style={{ color:"#64748b" }}>Realized: <span style={{ color:"#94a3b8" }}>{fmtUSD(tx.realizedValue || 0)}</span></div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PredictionMarketOverlay({ session, playerPrediction, onVote, isGM, teamName }) {
+  const [secondsLeft, setSecondsLeft] = useState(0);
+
+  useEffect(() => {
+    if (!session || session.phase === "closed") return undefined;
+    const computeLeft = () => {
+      const target = session.phase === "revealing" ? session.revealEndsAt : session.endsAt;
+      return Math.max(0, Math.ceil((target - Date.now()) / 1000));
+    };
+    setSecondsLeft(computeLeft());
+    const id = setInterval(() => setSecondsLeft(computeLeft()), 200);
+    return () => clearInterval(id);
+  }, [session]);
+
+  if (!session || session.phase === "closed") return null;
+
+  const question = session.question;
+  const isReveal = session.phase === "revealing";
+  const selected = playerPrediction || null;
+
+  return (
+    <div style={{ position:"fixed", inset:0, zIndex:9800, background:"rgba(2,8,23,0.96)",
+      display:"flex", alignItems:"center", justifyContent:"center",
+      fontFamily:"'JetBrains Mono','Courier New',monospace" }}>
+      <div style={{ width:"min(760px,95vw)", background:"#0a0f1e", border:"2px solid #00f5c4",
+        borderRadius:18, overflow:"hidden", boxShadow:"0 0 80px rgba(0,245,196,0.16)" }}>
+        <div style={{ padding:"18px 24px", borderBottom:"1px solid #1e293b",
+          background:isReveal ? "linear-gradient(135deg,#06291f,#064e3b)" : "linear-gradient(135deg,#042533,#0c4a6e)",
+          display:"flex", alignItems:"center", gap:14 }}>
+          <div style={{ fontSize:34 }}>{isReveal ? "✅" : "🎯"}</div>
+          <div style={{ flex:1 }}>
+            <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:900, fontSize:22, color:"#f8fafc" }}>
+              {isReveal ? "PREDICTION MARKET RESULT" : "PREDICTION MARKET POLLING"}
+            </div>
+            <div style={{ fontSize:10, color:isReveal ? "#86efac" : "#7dd3fc", letterSpacing:"0.15em", marginTop:3 }}>
+              ROUND {session.round} · {question?.concept?.toUpperCase() || "ECONOMIC REASONING"}
+            </div>
+          </div>
+          <div style={{ textAlign:"right" }}>
+            <div style={{ fontSize:9, color:"#cbd5e1", letterSpacing:"0.1em", marginBottom:4 }}>
+              {isReveal ? "RESULT SCREEN" : "POLL CLOSES IN"}
+            </div>
+            <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:900, fontSize:30,
+              color:isReveal ? "#86efac" : secondsLeft <= 5 ? "#fbbf24" : "#f8fafc" }}>
+              00:{String(secondsLeft).padStart(2,"0")}
+            </div>
+          </div>
+        </div>
+        <div style={{ padding:"22px 24px" }}>
+          <div style={{ textAlign:"center", marginBottom:18 }}>
+            <div style={{ fontSize:12, color:"#94a3b8", lineHeight:1.7 }}>{question?.question}</div>
+            {!isReveal && (
+              <div style={{ fontSize:10, color:"#38bdf8", marginTop:10 }}>
+                Trading pauses while teams submit one answer each. Correct answer still awards the round-end bonus.
+              </div>
+            )}
+          </div>
+          <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+            {question?.options?.map(opt => {
+              const pct = session.results?.[opt.id]?.pct || 0;
+              const votes = session.results?.[opt.id]?.votes || 0;
+              const isCorrect = question.correct === opt.id;
+              const isChosen = selected === opt.id;
+              const borderColor = isReveal && isCorrect ? "#22c55e" : isChosen ? "#38bdf8" : "#1e293b";
+              const background = isReveal && isCorrect
+                ? "linear-gradient(135deg,rgba(34,197,94,0.18),rgba(22,163,74,0.08))"
+                : isChosen
+                  ? "linear-gradient(135deg,rgba(56,189,248,0.16),rgba(14,116,144,0.06))"
+                  : "#0f172a";
+              return (
+                <div key={opt.id} style={{
+                  position:"relative", border:`1px solid ${borderColor}`, borderRadius:12,
+                  background, overflow:"hidden",
+                  boxShadow:isReveal && isCorrect ? "0 0 28px rgba(34,197,94,0.25)" : "none"
+                }}>
+                  {isReveal && (
+                    <div style={{ position:"absolute", inset:0, width:`${pct}%`,
+                      background:isCorrect ? "rgba(34,197,94,0.18)" : "rgba(56,189,248,0.12)",
+                      transition:"width 0.5s ease" }} />
+                  )}
+                  <div style={{ position:"relative", zIndex:1, padding:"14px 16px",
+                    display:"flex", alignItems:"center", gap:12 }}>
+                    <div style={{ width:28, height:28, borderRadius:8, display:"grid", placeItems:"center",
+                      background:isReveal && isCorrect ? "#166534" : "#020817",
+                      color:isReveal && isCorrect ? "#bbf7d0" : "#38bdf8", fontWeight:800 }}>
+                      {opt.id.toUpperCase()}
+                    </div>
+                    <div style={{ flex:1 }}>
+                      <div style={{ fontSize:12, color:"#e2e8f0", lineHeight:1.6 }}>{opt.text}</div>
+                      {isChosen && !isReveal && (
+                        <div style={{ fontSize:9, color:"#38bdf8", marginTop:6 }}>
+                          {isGM ? "GM monitor view" : `${teamName || "Your team"} locked this answer`}
+                        </div>
+                      )}
+                    </div>
+                    {!isReveal && !isGM && (
+                      <button onClick={() => onVote(opt.id)} disabled={!!selected}
+                        style={{ padding:"10px 16px",
+                          background:selected ? "#0b1220" : "linear-gradient(135deg,#00f5c4,#38bdf8)",
+                          color:selected ? "#475569" : "#020817", border:"none", borderRadius:8,
+                          cursor:selected ? "not-allowed" : "pointer", fontWeight:800,
+                          fontFamily:"inherit", fontSize:11 }}>
+                        {selected === opt.id ? "LOCKED" : selected ? "VOTED" : "VOTE"}
+                      </button>
+                    )}
+                    {isReveal && (
+                      <div style={{ textAlign:"right", minWidth:92 }}>
+                        <div style={{ fontSize:18, fontWeight:900, color:isCorrect ? "#22c55e" : "#e2e8f0" }}>
+                          {pct}%
+                        </div>
+                        <div style={{ fontSize:9, color:"#64748b" }}>{votes} vote{votes === 1 ? "" : "s"}</div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ marginTop:18, textAlign:"center", fontSize:10, color:"#64748b" }}>
+            {isReveal
+              ? "Green highlight marks the correct answer. Percentages are based on all submitted team votes."
+              : selected
+                ? "Your answer is locked. Results reveal automatically when polling ends."
+                : "Choose carefully. Each team gets one submission per round."}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CHART ENGINE — Timeframes, Candle Generator, Indicators, Chart
+// ═══════════════════════════════════════════════════════════════
+// ─── TIMEFRAMES ───────────────────────────────────────────────────────────────
+// 1 trading day = 9:30–16:00 = 390 minutes = 78 × 5m bars
+const TIMEFRAMES = [
+  { key:"5m",  label:"5m",  desc:"1 WEEK · 5-MIN BARS",    bars:390, xEvery:78  },
+  { key:"15m", label:"15m", desc:"1 WEEK · 15-MIN BARS",   bars:130, xEvery:26  },
+  { key:"1h",  label:"1h",  desc:"1 MONTH · HOURLY BARS",  bars:160, xEvery:24  },
+  { key:"4h",  label:"4h",  desc:"3 MONTHS · 4-HR BARS",   bars:180, xEvery:30  },
+  { key:"1D",  label:"1D",  desc:"1 YEAR · DAILY BARS",    bars:252, xEvery:21  },
+  { key:"1W",  label:"10Y", desc:"10 YEARS · WEEKLY BARS", bars:520, xEvery:52  },
+];
+
+// ─── CANDLE GENERATOR ─────────────────────────────────────────────────────────
+function generateCandles(basePrice, volatility, tf) {
+  const { bars, key } = tf;
+  const MS = { "5m":5*60e3, "15m":15*60e3, "1h":3600e3, "4h":14400e3, "1D":86400e3, "1W":7*86400e3 };
+  const barMs = MS[key];
+  const now   = Date.now();
+
+  // Start price: lower for long-frame charts (growth story), near current for short-frame
+  const startMult = key==="1W" ? rnd(0.30,0.52)
+                  : key==="1D" ? rnd(0.70,0.88)
+                  : key==="4h" ? rnd(0.82,0.95)
+                  : key==="1h" ? rnd(0.90,0.98)
+                  : rnd(0.94,1.03);
+  let price = basePrice * startMult;
+
+  // Annualised drift broken into per-bar
+  const barsPerYear = (365*24*3600e3) / barMs;
+  const barDrift    = 0.09 / barsPerYear;
+
+  // Structural events (indices into bar array)
+  const events = new Map([
+    [Math.floor(bars*0.12), rnd(-0.08,-0.03)],  // early dip
+    [Math.floor(bars*0.28), rnd(0.04,0.10)],    // bull leg
+    [Math.floor(bars*0.45), rnd(-0.12,-0.05)],  // correction
+    [Math.floor(bars*0.55), rnd(0.06,0.14)],    // recovery
+    [Math.floor(bars*0.68), rnd(-0.04,-0.02)],  // pause
+    [Math.floor(bars*0.73), rnd(-0.18,-0.08)],  // major crash
+    [Math.floor(bars*0.78), rnd(0.08,0.18)],    // V-shape bounce
+    [Math.floor(bars*0.88), rnd(0.03,0.09)],    // late rally
+    [Math.floor(bars*0.95), rnd(-0.03,0.05)],   // consolidation
+  ]);
+
+  // Intraday volatility multipliers
+  function intradayMult(ts) {
+    if (key!=="5m" && key!=="15m") return 1;
+    const d=new Date(ts), h=d.getHours(), m=d.getMinutes();
+    if (h===9  && m<=45)  return 2.8;  // open range
+    if (h===15 && m>=30)  return 2.0;  // close rush
+    if (h>=12  && h<=13)  return 0.6;  // lunch lull
+    return 1.0;
+  }
+
+  const candles = [];
+  for (let i=0; i<bars; i++) {
+    const ts  = now - (bars-i)*barMs;
+
+    // No time filtering — always generate all bars for consistent chart display
+
+    const baseVol = volatility * 0.01 * Math.sqrt(barMs/86400e3);
+    const vol     = clamp(baseVol, 0.0005, 0.05);
+    const iMult   = intradayMult(ts);
+    const shock   = events.get(i) || 0;
+    const drift   = barDrift + shock + rnd(-vol,vol)*iMult;
+
+    const open  = price;
+    const close = Math.max(0.5, price*(1+drift));
+    const span  = Math.abs(close-open);
+    const wMult = rnd(0.3,1.4)*iMult;
+    const high  = Math.max(open,close) + span*wMult*rnd(0.2,0.9) + price*vol*rnd(0.1,0.4);
+    const low   = Math.min(open,close) - span*wMult*rnd(0.2,0.9) - price*vol*rnd(0.1,0.4);
+    const volume= Math.round(rnd(400_000,9_000_000)*(1+Math.abs(drift)*25)*iMult);
+
+    candles.push({ ts, open, high:Math.max(open,close,high), low:Math.min(open,close,low), close, volume });
+    price = close;
+  }
+  return candles;
+}
+
+// ─── TECHNICAL INDICATORS ─────────────────────────────────────────────────────
+function ema(closes, p) {
+  const k=2/(p+1); let e=closes[0]; const out=[];
+  for (let i=0;i<closes.length;i++) {
+    if(i<p-1){out.push(null);continue;}
+    e=closes[i]*k+e*(1-k); out.push(e);
+  }
+  return out;
+}
+function bollingerBands(closes,p=20,m=2) {
+  const mid=[],up=[],lo=[];
+  for(let i=0;i<closes.length;i++){
+    if(i<p-1){mid.push(null);up.push(null);lo.push(null);continue;}
+    const sl=closes.slice(i-p+1,i+1),mn=sl.reduce((a,b)=>a+b,0)/p;
+    const sd=Math.sqrt(sl.reduce((a,b)=>a+(b-mn)**2,0)/p);
+    mid.push(mn);up.push(mn+m*sd);lo.push(mn-m*sd);
+  }
+  return {mid,up,lo};
+}
+function rsi(closes,p=14) {
+  const out=[]; let g=0,l=0;
+  for(let i=1;i<closes.length;i++){
+    const d=closes[i]-closes[i-1];
+    if(i<=p){if(d>0)g+=d;else l+=Math.abs(d);if(i===p){g/=p;l/=p;}out.push(null);continue;}
+    g=(g*(p-1)+Math.max(0,d))/p; l=(l*(p-1)+Math.abs(Math.min(0,d)))/p;
+    out.push(l===0?100:100-100/(1+g/l));
+  }
+  return out;
+}
+function macd(closes,f=12,s=26,sig=9) {
+  const mf=ema(closes,f),ms=ema(closes,s);
+  const line=mf.map((v,i)=>v!=null&&ms[i]!=null?v-ms[i]:null);
+  const sigL=ema(line.map(v=>v??0),sig);
+  const hist=line.map((v,i)=>v!=null&&sigL[i]!=null?v-sigL[i]:null);
+  return {line,sigL,hist};
+}
+function vwap(candles) {
+  let cumTP=0,cumVol=0; const out=[];
+  candles.forEach(c=>{ const tp=(c.high+c.low+c.close)/3; cumTP+=tp*c.volume; cumVol+=c.volume; out.push(cumVol?cumTP/cumVol:null); });
+  return out;
+}
+
+// ─── CANDLE CHART ─────────────────────────────────────────────────────────────
+const MIN_VISIBLE = 10; // fewest candles allowed in view
+
+function CandleChart({ candles, color, price, tf }) {
+  const mainRef = useRef(null);
+  const navRef  = useRef(null);
+  const total   = candles?.length || 0;
+
+  // Zoom/pan state: [startIdx, endIdx] inclusive
+  const [view,     setView]     = useState([0, total - 1]);
+  const [ind,      setInd]      = useState({ ema9:true, ema21:true, bb:false, vwap:false });
+  const [showVol,  setShowVol]  = useState(true);
+  const [showRSI,  setShowRSI]  = useState(true);
+  const [showMACD, setShowMACD] = useState(false);
+  const [tip,      setTip]      = useState(null);
+  const [cross,    setCross]    = useState(null);
+  // Drag-to-zoom brush on navigator
+  const [brush,    setBrush]    = useState(null); // {startX, endX} in navigator SVG coords
+  const brushRef   = useRef(null);
+  // Pan via mouse drag on main chart
+  const dragRef    = useRef(null); // {startX, startView}
+  // Selection-brush on main chart (ctrl+drag or dedicated mode)
+  const [zoomMode, setZoomMode] = useState(false); // when true, drag selects region
+  const selRef     = useRef(null); // {startIdx}
+  const [selRange, setSelRange] = useState(null); // {a,b} indices while dragging
+
+  // Reset view when candles change (new tf/ticker)
+  useEffect(() => { if (total>0) { setView([0, total-1]); setTip(null); setCross(null); } }, [total]);
+
+  if (!candles || total < 5) return (
+    <div style={{height:460,display:"flex",alignItems:"center",justifyContent:"center",color:"#1e293b",fontSize:12}}>
+      Generating chart…
+    </div>
+  );
+
+  // ── visible slice ──────────────────────────────────────────────────────────
+  const vStart = clamp(view[0], 0, Math.max(0, total-MIN_VISIBLE));
+  const vEnd   = clamp(view[1], vStart+MIN_VISIBLE-1, total-1);
+  const vis    = candles.slice(vStart, vEnd+1);
+  const vLen   = vis.length;
+  if (vLen < 2) return (
+    <div style={{height:460,display:"flex",alignItems:"center",justifyContent:"center",color:"#1e293b",fontSize:12}}>
+      Generating chart…
+    </div>
+  );
+
+  // ── layout ────────────────────────────────────────────────────────────────
+  const W=1040, PAD={top:16,right:82,bot:12,left:14};
+  const mainH = 300;
+  const volH  = showVol  ? 52  : 0;
+  const subH  = (showRSI||showMACD) ? 100 : 0;
+  const subGap= subH > 0 ? 12 : 0;
+  const navH  = 44; // navigator bar height
+  const navGap= 8;
+  const H     = PAD.top + mainH + volH + subGap + subH + PAD.bot;
+  const CW    = W - PAD.left - PAD.right;
+
+  // ── indicators on ALL candles (for consistency at edges) ──────────────────
+  const allCloses = candles.map(c=>c.close);
+  const allE9     = ema(allCloses, 9);
+  const allE21    = ema(allCloses, 21);
+  const allBB     = bollingerBands(allCloses, 20, 2);
+  const allRSI    = rsi(allCloses, 14);
+  const allMACD   = macd(allCloses, 12, 26, 9);
+  const allVWAP   = (tf==="5m"||tf==="15m") ? vwap(candles) : null;
+
+  // Slice indicators to visible window
+  const slice = arr => arr.slice(vStart, vEnd+1);
+  const visE9  = slice(allE9), visE21=slice(allE21);
+  const visBB  = {up:slice(allBB.up),lo:slice(allBB.lo),mid:slice(allBB.mid)};
+  const visRSI = slice(allRSI);
+  const visMACDl= slice(allMACD.line), visMACDs=slice(allMACD.sigL), visMACDh=slice(allMACD.hist);
+  const visVWAP = allVWAP ? slice(allVWAP) : null;
+
+  // ── price range for visible candles ───────────────────────────────────────
+  const lo  = vis.length ? Math.min(...vis.map(c=>c.low))  : 0;
+  const hi  = vis.length ? Math.max(...vis.map(c=>c.high)) : 1;
+  const rng = hi - lo || 1;
+
+  // ── geometry helpers ──────────────────────────────────────────────────────
+  const cw  = CW / vLen;
+  const bw  = Math.max(1.5, cw * 0.72);
+  const hbw = bw / 2;
+  const toX = i => PAD.left + (i + 0.5) * cw;
+  const toY = p => PAD.top + mainH - ((p - lo) / rng) * mainH;
+
+  const volY = PAD.top + mainH;
+  const maxV = vis.length ? Math.max(...vis.map(c=>c.volume), 1) : 1;
+
+  const subTop = PAD.top + mainH + volH + subGap;
+  const toRSI  = v => subTop + subH - ((v) / 100) * subH;
+  const macdVV = visMACDh.filter(v=>v!=null);
+  const mExt   = macdVV.length ? Math.max(0.001, Math.abs(Math.min(...macdVV,0)), Math.abs(Math.max(...macdVV,0))) : 0.001;
+  const toMCD  = v => subTop + subH/2 - (v / mExt) * (subH/2);
+
+  const curY   = toY(price);
+
+  // ── price grid ────────────────────────────────────────────────────────────
+  const gCount = 6, gStep = rng / gCount;
+  const grid   = Array.from({length:gCount+1}, (_,i) => lo + gStep*i);
+
+  // ── x labels on visible slice ─────────────────────────────────────────────
+  const tfObj   = TIMEFRAMES.find(t=>t.key===tf)||TIMEFRAMES[0];
+  const xEvery  = Math.max(1, Math.floor(tfObj.xEvery * vLen / total));
+  const xLbls   = vis.map((c,i)=>{
+    if (i % xEvery !== 0 && i !== vLen-1) return null;
+    const d=new Date(c.ts);
+    const lbl = tf==="5m"||tf==="15m"
+      ? (d.getHours()===9&&d.getMinutes()<=35 ? d.toLocaleDateString([],{weekday:"short",month:"short",day:"numeric"}) : fmtTS(c.ts))
+      : tf==="1h"||tf==="4h" ? d.toLocaleDateString([],{month:"short",day:"numeric"})
+      : tf==="1D" ? d.toLocaleDateString([],{month:"short",year:"2-digit"})
+      : String(d.getFullYear());
+    return {i, lbl};
+  }).filter(Boolean);
+
+  // ── NAVIGATOR geometry ────────────────────────────────────────────────────
+  const NW=1040, NH=navH;
+  const NPAD={l:14,r:82};
+  const NCW = NW - NPAD.l - NPAD.r;
+  const navLo = candles.length ? Math.min(...candles.map(c=>c.low))  : 0;
+  const navHi = candles.length ? Math.max(...candles.map(c=>c.high)) : 1;
+  const navRng= navHi - navLo || 1;
+  const ncw   = NCW / total;
+  const nToX  = i => NPAD.l + (i+0.5)*ncw;
+  const nToY  = p => NH - ((p-navLo)/navRng)*NH*0.85 - NH*0.05;
+  // close-line path for navigator
+  const navPts = candles.map((c,i)=>`${nToX(i)},${nToY(c.close)}`).join(" ");
+  // navigator window handles
+  const wxL = NPAD.l + (vStart/total)*NCW;
+  const wxR = NPAD.l + ((vEnd+1)/total)*NCW;
+
+  // ── ZOOM helpers ─────────────────────────────────────────────────────────
+  const zoomBy = useCallback((factor, centerFrac=0.5) => {
+    setView(([s,e]) => {
+      const len = e - s + 1;
+      const newLen = clamp(Math.round(len * factor), MIN_VISIBLE, total);
+      const center = s + len * centerFrac;
+      const ns = clamp(Math.round(center - newLen * centerFrac), 0, total - newLen);
+      return [ns, ns + newLen - 1];
+    });
+  }, [total]);
+
+  const panBy = useCallback(delta => {
+    setView(([s,e]) => {
+      const len = e - s + 1;
+      const ns  = clamp(s + delta, 0, total - len);
+      return [ns, ns + len - 1];
+    });
+  }, [total]);
+
+  // ── MAIN CHART mouse events ───────────────────────────────────────────────
+  function svgCoordX(e, svgRef) {
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect) return 0;
+    return (e.clientX - rect.left) * (W / rect.width);
+  }
+  function xToIdx(svgX) {
+    return clamp(Math.floor((svgX - PAD.left) / cw), 0, vLen-1);
+  }
+
+  function onMainMove(e) {
+    const mx = svgCoordX(e, mainRef);
+
+    // Pan drag
+    if (dragRef.current && !zoomMode) {
+      const dx = mx - dragRef.current.startX;
+      const dBars = -Math.round(dx / cw);
+      const [s0,e0] = dragRef.current.startView;
+      const len = e0-s0+1;
+      const ns = clamp(s0+dBars, 0, total-len);
+      setView([ns, ns+len-1]);
+      setCross(null); setTip(null);
+      return;
+    }
+    // Zoom-mode selection drag
+    if (selRef.current && zoomMode) {
+      const idx = xToIdx(mx) + vStart;
+      setSelRange({ a:Math.min(selRef.current.startIdx, idx), b:Math.max(selRef.current.startIdx, idx) });
+      setCross(null); setTip(null);
+      return;
+    }
+
+    // Normal crosshair + tooltip
+    const idx = xToIdx(mx);
+    if (idx < 0 || idx >= vLen) return;
+    const c = vis[idx];
+    const ai = idx + vStart; // absolute index
+    setCross({ x:toX(idx), y:toY(c.close) });
+    setTip({
+      ...c, idx, ai,
+      e9:allE9[ai], e21:allE21[ai],
+      bbU:allBB.up[ai], bbL:allBB.lo[ai], bbM:allBB.mid[ai],
+      rsiV:allRSI[ai], macdV:allMACD.line[ai], histV:allMACD.hist[ai],
+      vwapV:allVWAP?allVWAP[ai]:null
+    });
+  }
+
+  function onMainDown(e) {
+    if (zoomMode) {
+      const mx  = svgCoordX(e, mainRef);
+      const idx = xToIdx(mx) + vStart;
+      selRef.current = { startIdx:idx };
+      setSelRange(null);
+    } else {
+      dragRef.current = { startX: svgCoordX(e,mainRef), startView:[vStart,vEnd] };
+    }
+  }
+
+  function onMainUp(e) {
+    if (zoomMode && selRef.current && selRange) {
+      const {a,b} = selRange;
+      const newLen = b-a+1;
+      if (newLen >= MIN_VISIBLE) setView([a, b]);
+      selRef.current = null; setSelRange(null);
+    }
+    dragRef.current = null;
+  }
+
+  // Wheel zoom
+  function onWheel(e) {
+    e.preventDefault();
+    const rect = mainRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const mx = (e.clientX - rect.left) * (W / rect.width);
+    const frac = clamp((mx - PAD.left) / CW, 0, 1);
+    const factor = e.deltaY > 0 ? 1.15 : 0.87;
+    zoomBy(factor, frac);
+  }
+
+  // ── NAVIGATOR mouse ────────────────────────────────────────────────────────
+  const navDragRef = useRef(null);
+  function onNavDown(e) {
+    const rect = navRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const nx = (e.clientX - rect.left) * (NW / rect.width);
+    // If click inside window handle → pan
+    if (nx >= wxL - 4 && nx <= wxR + 4) {
+      navDragRef.current = { type:"pan", startNx:nx, startView:[vStart,vEnd] };
+    } else {
+      // Click outside → jump view centre
+      const clickFrac = clamp((nx - NPAD.l) / NCW, 0, 1);
+      const len = vEnd - vStart + 1;
+      const ns  = clamp(Math.round(clickFrac * total - len/2), 0, total-len);
+      setView([ns, ns+len-1]);
+    }
+  }
+  function onNavMove(e) {
+    if (!navDragRef.current) return;
+    const rect = navRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const nx = (e.clientX - rect.left) * (NW / rect.width);
+    if (navDragRef.current.type === "pan") {
+      const dFrac = (nx - navDragRef.current.startNx) / NCW;
+      const dBars = Math.round(dFrac * total);
+      const [s0,e0] = navDragRef.current.startView;
+      const len = e0-s0+1;
+      const ns  = clamp(s0+dBars, 0, total-len);
+      setView([ns, ns+len-1]);
+    }
+  }
+  function onNavUp() { navDragRef.current = null; }
+
+  // ── cursor ────────────────────────────────────────────────────────────────
+  const mainCursor = zoomMode ? "crosshair" : dragRef.current ? "grabbing" : "grab";
+
+  // ── sel range SVG coords ──────────────────────────────────────────────────
+  const selX1 = selRange ? PAD.left + (selRange.a - vStart) * cw : null;
+  const selX2 = selRange ? PAD.left + (selRange.b - vStart + 1) * cw : null;
+
+  // ── candle drawn count badge ──────────────────────────────────────────────
+  const zoomPct = Math.round((vLen / total) * 100);
+
+  return (
+    <div style={{userSelect:"none"}}>
+      {/* ── TOP CONTROL BAR ── */}
+      <div style={{display:"flex",gap:6,marginBottom:10,flexWrap:"wrap",alignItems:"center"}}>
+        {/* Overlays */}
+        <span style={{fontSize:9,color:"#1e293b",letterSpacing:"0.12em"}}>OVERLAY</span>
+        {[
+          {k:"ema9",  l:"EMA 9",  c:"#fbbf24"},
+          {k:"ema21", l:"EMA 21", c:"#38bdf8"},
+          {k:"bb",    l:"BB(20)", c:"#a78bfa"},
+          ...(allVWAP?[{k:"vwap",l:"VWAP",c:"#fb923c"}]:[]),
+        ].map(o=>(
+          <button key={o.k} onClick={()=>setInd(p=>({...p,[o.k]:!p[o.k]}))} style={{
+            padding:"3px 9px",borderRadius:4,cursor:"pointer",
+            background:ind[o.k]?`${o.c}22`:"#0a0f1e",
+            border:`1px solid ${ind[o.k]?o.c:"#0f172a"}`,
+            color:ind[o.k]?o.c:"#334155",fontFamily:"inherit",fontSize:9,fontWeight:700
+          }}>{o.l}</button>
+        ))}
+
+        <div style={{width:1,height:14,background:"#0f172a"}}/>
+
+        {/* Sub-panels */}
+        {[
+          {l:"Vol",  s:showVol,  fn:v=>{setShowVol(v);}},
+          {l:"RSI",  s:showRSI,  fn:v=>{setShowRSI(v);if(v)setShowMACD(false);}},
+          {l:"MACD", s:showMACD, fn:v=>{setShowMACD(v);if(v)setShowRSI(false);}},
+        ].map(p=>(
+          <button key={p.l} onClick={()=>p.fn(!p.s)} style={{
+            padding:"3px 9px",borderRadius:4,cursor:"pointer",
+            background:p.s?"#1e293b":"#0a0f1e",
+            border:`1px solid ${p.s?"#334155":"#0f172a"}`,
+            color:p.s?"#64748b":"#1e293b",fontFamily:"inherit",fontSize:9
+          }}>{p.l}</button>
+        ))}
+
+        <div style={{width:1,height:14,background:"#0f172a"}}/>
+
+        {/* Zoom controls */}
+        <span style={{fontSize:9,color:"#1e293b",letterSpacing:"0.1em"}}>ZOOM</span>
+        {[
+          {l:"🔍−", title:"Zoom out",  fn:()=>zoomBy(1.3,0.5)},
+          {l:"🔍+", title:"Zoom in",   fn:()=>zoomBy(0.72,0.5)},
+          {l:"◀",  title:"Pan left",  fn:()=>panBy(-Math.max(1,Math.round((vEnd-vStart)*0.15)))},
+          {l:"▶",  title:"Pan right", fn:()=>panBy( Math.max(1,Math.round((vEnd-vStart)*0.15)))},
+          {l:"↺",  title:"Reset view",fn:()=>setView([0,total-1])},
+        ].map(b=>(
+          <button key={b.l} title={b.title} onClick={b.fn} style={{
+            padding:"3px 9px",borderRadius:4,cursor:"pointer",
+            background:"#0a0f1e",border:"1px solid #0f172a",
+            color:"#475569",fontFamily:"inherit",fontSize:10
+          }}>{b.l}</button>
+        ))}
+
+        {/* Zoom-select toggle */}
+        <button
+          title="Drag to select zoom region"
+          onClick={()=>setZoomMode(z=>!z)}
+          style={{
+            padding:"3px 10px",borderRadius:4,cursor:"pointer",
+            background:zoomMode?"#1e3a5f":"#0a0f1e",
+            border:`1px solid ${zoomMode?"#38bdf8":"#0f172a"}`,
+            color:zoomMode?"#38bdf8":"#334155",fontFamily:"inherit",fontSize:9,fontWeight:zoomMode?700:400
+          }}>
+          {zoomMode ? "✕ CANCEL SELECT" : "⬚ SELECT ZOOM"}
+        </button>
+
+        {/* Stats */}
+        <div style={{marginLeft:"auto",display:"flex",gap:10,fontSize:9,alignItems:"center"}}>
+          <span style={{color:"#1e293b"}}>{vLen} bars ({zoomPct}%)</span>
+          <span style={{color:"#00f5c4"}}>▮ Bull</span>
+          <span style={{color:"#ef4444"}}>▮ Bear</span>
+          {ind.ema9  && <span style={{color:"#fbbf24"}}>━ EMA9</span>}
+          {ind.ema21 && <span style={{color:"#38bdf8"}}>━ EMA21</span>}
+          {ind.bb    && <span style={{color:"#a78bfa"}}>◈ BB</span>}
+          {ind.vwap  && allVWAP && <span style={{color:"#fb923c"}}>━ VWAP</span>}
+        </div>
+      </div>
+
+      {/* ── MAIN CHART SVG ── */}
+      <div style={{
+        position:"relative",background:"#060c18",borderRadius:"12px 12px 0 0",
+        border:"1px solid #0d1420",borderBottom:"none",overflow:"hidden"
+      }}>
+        <svg
+          ref={mainRef} width="100%" viewBox={`0 0 ${W} ${H}`}
+          style={{display:"block", cursor:mainCursor, touchAction:"none"}}
+          onMouseMove={onMainMove}
+          onMouseDown={onMainDown}
+          onMouseUp={onMainUp}
+          onMouseLeave={()=>{setTip(null);setCross(null);dragRef.current=null;}}
+          onWheel={onWheel}
+        >
+          <defs>
+            <linearGradient id={`bg_${color.replace(/\W/g,"")}`} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={color} stopOpacity="0.05"/>
+              <stop offset="100%" stopColor={color} stopOpacity="0"/>
+            </linearGradient>
+            <clipPath id="mc"><rect x={PAD.left} y={PAD.top} width={CW} height={mainH}/></clipPath>
+            <clipPath id="vc"><rect x={PAD.left} y={volY} width={CW} height={volH}/></clipPath>
+            <clipPath id="sc"><rect x={PAD.left} y={subTop} width={CW} height={subH}/></clipPath>
+          </defs>
+
+          {/* Background */}
+          <rect x={PAD.left} y={PAD.top} width={CW} height={mainH} fill={`url(#bg_${color.replace(/\W/g,"")})`}/>
+
+          {/* Price grid */}
+          {grid.map((p,i)=>(
+            <g key={i}>
+              <line x1={PAD.left} y1={toY(p)} x2={W-PAD.right} y2={toY(p)}
+                stroke="#0d1420" strokeWidth="1" strokeDasharray="3 7"/>
+              <text x={W-PAD.right+5} y={toY(p)+4} fill="#1e293b" fontSize="9"
+                fontFamily="JetBrains Mono,monospace">
+                {p>=1000?`$${fmt(p/1000,1)}K`:`$${fmt(p,2)}`}
+              </text>
+            </g>
+          ))}
+
+          {/* Bollinger Bands */}
+          {ind.bb&&(()=>{
+            const uPts=vis.map((c,i)=>visBB.up[i]!=null?`${toX(i)},${toY(visBB.up[i])}`:null).filter(Boolean).join(" ");
+            const lPts=vis.map((c,i)=>visBB.lo[i]!=null?`${toX(i)},${toY(visBB.lo[i])}`:null).filter(Boolean).join(" ");
+            const mPts=vis.map((c,i)=>visBB.mid[i]!=null?`${toX(i)},${toY(visBB.mid[i])}`:null).filter(Boolean).join(" ");
+            const fill=[...uPts.split(" "),...lPts.split(" ").reverse()].join(" ");
+            return (
+              <g clipPath="url(#mc)">
+                <polygon points={fill} fill="#a78bfa10"/>
+                <polyline points={uPts} fill="none" stroke="#a78bfa" strokeWidth="0.8" strokeDasharray="3 3" opacity="0.55"/>
+                <polyline points={mPts} fill="none" stroke="#a78bfa" strokeWidth="0.6" strokeDasharray="5 4" opacity="0.35"/>
+                <polyline points={lPts} fill="none" stroke="#a78bfa" strokeWidth="0.8" strokeDasharray="3 3" opacity="0.55"/>
+              </g>
+            );
+          })()}
+
+          {/* VWAP */}
+          {ind.vwap&&visVWAP&&(()=>{
+            const pts=vis.map((c,i)=>visVWAP[i]!=null?`${toX(i)},${toY(visVWAP[i])}`:null).filter(Boolean).join(" ");
+            return <polyline clipPath="url(#mc)" points={pts} fill="none" stroke="#fb923c" strokeWidth="1.1" strokeDasharray="4 2" opacity="0.8"/>;
+          })()}
+
+          {/* Candles */}
+          <g clipPath="url(#mc)">
+            {vis.map((c,i)=>{
+              const up=c.close>=c.open, fc=up?"#00f5c4":"#ef4444";
+              const bT=toY(Math.max(c.open,c.close)), bB=toY(Math.min(c.open,c.close));
+              const bH=Math.max(0.8,bB-bT), cx=toX(i);
+              return (
+                <g key={i}>
+                  <line x1={cx} y1={toY(c.high)} x2={cx} y2={toY(c.low)}
+                    stroke={fc} strokeWidth={Math.max(0.5,cw*0.06)} opacity="0.7"/>
+                  <rect x={cx-hbw} y={bT} width={bw} height={bH}
+                    fill={up?fc:"none"} stroke={fc}
+                    strokeWidth={up?0:Math.max(0.5,cw*0.05)} rx="0.4" opacity="0.92"/>
+                </g>
+              );
+            })}
+          </g>
+
+          {/* Selection brush overlay (zoom-mode drag) */}
+          {zoomMode && selRange && selX1!=null && selX2!=null && (
+            <g clipPath="url(#mc)">
+              <rect x={Math.min(selX1,selX2)} y={PAD.top}
+                width={Math.abs(selX2-selX1)} height={mainH}
+                fill="#38bdf820" stroke="#38bdf8" strokeWidth="1" strokeDasharray="4 2"/>
+              <text x={(selX1+selX2)/2} y={PAD.top+14} textAnchor="middle"
+                fill="#38bdf8" fontSize="9" fontFamily="JetBrains Mono,monospace">
+                {Math.abs(selRange.b-selRange.a)+1} bars selected
+              </text>
+            </g>
+          )}
+
+          {/* EMA9 */}
+          {ind.ema9&&(()=>{
+            const pts=vis.map((c,i)=>visE9[i]!=null?`${toX(i)},${toY(visE9[i])}`:null).filter(Boolean).join(" ");
+            return <polyline clipPath="url(#mc)" points={pts} fill="none" stroke="#fbbf24" strokeWidth="1.1" opacity="0.9"/>;
+          })()}
+          {/* EMA21 */}
+          {ind.ema21&&(()=>{
+            const pts=vis.map((c,i)=>visE21[i]!=null?`${toX(i)},${toY(visE21[i])}`:null).filter(Boolean).join(" ");
+            return <polyline clipPath="url(#mc)" points={pts} fill="none" stroke="#38bdf8" strokeWidth="1.1" opacity="0.9"/>;
+          })()}
+
+          {/* Live price line */}
+          {price>=lo&&price<=hi&&(
+            <g>
+              <line x1={PAD.left} y1={curY} x2={W-PAD.right} y2={curY}
+                stroke={color} strokeWidth="0.8" strokeDasharray="5 3" opacity="0.45"/>
+              <rect x={W-PAD.right+1} y={curY-9} width={74} height={18} fill={color} rx="3"/>
+              <text x={W-PAD.right+5} y={curY+5} fill="#020817" fontSize="10"
+                fontFamily="JetBrains Mono,monospace" fontWeight="bold">
+                {price>=1000?`$${fmt(price/1000,2)}K`:`$${fmt(price,2)}`}
+              </text>
+            </g>
+          )}
+
+          {/* Volume */}
+          {showVol&&(
+            <g clipPath="url(#vc)">
+              <line x1={PAD.left} y1={volY} x2={W-PAD.right} y2={volY} stroke="#0d1420" strokeWidth="1"/>
+              {vis.map((c,i)=>{
+                const up=c.close>=c.open, vh=maxV?(c.volume/maxV)*volH:0;
+                return <rect key={i} x={toX(i)-hbw} y={volY+volH-vh} width={bw} height={vh}
+                  fill={up?"#00f5c418":"#ef444418"}/>;
+              })}
+              <text x={W-PAD.right+5} y={volY+10} fill="#1e293b" fontSize="8" fontFamily="JetBrains Mono,monospace">VOL</text>
+            </g>
+          )}
+
+          {/* RSI */}
+          {showRSI&&subH>0&&(()=>{
+            const pts=visRSI.map((v,i)=>v!=null?`${toX(i)},${toRSI(v)}`:null).filter(Boolean).join(" ");
+            return (
+              <g>
+                <rect x={PAD.left} y={subTop} width={CW} height={subH} fill="#03070f"/>
+                <line x1={PAD.left} y1={subTop} x2={W-PAD.right} y2={subTop} stroke="#0d1420" strokeWidth="1"/>
+                <rect x={PAD.left} y={toRSI(70)} width={CW} height={toRSI(30)-toRSI(70)} fill="#fbbf2406"/>
+                {[30,50,70].map(v=>(
+                  <g key={v}>
+                    <line x1={PAD.left} y1={toRSI(v)} x2={W-PAD.right} y2={toRSI(v)}
+                      stroke={v===50?"#0f172a":"#fbbf2430"} strokeWidth="0.6"
+                      strokeDasharray={v===50?"4 6":"3 4"}/>
+                    <text x={W-PAD.right+5} y={toRSI(v)+4} fill="#fbbf2450" fontSize="8"
+                      fontFamily="JetBrains Mono,monospace">{v}</text>
+                  </g>
+                ))}
+                <polyline clipPath="url(#sc)" points={pts} fill="none" stroke="#fbbf24" strokeWidth="1.3" opacity="0.9"/>
+                <text x={PAD.left+4} y={subTop+12} fill="#1e293b" fontSize="8" fontFamily="JetBrains Mono,monospace">RSI(14)</text>
+                {tip?.rsiV!=null&&<text x={PAD.left+48} y={subTop+12} fill="#fbbf24" fontSize="8"
+                  fontFamily="JetBrains Mono,monospace" fontWeight="bold">{fmt(tip.rsiV,1)}</text>}
+              </g>
+            );
+          })()}
+
+          {/* MACD */}
+          {showMACD&&subH>0&&(()=>{
+            const mPts=visMACDl.map((v,i)=>v!=null?`${toX(i)},${toMCD(v)}`:null).filter(Boolean).join(" ");
+            const sPts=visMACDs.map((v,i)=>v!=null?`${toX(i)},${toMCD(v)}`:null).filter(Boolean).join(" ");
+            return (
+              <g>
+                <rect x={PAD.left} y={subTop} width={CW} height={subH} fill="#03070f"/>
+                <line x1={PAD.left} y1={subTop} x2={W-PAD.right} y2={subTop} stroke="#0d1420" strokeWidth="1"/>
+                <line x1={PAD.left} y1={subTop+subH/2} x2={W-PAD.right} y2={subTop+subH/2} stroke="#0f172a" strokeWidth="0.8"/>
+                <g clipPath="url(#sc)">
+                  {visMACDh.map((h,i)=>h!=null&&(
+                    <rect key={i} x={toX(i)-hbw} y={h>=0?toMCD(h):toMCD(0)} width={bw}
+                      height={Math.abs(toMCD(0)-toMCD(h))} fill={h>=0?"#00f5c428":"#ef444428"}/>
+                  ))}
+                </g>
+                <polyline clipPath="url(#sc)" points={mPts} fill="none" stroke="#00f5c4" strokeWidth="1.2" opacity="0.9"/>
+                <polyline clipPath="url(#sc)" points={sPts} fill="none" stroke="#f472b6" strokeWidth="1.0" opacity="0.9"/>
+                <text x={PAD.left+4} y={subTop+12} fill="#1e293b" fontSize="8" fontFamily="JetBrains Mono,monospace">MACD(12,26,9)</text>
+              </g>
+            );
+          })()}
+
+          {/* X labels */}
+          {xLbls.map(l=>(
+            <text key={l.i} x={toX(l.i)} y={PAD.top+mainH+volH+subGap+subH+11}
+              textAnchor="middle" fill="#1e293b" fontSize="8" fontFamily="JetBrains Mono,monospace">
+              {l.lbl}
+            </text>
+          ))}
+
+          {/* Crosshair */}
+          {cross&&!selRange&&(
+            <g>
+              <line x1={cross.x} y1={PAD.top} x2={cross.x} y2={PAD.top+mainH+volH+subGap+subH}
+                stroke="#1e293b" strokeWidth="0.7" strokeDasharray="2 5" opacity="0.9"/>
+              <line x1={PAD.left} y1={cross.y} x2={W-PAD.right} y2={cross.y}
+                stroke="#1e293b" strokeWidth="0.7" strokeDasharray="2 5" opacity="0.9"/>
+              {/* Price label on Y axis */}
+              {tip&&(
+                <>
+                  <rect x={W-PAD.right+1} y={cross.y-8} width={74} height={16} fill="#1e293b" rx="2"/>
+                  <text x={W-PAD.right+5} y={cross.y+4} fill="#64748b" fontSize="9"
+                    fontFamily="JetBrains Mono,monospace">{`$${fmt(tip.close,2)}`}</text>
+                </>
+              )}
+            </g>
+          )}
+
+          {/* Axis borders */}
+          <line x1={W-PAD.right} y1={PAD.top} x2={W-PAD.right} y2={PAD.top+mainH+volH+subGap+subH} stroke="#0d1420" strokeWidth="1"/>
+          <line x1={PAD.left}    y1={PAD.top} x2={PAD.left}    y2={PAD.top+mainH} stroke="#0d1420" strokeWidth="1"/>
+        </svg>
+
+        {/* Tooltip */}
+        {tip&&!selRange&&(
+          <div style={{
+            position:"absolute",top:6,left:20,
+            background:"rgba(3,7,14,0.96)",border:"1px solid #0f172a",
+            borderRadius:10,padding:"10px 15px",
+            fontFamily:"'JetBrains Mono',monospace",pointerEvents:"none",
+            backdropFilter:"blur(8px)",display:"flex",gap:16,alignItems:"flex-start"
+          }}>
+            <div>
+              <div style={{fontSize:9,color:"#334155",marginBottom:5,letterSpacing:"0.1em"}}>{fmtDT(tip.ts,tf)}</div>
+              <div style={{display:"grid",gridTemplateColumns:"auto auto",columnGap:10,rowGap:2,fontSize:11}}>
+                {[["O",tip.open],["H",tip.high],["L",tip.low],["C",tip.close]].map(([l,v])=>(
+                  <div key={l} style={{display:"contents"}}>
+                    <span style={{color:"#334155"}}>{l}</span>
+                    <span style={{color:tip.close>=tip.open?"#00f5c4":"#ef4444",fontWeight:800}}>{`$${fmt(v,2)}`}</span>
+                  </div>
+                ))}
+                <div style={{display:"contents"}}>
+                  <span style={{color:"#334155"}}>Vol</span>
+                  <span style={{color:"#475569"}}>{(tip.volume/1e6).toFixed(2)}M</span>
+                </div>
+              </div>
+            </div>
+            <div>
+              <div style={{fontSize:9,color:"#334155",marginBottom:5,letterSpacing:"0.1em"}}>CHANGE</div>
+              <div style={{fontWeight:800,fontSize:16,color:tip.close>=tip.open?"#00f5c4":"#ef4444"}}>
+                {tip.close>=tip.open?"+":""}{fmt(((tip.close-tip.open)/tip.open)*100)}%
+              </div>
+              <div style={{fontSize:10,color:"#475569",marginTop:2}}>
+                {tip.close>=tip.open?"+":""}{`$${fmt(tip.close-tip.open,2)}`}
+              </div>
+            </div>
+            <div style={{fontSize:10}}>
+              <div style={{fontSize:9,color:"#334155",marginBottom:5,letterSpacing:"0.1em"}}>INDICATORS</div>
+              {ind.ema9  && tip.e9  !=null && <div style={{color:"#fbbf24",marginBottom:2}}>EMA9  {`$${fmt(tip.e9,2)}`}</div>}
+              {ind.ema21 && tip.e21 !=null && <div style={{color:"#38bdf8",marginBottom:2}}>EMA21 {`$${fmt(tip.e21,2)}`}</div>}
+              {ind.bb    && tip.bbU !=null && <div style={{color:"#a78bfa",marginBottom:2}}>BB  {`$${fmt(tip.bbL,2)}`}–{`$${fmt(tip.bbU,2)}`}</div>}
+              {ind.vwap  && tip.vwapV!=null&& <div style={{color:"#fb923c",marginBottom:2}}>VWAP {`$${fmt(tip.vwapV,2)}`}</div>}
+              {showRSI   && tip.rsiV !=null && <div style={{color:"#fbbf24",marginBottom:2}}>RSI  {fmt(tip.rsiV,1)}</div>}
+              {showMACD  && tip.macdV!=null && <div style={{color:"#00f5c4"}}>MACD {fmt(tip.macdV,3)}</div>}
+            </div>
+          </div>
+        )}
+
+        {/* Zoom mode hint */}
+        {zoomMode&&(
+          <div style={{position:"absolute",bottom:6,right:90,
+            background:"rgba(56,189,248,0.12)",border:"1px solid #38bdf840",
+            borderRadius:5,padding:"3px 10px",fontSize:9,color:"#38bdf8",
+            fontFamily:"JetBrains Mono,monospace"}}>
+            Click and drag to select a region to zoom into
+          </div>
+        )}
+      </div>
+
+      {/* ── NAVIGATOR BAR ── */}
+      <div style={{
+        position:"relative",background:"#040912",
+        border:"1px solid #0d1420",borderTop:"none",
+        borderRadius:"0 0 12px 12px",overflow:"hidden",
+        cursor:"ew-resize"
+      }}>
+        <svg
+          ref={navRef} width="100%" viewBox={`0 0 ${NW} ${NH+6}`}
+          style={{display:"block"}}
+          onMouseDown={onNavDown}
+          onMouseMove={onNavMove}
+          onMouseUp={onNavUp}
+          onMouseLeave={onNavUp}
+        >
+          {/* Full-history line */}
+          <polyline points={navPts} fill="none" stroke={color} strokeWidth="1" opacity="0.4"/>
+
+          {/* Shaded out-of-view regions */}
+          <rect x={NPAD.l} y={0} width={wxL-NPAD.l} height={NH+6} fill="rgba(0,0,0,0.55)"/>
+          <rect x={wxR}    y={0} width={NPAD.l+NCW-wxR} height={NH+6} fill="rgba(0,0,0,0.55)"/>
+
+          {/* Viewport window */}
+          <rect x={wxL} y={0} width={wxR-wxL} height={NH+6}
+            fill="none" stroke={color} strokeWidth="1.2" opacity="0.7"/>
+          {/* Window fill */}
+          <rect x={wxL} y={0} width={wxR-wxL} height={NH+6} fill={`${color}0a`}/>
+
+          {/* Drag handles */}
+          {[wxL, wxR].map((x,i)=>(
+            <rect key={i} x={x-(i===0?3:0)} y={0} width={3} height={NH+6}
+              fill={color} opacity="0.5" rx="1"/>
+          ))}
+
+          {/* Labels */}
+          <text x={NPAD.l+4} y={NH-2} fill="#0d1420" fontSize="8" fontFamily="JetBrains Mono,monospace">
+            NAVIGATOR · DRAG TO PAN · SCROLL OR BUTTONS TO ZOOM
+          </text>
+          <text x={NW-NPAD.r+5} y={NH-2} fill="#1e293b" fontSize="8" fontFamily="JetBrains Mono,monospace">
+            {vLen}/{total}
+          </text>
+        </svg>
+      </div>
+    </div>
+  );
+}
+
+
+
+
+// ─── STOCK DETAIL MODAL
+function StockDetailModal({ stock, sector, price, prevPrice, history, assetBeta, holdings, cash, buyingPower, restrictedCash = 0, marginStatus = "safe", tradeSpreadRate = 0, canTrade, onBuy, onSell, onShort, onCover, onClose, transactions, aiLog, orderFlow = null }) {
+  const [qty,    setQty]    = useState(1);
+  const [detTab, setDetTab] = useState("chart");
+  const [tf,     setTF]     = useState("1D");
+  const cacheRef = useRef({});
+
+  if (!stock) return null;
+
+  const color    = sector?.color || "#00f5c4";
+  const chg      = prevPrice > 0 ? ((price - prevPrice) / prevPrice) * 100 : 0;
+  const up       = chg >= 0;
+  const held     = holdings[stock.ticker];
+  const heldQty  = held?.qty || 0;
+  const longHeld = longQty(held);
+  const shortHeld = shortQty(held);
+  const buyTotal = price * qty * (1 + tradeSpreadRate);
+  const canBuy   = canTrade && buyTotal <= buyingPower && qty > 0 && shortHeld === 0;
+  const canSell  = canTrade && longHeld >= qty && qty > 0;
+  const canShort = canTrade && qty > 0 && longHeld === 0 && buyTotal <= buyingPower;
+  const canCover = canTrade && shortHeld >= qty && qty > 0;
+  const unrealized = held ? (price - held.avgCost) * held.qty : 0;
+  const unrPct     = held ? ((price - held.avgCost) / held.avgCost) * 100 * (held.qty < 0 ? -1 : 1) : 0;
+
+  // ── BUY/SELL RATIO ─────────────────────────────────────────────────────────
+  // Combines player's own transactions + AI bot trades for this ticker
+  const myBuys  = (transactions||[]).filter(t => (t.type==="BUY" || t.type==="COVER")  && t.ticker===stock.ticker).length;
+  const mySells = (transactions||[]).filter(t => (t.type==="SELL" || t.type==="SHORT") && t.ticker===stock.ticker).length;
+  const botBuys  = (aiLog||[]).filter(t => t.action==="buy"  && t.ticker===stock.ticker).length;
+  const botSells = (aiLog||[]).filter(t => t.action==="sell" && t.ticker===stock.ticker).length;
+  const totalBuys  = myBuys  + botBuys;
+  const totalSells = mySells + botSells;
+  const fallbackTrades = totalBuys + totalSells;
+  const fallbackBuyPct = fallbackTrades > 0 ? Math.round((totalBuys  / fallbackTrades) * 100) : 50;
+  const buyPct  = orderFlow ? (orderFlow.buyPct ?? 50) : fallbackBuyPct;
+  const sellPct = 100 - buyPct;
+  const flowDisplay = orderFlow ? getOrderFlowDisplay(orderFlow) : getOrderFlowDisplay({
+    pressure: fallbackTrades > 0 ? ((fallbackBuyPct - 50) / 50) * Math.min(1, fallbackTrades / 12) : 0
+  });
+  const ratioSignal = flowDisplay.label;
+  const ratioColor  = flowDisplay.color;
+  const totalTrades = orderFlow ? ((orderFlow.buyCount || 0) + (orderFlow.sellCount || 0)) : fallbackTrades;
+  const displayedBuyCount = orderFlow ? Math.max(totalBuys, orderFlow.buyCount || 0) : totalBuys;
+  const displayedSellCount = orderFlow ? Math.max(totalSells, orderFlow.sellCount || 0) : totalSells;
+
+  // Generate/cache candles per ticker+timeframe (pure, no setState)
+  const cacheKey = `${stock.ticker}_${tf}`;
+  if (!cacheRef.current[cacheKey]) {
+    const tfObj = TIMEFRAMES.find(t => t.key === tf) || TIMEFRAMES[0];
+    const c = generateCandles(stock.basePrice || 100, stock.volatility || 1, tfObj);
+    if (c.length > 0) c[c.length - 1].close = price;
+    cacheRef.current = { ...cacheRef.current, [cacheKey]: c };
+  }
+  const candles = cacheRef.current[cacheKey] || [];
+  const tfObj   = TIMEFRAMES.find(t => t.key === tf) || TIMEFRAMES[0];
+
+  return (
+    <div style={{
+      position:"fixed", inset:0, zIndex:9000, background:"rgba(2,8,23,0.93)",
+      display:"flex", alignItems:"center", justifyContent:"center",
+      backdropFilter:"blur(6px)", padding:"10px",
+    }} onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{
+        width:"min(1120px,99vw)", background:"#060c18",
+        border:`1px solid ${color}55`, borderRadius:18,
+        boxShadow:`0 0 80px ${color}18`, overflow:"hidden",
+        display:"flex", flexDirection:"column", maxHeight:"97vh",
+        animation:"fadeup 0.2s ease"
+      }}>
+
+        {/* Header */}
+        <div style={{
+          padding:"13px 22px 11px",
+          background:`linear-gradient(135deg,${color}0d,transparent 60%)`,
+          borderBottom:`1px solid ${color}22`,
+          display:"flex", alignItems:"center", justifyContent:"space-between", flexShrink:0
+        }}>
+          <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+            <span style={{ fontFamily:"'Syne',sans-serif", fontWeight:900, fontSize:26, color, lineHeight:1 }}>
+              {stock.ticker}
+            </span>
+            <span style={{ fontSize:9, padding:"3px 8px", borderRadius:4,
+              background:`${color}18`, border:`1px solid ${color}35`, color, fontWeight:700 }}>
+              {sector?.icon} {sector?.label}
+            </span>
+            <span style={{ fontSize:12, color:"#64748b" }}>{stock.name}</span>
+          </div>
+          <div style={{ display:"flex", alignItems:"center", gap:18 }}>
+            <div style={{ textAlign:"right" }}>
+              <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:32, lineHeight:1, color:"#f1f5f9" }}>
+                ${Number(price).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}
+              </div>
+              <div style={{ fontSize:12, fontWeight:700, color: up ? "#00f5c4" : "#ef4444" }}>
+                {up ? "▲ +" : "▼ "}{Math.abs(chg).toFixed(2)}%
+              </div>
+            </div>
+            <button onClick={onClose} style={{
+              width:32, height:32, borderRadius:8, background:"#0f172a",
+              border:"1px solid #1e293b", color:"#64748b", fontSize:18,
+              cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0
+            }}>✕</button>
+          </div>
+        </div>
+
+        {/* Tab bar + TF selector */}
+        <div style={{ display:"flex", alignItems:"center", borderBottom:"1px solid #0f172a",
+          flexShrink:0, padding:"0 22px" }}>
+          {["chart","about"].map(t => (
+            <button key={t} onClick={() => setDetTab(t)} style={{
+              padding:"9px 14px", background:"none", border:"none",
+              color: detTab===t ? color : "#475569",
+              borderBottom: detTab===t ? `2px solid ${color}` : "2px solid transparent",
+              cursor:"pointer", fontFamily:"inherit", fontSize:10,
+              fontWeight: detTab===t ? 700 : 400, letterSpacing:"0.1em", textTransform:"uppercase"
+            }}>{t}</button>
+          ))}
+          {detTab === "chart" && (
+            <>
+              <div style={{ width:1, height:16, background:"#0f172a", margin:"0 12px" }}/>
+              <div style={{ display:"flex", gap:3, alignItems:"center" }}>
+                {TIMEFRAMES.map(t => (
+                  <button key={t.key} onClick={() => setTF(t.key)} style={{
+                    padding:"3px 9px", borderRadius:4, cursor:"pointer",
+                    background: tf===t.key ? `${color}1a` : "#060c18",
+                    border:`1px solid ${tf===t.key ? color : "#0d1420"}`,
+                    color: tf===t.key ? color : "#334155",
+                    fontFamily:"inherit", fontSize:9, fontWeight: tf===t.key ? 700 : 400, transition:"all 0.15s"
+                  }}>{t.label}</button>
+                ))}
+                <span style={{ fontSize:8, color:"#1e293b", marginLeft:8, letterSpacing:"0.08em" }}>{tfObj.desc}</span>
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Body */}
+        <div style={{ flex:1, overflowY:"auto", overflowX:"hidden", padding:"16px 20px" }}>
+
+          {detTab === "chart" && (
+            <div style={{ animation:"fadeup 0.2s ease" }}>
+              <CandleChart candles={candles} color={color} price={price} tf={tf} />
+
+              {/* Company stats */}
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:8, marginTop:14 }}>
+                {[
+                  { l:"MKT CAP",    v: stock.mktCap    || "—", c:"#f1f5f9" },
+                  { l:"EMPLOYEES",  v: stock.employees || "—", c:"#94a3b8" },
+                  { l:"FOUNDED",    v: stock.founded   || "—", c:"#64748b" },
+                  { l:"VOLATILITY", v: `${stock.volatility}×`, c: stock.volatility>=1.5?"#ef4444":stock.volatility>=1.2?"#fbbf24":"#00f5c4" },
+                  { l:"ASSET BETA", v: assetBeta != null ? assetBeta.toFixed(2) : "—", c:"#c4b5fd" },
+                ].map(m => (
+                  <div key={m.l} style={{ background:"#0a0f1e", border:"1px solid #111827",
+                    borderRadius:8, padding:"10px 12px", textAlign:"center" }}>
+                    <div style={{ fontSize:8, color:"#334155", letterSpacing:"0.1em", marginBottom:4 }}>{m.l}</div>
+                    <div style={{ fontSize:13, fontWeight:800, color:m.c }}>{m.v}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Buy/Sell Ratio */}
+              <div style={{ background:"#0a0f1e", border:"1px solid #111827", borderRadius:10, padding:"12px 14px", marginTop:12 }}>
+                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
+                  <div style={{ fontSize:9, color:"#475569", letterSpacing:"0.1em", fontWeight:700 }}>MARKET SENTIMENT — BUY / SELL RATIO</div>
+                  <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                    <span style={{ fontSize:9, color:"#334155" }}>{totalTrades} {orderFlow ? "flow prints" : "trades"}</span>
+                    <span style={{ fontSize:10, fontWeight:800, color:ratioColor, padding:"2px 8px",
+                      background:`${ratioColor}18`, border:`1px solid ${ratioColor}44`, borderRadius:4,
+                      letterSpacing:"0.06em" }}>{ratioSignal}</span>
+                  </div>
+                </div>
+                <div style={{ position:"relative", height:20, borderRadius:10, overflow:"hidden",
+                  background:"#0f172a", border:"1px solid #1e293b" }}>
+                  <div style={{ position:"absolute", left:0, top:0, bottom:0,
+                    width:`${buyPct}%`,
+                    background: totalTrades===0 ? "transparent" : "linear-gradient(90deg,#00f5c4bb,#00f5c455)",
+                    transition:"width 0.6s ease" }}/>
+                  <div style={{ position:"absolute", right:0, top:0, bottom:0,
+                    width:`${sellPct}%`,
+                    background: totalTrades===0 ? "transparent" : "linear-gradient(270deg,#ef4444bb,#ef444455)",
+                    transition:"width 0.6s ease" }}/>
+                  <div style={{ position:"absolute", left:"50%", top:3, bottom:3, width:1,
+                    background:"#1e293b", transform:"translateX(-50%)" }}/>
+                  {totalTrades > 0 && buyPct > 14 && (
+                    <div style={{ position:"absolute", left:8, top:0, bottom:0, display:"flex",
+                      alignItems:"center", fontSize:9, fontWeight:800, color:"#00f5c4", letterSpacing:"0.04em" }}>
+                      {buyPct}% BUY
+                    </div>
+                  )}
+                  {totalTrades > 0 && sellPct > 14 && (
+                    <div style={{ position:"absolute", right:8, top:0, bottom:0, display:"flex",
+                      alignItems:"center", fontSize:9, fontWeight:800, color:"#ef4444", letterSpacing:"0.04em" }}>
+                      SELL {sellPct}%
+                    </div>
+                  )}
+                  {totalTrades === 0 && (
+                    <div style={{ position:"absolute", inset:0, display:"flex", alignItems:"center",
+                      justifyContent:"center", fontSize:9, color:"#334155", letterSpacing:"0.1em" }}>
+                      NO TRADES YET — BE FIRST TO MOVE
+                    </div>
+                  )}
+                </div>
+                <div style={{ display:"flex", justifyContent:"space-between", marginTop:6, fontSize:9 }}>
+                  {orderFlow ? (
+                    <>
+                      <span style={{ color:"#00f5c4" }}>▲ {displayedBuyCount} buy-side prints</span>
+                      <span style={{ color:"#ef4444" }}>{displayedSellCount} sell-side prints ▼</span>
+                    </>
+                  ) : (
+                    <>
+                      <span style={{ color:"#00f5c4" }}>▲ {totalBuys} buys
+                        <span style={{ color:"#334155", marginLeft:5 }}>({myBuys} you · {botBuys} bots)</span>
+                      </span>
+                      <span style={{ color:"#ef4444" }}>
+                        <span style={{ color:"#334155", marginRight:5 }}>({mySells} you · {botSells} bots)</span>
+                        {totalSells} sells ▼
+                      </span>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              {/* Position */}
+              {held && (
+                <div style={{ background:`${color}0a`, border:`1px solid ${color}25`,
+                  borderRadius:10, padding:"12px 14px", marginTop:12 }}>
+                  <div style={{ fontSize:9, color, letterSpacing:"0.12em", marginBottom:8, fontWeight:700 }}>YOUR POSITION</div>
+                  <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:8, fontSize:11 }}>
+                    <div><div style={{ color:"#334155", fontSize:9, marginBottom:2 }}>POSITION</div>
+                      <div style={{ color:heldQty < 0 ? "#fca5a5" : "#f1f5f9", fontWeight:700 }}>
+                        {heldQty < 0 ? "SHORT" : "LONG"} {Math.abs(heldQty)}
+                      </div></div>
+                    <div><div style={{ color:"#334155", fontSize:9, marginBottom:2 }}>AVG COST</div>
+                      <div style={{ color:"#f1f5f9", fontWeight:700 }}>${held.avgCost.toFixed(2)}</div></div>
+                    <div><div style={{ color:"#334155", fontSize:9, marginBottom:2 }}>NET VALUE</div>
+                      <div style={{ color:"#f1f5f9", fontWeight:700 }}>${(price*heldQty).toFixed(0)}</div></div>
+                    <div><div style={{ color:"#334155", fontSize:9, marginBottom:2 }}>ASSET BETA</div>
+                      <div style={{ color:"#ddd6fe", fontWeight:700 }}>{assetBeta != null ? assetBeta.toFixed(2) : "—"}</div></div>
+                    <div><div style={{ color:"#334155", fontSize:9, marginBottom:2 }}>UNREALIZED P&L</div>
+                      <div style={{ color:unrealized>=0?"#00f5c4":"#ef4444", fontWeight:700 }}>
+                        {unrealized>=0?"+":""}${Math.abs(unrealized).toFixed(0)} ({unrPct>=0?"+":""}{unrPct.toFixed(1)}%)
+                      </div></div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {detTab === "about" && (
+            <div style={{ animation:"fadeup 0.2s ease" }}>
+              <p style={{ fontSize:13, color:"#64748b", lineHeight:1.8, marginBottom:20 }}>
+                {stock.description || "No description available."}
+              </p>
+              {/* ETF constituent chips */}
+              {stock.constituents && (
+                <div style={{ marginBottom:16 }}>
+                  <div style={{ fontSize:9, color:"#475569", letterSpacing:"0.1em", marginBottom:6 }}>
+                    TRACKS {stock.constituents.length} STOCKS
+                  </div>
+                  <div style={{ display:"flex", flexWrap:"wrap", gap:5 }}>
+                    {stock.constituents.map(t => {
+                      const st = ALL_STOCKS.find(x => x.ticker === t);
+                      return (
+                        <div key={t} style={{
+                          padding:"4px 10px", borderRadius:6, fontSize:10, fontWeight:700,
+                          background:`${st?.color || color}15`,
+                          border:`1px solid ${st?.color || color}40`,
+                          color: st?.color || color
+                        }}>
+                          {t}
+                          <span style={{ fontSize:8, fontWeight:400, marginLeft:4, color:"#64748b" }}>
+                            {st?.name?.split(" ")[0]}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+              {/* Buy/Sell Ratio — about tab */}
+              <div style={{ background:"#0a0f1e", border:"1px solid #111827", borderRadius:10, padding:"12px 14px", marginBottom:12 }}>
+                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
+                  <div style={{ fontSize:9, color:"#475569", letterSpacing:"0.1em", fontWeight:700 }}>BUY / SELL RATIO</div>
+                  <span style={{ fontSize:10, fontWeight:800, color:ratioColor, padding:"2px 8px",
+                    background:`${ratioColor}18`, border:`1px solid ${ratioColor}44`, borderRadius:4,
+                    letterSpacing:"0.06em" }}>{ratioSignal}</span>
+                </div>
+                <div style={{ position:"relative", height:20, borderRadius:10, overflow:"hidden",
+                  background:"#0f172a", border:"1px solid #1e293b" }}>
+                  <div style={{ position:"absolute", left:0, top:0, bottom:0, width:`${buyPct}%`,
+                    background: totalTrades===0 ? "transparent" : "linear-gradient(90deg,#00f5c4bb,#00f5c455)",
+                    transition:"width 0.6s ease" }}/>
+                  <div style={{ position:"absolute", right:0, top:0, bottom:0, width:`${sellPct}%`,
+                    background: totalTrades===0 ? "transparent" : "linear-gradient(270deg,#ef4444bb,#ef444455)",
+                    transition:"width 0.6s ease" }}/>
+                  <div style={{ position:"absolute", left:"50%", top:3, bottom:3, width:1,
+                    background:"#1e293b", transform:"translateX(-50%)" }}/>
+                  {totalTrades > 0 && buyPct > 14 && (
+                    <div style={{ position:"absolute", left:8, top:0, bottom:0, display:"flex",
+                      alignItems:"center", fontSize:9, fontWeight:800, color:"#00f5c4" }}>
+                      {buyPct}% BUY
+                    </div>
+                  )}
+                  {totalTrades > 0 && sellPct > 14 && (
+                    <div style={{ position:"absolute", right:8, top:0, bottom:0, display:"flex",
+                      alignItems:"center", fontSize:9, fontWeight:800, color:"#ef4444" }}>
+                      SELL {sellPct}%
+                    </div>
+                  )}
+                  {totalTrades === 0 && (
+                    <div style={{ position:"absolute", inset:0, display:"flex", alignItems:"center",
+                      justifyContent:"center", fontSize:9, color:"#334155", letterSpacing:"0.1em" }}>
+                      NO TRADES YET
+                    </div>
+                  )}
+                </div>
+                <div style={{ display:"flex", justifyContent:"space-between", marginTop:6, fontSize:9 }}>
+                  {orderFlow ? (
+                    <>
+                      <span style={{ color:"#00f5c4" }}>▲ {displayedBuyCount} buy-side prints</span>
+                      <span style={{ color:"#ef4444" }}>{displayedSellCount} sell-side prints ▼</span>
+                    </>
+                  ) : (
+                    <>
+                      <span style={{ color:"#00f5c4" }}>▲ {totalBuys} buys <span style={{ color:"#334155" }}>({myBuys} you · {botBuys} bots)</span></span>
+                      <span style={{ color:"#ef4444" }}><span style={{ color:"#334155" }}>({mySells} you · {botSells} bots)</span> {totalSells} sells ▼</span>
+                    </>
+                  )}
+                </div>
+              </div>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:8 }}>
+                {[
+                  { l:"TICKER",     v: stock.ticker,           c: color    },
+                  { l:"MKT CAP",    v: stock.mktCap    || "—", c:"#f1f5f9" },
+                  { l:"EMPLOYEES",  v: stock.employees || "—", c:"#94a3b8" },
+                  { l:"FOUNDED",    v: stock.founded   || "—", c:"#64748b" },
+                  { l:"SECTOR",     v: sector?.label   || "—", c: color    },
+                  { l:"VOLATILITY", v: `${stock.volatility}×`, c: stock.volatility>=1.5?"#ef4444":stock.volatility>=1.2?"#fbbf24":"#00f5c4" },
+                ].map(m => (
+                  <div key={m.l} style={{ background:"#0a0f1e", border:"1px solid #111827",
+                    borderRadius:8, padding:"10px 12px" }}>
+                    <div style={{ fontSize:8, color:"#334155", letterSpacing:"0.1em", marginBottom:4 }}>{m.l}</div>
+                    <div style={{ fontSize:13, fontWeight:800, color:m.c }}>{m.v}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Trade Panel */}
+        <div style={{ borderTop:`1px solid ${color}22`, background:"#040b17",
+          padding:"13px 22px", flexShrink:0 }}>
+          {!canTrade && (
+            <div style={{ fontSize:11, color:"#ef4444", marginBottom:8, textAlign:"center",
+              padding:"6px", background:"rgba(239,68,68,0.08)", borderRadius:6 }}>
+              ⚠ Trading currently locked
+            </div>
+          )}
+          <div style={{ display:"flex", alignItems:"center", gap:12, flexWrap:"wrap" }}>
+            <div>
+              <div style={{ fontSize:9, color:"#475569", marginBottom:4, letterSpacing:"0.1em" }}>QUANTITY</div>
+              <div style={{ display:"flex", alignItems:"center", gap:4 }}>
+                <button onClick={() => setQty(q=>Math.max(1,q-1))} style={{ width:28,height:36,background:"#0f172a",border:"1px solid #1e293b",color:"#94a3b8",borderRadius:5,cursor:"pointer",fontSize:14,fontFamily:"inherit" }}>−</button>
+                <input type="number" min={1} value={qty}
+                  onChange={e=>setQty(Math.max(1,parseInt(e.target.value)||1))}
+                  style={{ width:60,padding:"8px 0",textAlign:"center",background:"#020817",border:"1px solid #1e293b",color:"#f1f5f9",borderRadius:5,fontSize:15,fontFamily:"inherit" }}/>
+                <button onClick={() => setQty(q=>q+1)} style={{ width:28,height:36,background:"#0f172a",border:"1px solid #1e293b",color:"#94a3b8",borderRadius:5,cursor:"pointer",fontSize:14,fontFamily:"inherit" }}>+</button>
+              </div>
+            </div>
+            <div style={{ flex:1 }}>
+              <div style={{ fontSize:9, color:"#475569", marginBottom:4 }}>TOTAL COST</div>
+              <div style={{ fontSize:18, fontWeight:800, color:"#f1f5f9" }}>
+                ${buyTotal.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}
+              </div>
+              <div style={{ fontSize:10, color:"#334155", marginTop:2 }}>
+                Free cash: ${cash.toLocaleString("en-US",{minimumFractionDigits:0,maximumFractionDigits:0})}
+                <span style={{ marginLeft:8, color:"#64748b" }}>· Buying power: ${Number(buyingPower || 0).toLocaleString("en-US",{minimumFractionDigits:0,maximumFractionDigits:0})}</span>
+                <span style={{ marginLeft:8, color:"#64748b" }}>· Short collateral: ${Number(restrictedCash || 0).toLocaleString("en-US",{minimumFractionDigits:0,maximumFractionDigits:0})}</span>
+                <span style={{ marginLeft:8, color:marginStatus === "call" ? "#ef4444" : marginStatus === "watch" ? "#fbbf24" : "#00f5c4" }}>
+                  · Margin: {marginStatus.toUpperCase()}
+                </span>
+                {longHeld>0 && <span style={{ marginLeft:8,color:"#475569" }}>· Long: {longHeld}</span>}
+                {shortHeld>0 && <span style={{ marginLeft:8,color:"#fca5a5" }}>· Short: {shortHeld}</span>}
+              </div>
+            </div>
+            <div style={{ display:"flex", gap:4 }}>
+              {[1,5,10,25].map(n=>(
+                <button key={n} onClick={()=>setQty(n)} style={{
+                  padding:"5px 9px",background:qty===n?`${color}22`:"#0f172a",
+                  border:`1px solid ${qty===n?color:"#1e293b"}`,color:qty===n?color:"#475569",
+                  borderRadius:5,cursor:"pointer",fontFamily:"inherit",fontSize:10,fontWeight:700
+                }}>{n}</button>
+              ))}
+              <button onClick={()=>{const unitCost = price * (1 + tradeSpreadRate); const m=Math.floor((buyingPower || 0)/Math.max(unitCost,0.01)); if(m>0)setQty(m);}} style={{
+                padding:"5px 9px",background:"#0f172a",border:"1px solid #1e293b",
+                color:"#fbbf24",borderRadius:5,cursor:"pointer",fontFamily:"inherit",fontSize:9,fontWeight:700
+              }}>MAX</button>
+            </div>
+            <div style={{ display:"flex", gap:8 }}>
+              <button onClick={()=>{onBuy(stock.ticker,qty);onClose();}} disabled={!canBuy} style={{
+                padding:"12px 28px",
+                background:canBuy?"linear-gradient(135deg,#00f5c4,#00d4aa)":"#1e293b",
+                color:canBuy?"#020817":"#334155",border:"none",borderRadius:8,fontWeight:800,
+                cursor:canBuy?"pointer":"not-allowed",fontFamily:"inherit",fontSize:14
+              }}>▲ BUY</button>
+              <button onClick={()=>{onSell(stock.ticker,qty);onClose();}} disabled={!canSell} style={{
+                padding:"12px 28px",
+                background:canSell?"linear-gradient(135deg,#ef4444,#dc2626)":"#1e293b",
+                color:canSell?"#fff":"#334155",border:"none",borderRadius:8,fontWeight:800,
+                cursor:canSell?"pointer":"not-allowed",fontFamily:"inherit",fontSize:14
+              }}>▼ SELL</button>
+              <button onClick={()=>{onShort(stock.ticker,qty);onClose();}} disabled={!canShort} style={{
+                padding:"12px 24px",
+                background:canShort?"linear-gradient(135deg,#f97316,#ea580c)":"#1e293b",
+                color:canShort?"#fff":"#334155",border:"none",borderRadius:8,fontWeight:800,
+                cursor:canShort?"pointer":"not-allowed",fontFamily:"inherit",fontSize:14
+              }}>↘ SHORT</button>
+              <button onClick={()=>{onCover(stock.ticker,qty);onClose();}} disabled={!canCover} style={{
+                padding:"12px 24px",
+                background:canCover?"linear-gradient(135deg,#22c55e,#16a34a)":"#1e293b",
+                color:canCover?"#04130a":"#334155",border:"none",borderRadius:8,fontWeight:800,
+                cursor:canCover?"pointer":"not-allowed",fontFamily:"inherit",fontSize:14
+              }}>↗ COVER</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ─── DISRUPTION BLAST OVERLAY ─────────────────────────────────────────────────
+// Full-screen blurred overlay shown on ALL screens when GM fires a disruption
+function DisruptionBlast({ events, roundNum, onDismiss, isGM }) {
+  const [step, setStep] = useState(0);
+  useEffect(() => {
+    const t = setTimeout(() => setStep(s => Math.min(s + 1, events.length)), 600);
+    return () => clearTimeout(t);
+  }, [step, events.length]);
+
+  return (
+    <div style={{
+      position:"fixed", inset:0, zIndex:10000,
+      background:"rgba(2,4,12,0.97)",
+      backdropFilter:"blur(18px)", WebkitBackdropFilter:"blur(18px)",
+      display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center",
+      fontFamily:"'JetBrains Mono','Courier New',monospace",
+      backgroundImage:"repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(239,68,68,0.03) 3px,rgba(239,68,68,0.03) 4px)",
+      animation:"fadein 0.4s ease"
+    }}>
+      {/* Red pulse border */}
+      <div style={{ position:"absolute", inset:0, border:"3px solid #ef444440",
+        boxShadow:"inset 0 0 120px rgba(239,68,68,0.15)", pointerEvents:"none" }}/>
+
+      <div style={{ width:"min(760px,95vw)", textAlign:"center" }}>
+        {/* Header */}
+        <div style={{ fontSize:9, color:"#ef4444", letterSpacing:"0.5em", marginBottom:16,
+          animation:"pulse 1s infinite" }}>
+          ● LIVE ALERT · ROUND {roundNum}
+        </div>
+        <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:"clamp(42px,7vw,80px)",
+          lineHeight:1, color:"#ef4444",
+          textShadow:"0 0 60px rgba(239,68,68,0.8), 0 0 120px rgba(239,68,68,0.4)",
+          marginBottom:8, animation:"pulse 2s infinite" }}>
+          MARKET DISRUPTION
+        </div>
+        <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:900,
+          fontSize:"clamp(14px,2.5vw,22px)", color:"#fca5a5",
+          letterSpacing:"0.2em", marginBottom:36 }}>
+          TAKING EFFECT THIS ROUND — TRADE ACCORDINGLY
+        </div>
+
+        {/* Events */}
+        <div style={{ display:"flex", flexDirection:"column", gap:10, marginBottom:32 }}>
+          {events.map((evt, i) => {
+            const stock = ALL_STOCKS.find(s => s.ticker === evt.ticker);
+            const up = evt.impact > 0;
+            const visible = i < step;
+            return (
+              <div key={i} style={{
+                opacity: visible ? 1 : 0,
+                transform: visible ? "none" : "translateY(20px)",
+                transition:"all 0.5s ease",
+                background: up ? "rgba(0,245,196,0.06)" : "rgba(239,68,68,0.06)",
+                border:`1px solid ${up?"#00f5c430":"#ef444430"}`,
+                borderLeft:`4px solid ${up?"#00f5c4":"#ef4444"}`,
+                borderRadius:12, padding:"16px 20px",
+                display:"flex", alignItems:"center", gap:16, textAlign:"left"
+              }}>
+                <div style={{ flexShrink:0 }}>
+                  <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:32,
+                    color: stock?.color || "#94a3b8", letterSpacing:"0.05em" }}>
+                    {evt.ticker}
+                  </div>
+                  <div style={{ fontSize:10, color:"#475569" }}>{stock?.name}</div>
+                </div>
+                <div style={{ flex:1 }}>
+                  <div style={{ fontSize:"clamp(12px,1.8vw,16px)", fontWeight:700,
+                    color:"#f1f5f9", lineHeight:1.5, marginBottom:4 }}>
+                    {evt.headline}
+                  </div>
+                  {evt.detail && <div style={{ fontSize:11, color:"#64748b", fontStyle:"italic" }}>
+                    {evt.detail}
+                  </div>}
+                </div>
+                <div style={{ flexShrink:0, textAlign:"center" }}>
+                  <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:40,
+                    color: up?"#00f5c4":"#ef4444", lineHeight:1 }}>
+                    {up?"▲":""}{evt.impact > 0 ? "+" : ""}{evt.impact}%
+                  </div>
+                  <div style={{ fontSize:10, fontWeight:700,
+                    color: up?"#00f5c4":"#ef4444", letterSpacing:"0.1em" }}>
+                    {up?"SURGE":"CRASH"}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* GM-only dismiss button */}
+        {isGM && step >= events.length && (
+          <button onClick={onDismiss} style={{
+            padding:"14px 40px",
+            background:"linear-gradient(135deg,#7f1d1d,#dc2626)",
+            border:"none", borderRadius:10, color:"#fff",
+            fontFamily:"inherit", fontSize:13, fontWeight:800,
+            cursor:"pointer", letterSpacing:"0.1em",
+            boxShadow:"0 0 30px rgba(220,38,38,0.5)",
+            animation:"pulse 1.5s infinite"
+          }}>
+            ⚡ LAUNCH ROUND {roundNum} →
+          </button>
+        )}
+        {!isGM && (
+          <div style={{ fontSize:11, color:"#334155", letterSpacing:"0.2em" }}>
+            AWAITING GAME MASTER TO LAUNCH ROUND…
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+// ─── WINNER CEREMONY ──────────────────────────────────────────────────────────
+function WinnerCeremony({ ranked, teams }) {
+  const top3 = ranked.slice(0, 3);
+  const medals = [
+    { icon:"🥇", label:"CHAMPION",      bg:"linear-gradient(135deg,#78350f,#d97706)", border:"#f59e0b", glow:"rgba(245,158,11,0.5)",  size:32 },
+    { icon:"🥈", label:"RUNNER-UP",     bg:"linear-gradient(135deg,#1e293b,#475569)", border:"#94a3b8", glow:"rgba(148,163,184,0.3)", size:26 },
+    { icon:"🥉", label:"3RD PLACE",     bg:"linear-gradient(135deg,#431407,#92400e)", border:"#b45309", glow:"rgba(180,83,9,0.3)",    size:22 },
+  ];
+
+  return (
+    <div style={{
+      position:"fixed", inset:0, zIndex:9500,
+      background:"radial-gradient(ellipse at center, #0a0518 0%, #020817 70%)",
+      display:"flex", flexDirection:"column", alignItems:"center",
+      justifyContent:"center", gap:32,
+      fontFamily:"'JetBrains Mono','Courier New',monospace",
+      animation:"fadeup 0.6s ease"
+    }}>
+      {/* Title */}
+      <div style={{ textAlign:"center" }}>
+        <div style={{ fontSize:48, marginBottom:8 }}>🏆</div>
+        <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:64, lineHeight:1,
+          background:"linear-gradient(135deg,#fbbf24,#f59e0b,#fbbf24)",
+          WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent",
+          letterSpacing:"0.05em" }}>
+          BULL PIT CHAMPIONS
+        </div>
+        <div style={{ fontSize:11, color:"#475569", letterSpacing:"0.3em", marginTop:8 }}>
+          FINAL RESULTS — ALL 7 ROUNDS COMPLETE
+        </div>
+      </div>
+
+      {/* Podium */}
+      <div style={{ display:"flex", alignItems:"flex-end", gap:16 }}>
+        {/* Reorder: 2nd, 1st, 3rd for podium look */}
+        {[1, 0, 2].map(idx => {
+          const entry = top3[idx];
+          if (!entry) return null;
+          const m = medals[idx];
+          const team = teams?.find(t => t.name === entry.name);
+          const color = team?.color || entry.color || "#64748b";
+          const pnl = (entry.total || 0) - (entry.initCash || 100000);
+          const heights = [160, 220, 130]; // 2nd, 1st, 3rd podium heights
+          return (
+            <div key={entry.name} style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:12 }}>
+              {/* Medal + name card */}
+              <div style={{
+                background:"#0a0f1e", border:`2px solid ${m.border}`,
+                borderRadius:16, padding:"20px 28px", textAlign:"center",
+                boxShadow:`0 0 40px ${m.glow}`,
+                minWidth: idx === 0 ? 240 : 200,
+                animation: idx === 0 ? "glowPulse 2s infinite" : "none"
+              }}>
+                <div style={{ fontSize: idx === 0 ? 52 : 40, marginBottom:8 }}>{m.icon}</div>
+                <div style={{ fontSize:9, color:m.border, fontWeight:800,
+                  letterSpacing:"0.2em", marginBottom:6 }}>{m.label}</div>
+                <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:900,
+                  fontSize: idx === 0 ? 22 : 18, color, marginBottom:8,
+                  lineHeight:1.2 }}>{entry.name}</div>
+                <div style={{ fontFamily:"'Bebas Neue',sans-serif",
+                  fontSize: idx === 0 ? 36 : 28, color:"#f1f5f9", lineHeight:1 }}>
+                  ${(entry.total||0).toLocaleString(undefined,{maximumFractionDigits:0})}
+                </div>
+                <div style={{ fontSize:12, fontWeight:800, marginTop:4,
+                  color: pnl >= 0 ? "#00f5c4" : "#ef4444" }}>
+                  {pnl >= 0 ? "▲ +" : "▼ "}${Math.abs(pnl).toLocaleString(undefined,{maximumFractionDigits:0})}
+                </div>
+                <div style={{ fontSize:10, color:"#475569", marginTop:4 }}>
+                  Score: <span style={{ color:m.border, fontWeight:800 }}>{(entry.score||0).toFixed(1)} pts</span>
+                </div>
+              </div>
+              {/* Podium block */}
+              <div style={{
+                width: idx === 0 ? 200 : 160,
+                height: heights[idx === 0 ? 1 : idx === 1 ? 0 : 2],
+                background: m.bg,
+                border:`1px solid ${m.border}44`,
+                borderRadius:"8px 8px 0 0",
+                display:"flex", alignItems:"center", justifyContent:"center",
+                fontSize: idx === 0 ? 36 : 28, fontWeight:900,
+                color: m.border,
+                fontFamily:"'Bebas Neue',sans-serif",
+                letterSpacing:"0.05em"
+              }}>
+                {idx === 0 ? "1ST" : idx === 1 ? "2ND" : "3RD"}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Rest of leaderboard */}
+      {ranked.length > 3 && (
+        <div style={{ display:"flex", flexDirection:"column", gap:6, width:480 }}>
+          <div style={{ fontSize:9, color:"#334155", letterSpacing:"0.15em", textAlign:"center", marginBottom:4 }}>
+            FULL LEADERBOARD
+          </div>
+          {ranked.slice(3).map((entry, i) => {
+            const team = teams?.find(t => t.name === entry.name);
+            const color = team?.color || entry.color || "#64748b";
+            const pnl = (entry.total||0) - 100000;
+            return (
+              <div key={entry.name} style={{
+                display:"flex", alignItems:"center", gap:12,
+                background:"#0a0f1e", border:"1px solid #111827",
+                borderLeft:`3px solid ${color}`, borderRadius:8,
+                padding:"10px 14px"
+              }}>
+                <div style={{ fontSize:12, color:"#334155", fontWeight:800, minWidth:24 }}>#{i+4}</div>
+                <div style={{ flex:1, fontWeight:700, color, fontSize:13 }}>{entry.name}</div>
+                {entry.isBot && <span style={{ fontSize:9, color:"#334155", padding:"1px 5px",
+                  border:"1px solid #1e293b", borderRadius:3 }}>BOT</span>}
+                <div style={{ textAlign:"right" }}>
+                  <div style={{ fontSize:13, fontWeight:800, color:"#f1f5f9" }}>
+                    ${(entry.total||0).toLocaleString(undefined,{maximumFractionDigits:0})}
+                  </div>
+                  <div style={{ fontSize:10, color: pnl>=0?"#00f5c4":"#ef4444" }}>
+                    {pnl>=0?"+":""}{((pnl/100000)*100).toFixed(1)}%
+                  </div>
+                </div>
+                <div style={{ fontSize:10, color:"#fbbf24", fontWeight:800, minWidth:48, textAlign:"right" }}>
+                  {(entry.score||0).toFixed(1)}pt
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div style={{ fontSize:10, color:"#1e293b", letterSpacing:"0.2em" }}>
+        BULL PIT · GAME COMPLETE
+      </div>
+    </div>
+  );
+}
+
+// ─── TEAM EDITOR ──────────────────────────────────────────────────────────────
+function TeamEditor({ teams, onSave }) {
+  const [draft, setDraft] = useState(teams.map(t => ({ ...t })));
+  const [saved, setSaved]  = useState(false);
+  const [colorPicker, setColorPicker] = useState(null); // index of team whose picker is open
+
+  const COLORS = [
+    "#00f5c4","#38bdf8","#fbbf24","#f472b6","#a78bfa","#fb923c",
+    "#4ade80","#f87171","#c084fc","#67e8f9","#fde68a","#86efac",
+    "#e879f9","#f97316","#84cc16","#06b6d4","#ec4899","#8b5cf6",
+    "#14b8a6","#f59e0b","#10b981","#3b82f6","#ef4444","#6366f1",
+    "#d946ef","#0ea5e9","#22c55e","#eab308","#64748b","#94a3b8",
+  ];
+
+  const DEFAULT_NAMES = [
+    "Alpha Squad","Bull Runners","Bear Force","Quantum Traders","Solar Surge","Dark Pool",
+    "Iron Hawks","Neon Tigers","Ghost Traders","Storm Capital","Red Wolves","Blue Chip",
+    "Apex Fund","Zenith Crew","Volt Trade","Lunar Assets","Shadow Bulls","Delta Force",
+    "Nova Traders","Titan Group","Cyber Fund","Blaze Squad","Arctic Bears","Steel Wolves",
+    "Jade Capital","Echo Markets","Fusion Pit","Prime Assets","Vortex Fund","Omega Trade",
+    "Cobalt Fund","Phantom Bulls","Nexus Capital","Pulse Traders","Crimson Bears",
+    "Orbit Fund","Forge Capital","Dusk Traders","Rift Squad","Ember Fund",
+    "Pinnacle Trade","Specter Group","Onyx Capital","Drift Fund","Cipher Traders",
+    "Vault Squad","Prism Capital","Blitz Fund","Rogue Traders","Helix Group",
+    "Surge Capital","Nano Fund","Vector Trade","Proxy Squad","Zenith Bears",
+    "Apex Wolves","Flux Capital","Binary Fund","Storm Hawks","Eclipse Trade",
+  ];
+
+  function upd(i, field, val) {
+    setDraft(d => d.map((t, j) => j === i ? { ...t, [field]: val } : t));
+    setColorPicker(null);
+  }
+
+  function addTeam() {
+    if (draft.length >= MAX_TEAMS) return;
+    const idx = draft.length;
+    const id  = `t${Date.now()}`;
+    const name = DEFAULT_NAMES[idx] || `Team ${idx + 1}`;
+    const pw   = name.toLowerCase().replace(/\s/g,"") + Math.floor(100+Math.random()*900);
+    const color = COLORS[idx % COLORS.length];
+    setDraft(d => [...d, { id, name, password: pw, color }]);
+  }
+
+  function removeTeam(i) {
+    if (draft.length <= 1) return;
+    setDraft(d => d.filter((_, j) => j !== i));
+    setColorPicker(null);
+  }
+
+  function handleSave() {
+    onSave(draft);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2500);
+  }
+
+  const inp = {
+    width:"100%", padding:"6px 8px", background:"#020817",
+    border:"1px solid #1e293b", color:"#f1f5f9", borderRadius:5,
+    fontFamily:"inherit", fontSize:11, outline:"none",
+  };
+
+  const atMax = draft.length >= MAX_TEAMS;
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+
+      {/* Header row */}
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+        <div style={{ fontSize:9, color:"#475569", letterSpacing:"0.1em" }}>
+          TEAM EDITOR
+          <span style={{ marginLeft:8, color: atMax ? "#ef4444" : "#00f5c4", fontWeight:700 }}>
+            {draft.length} / {MAX_TEAMS}
+          </span>
+        </div>
+        <button onClick={addTeam} disabled={atMax}
+          style={{ padding:"5px 12px", background: atMax ? "#0f172a" : "#0a2a1a",
+            border:`1px solid ${atMax ? "#1e293b" : "#00f5c4"}`,
+            color: atMax ? "#334155" : "#00f5c4", borderRadius:6,
+            cursor: atMax ? "not-allowed" : "pointer", fontFamily:"inherit",
+            fontSize:10, fontWeight:700, opacity: atMax ? 0.5 : 1 }}>
+          + ADD TEAM {atMax ? `(MAX ${MAX_TEAMS})` : ""}
+        </button>
+      </div>
+
+      {/* Team list */}
+      <div style={{ maxHeight:460, overflowY:"auto", display:"flex", flexDirection:"column", gap:5,
+        paddingRight:2 }}>
+        {draft.map((t, i) => (
+          <div key={t.id} style={{ background:"#0a0f1e", border:`1px solid ${t.color}33`,
+            borderLeft:`3px solid ${t.color}`, borderRadius:8, padding:"8px 10px",
+            position:"relative" }}>
+
+            <div style={{ display:"grid", gridTemplateColumns:"26px 1fr 1fr auto auto", gap:6, alignItems:"center" }}>
+
+              {/* Team # badge */}
+              <div style={{ fontSize:9, color:"#475569", fontWeight:700, textAlign:"center" }}>
+                #{i+1}
+              </div>
+
+              {/* Name */}
+              <div>
+                <div style={{ fontSize:8, color:"#475569", marginBottom:2 }}>NAME</div>
+                <input value={t.name} onChange={e => upd(i,"name",e.target.value)} style={inp} />
+              </div>
+
+              {/* Password */}
+              <div>
+                <div style={{ fontSize:8, color:"#475569", marginBottom:2 }}>PASSWORD</div>
+                <input value={t.password || ""} onChange={e => upd(i,"password",e.target.value)} style={inp} />
+              </div>
+
+              {/* Color swatch / picker toggle */}
+              <div style={{ position:"relative" }}>
+                <div style={{ fontSize:8, color:"#475569", marginBottom:2 }}>COLOR</div>
+                <button onClick={() => setColorPicker(colorPicker === i ? null : i)}
+                  style={{ width:32, height:28, background:t.color, border:"2px solid #1e293b",
+                    borderRadius:5, cursor:"pointer", display:"block" }} />
+                {colorPicker === i && (
+                  <div style={{ position:"absolute", right:0, top:48, zIndex:100,
+                    background:"#0f172a", border:"1px solid #334155", borderRadius:8,
+                    padding:8, display:"grid", gridTemplateColumns:"repeat(6,22px)", gap:4,
+                    boxShadow:"0 8px 32px #000a" }}>
+                    {COLORS.map(c => (
+                      <button key={c} onClick={() => { upd(i,"color",c); setColorPicker(null); }}
+                        title={c}
+                        style={{ width:22, height:22, background:c, border: t.color===c ? "2px solid #fff" : "2px solid transparent",
+                          borderRadius:4, cursor:"pointer", padding:0 }} />
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Remove */}
+              <div>
+                <div style={{ fontSize:8, color:"transparent", marginBottom:2 }}>DEL</div>
+                <button onClick={() => removeTeam(i)} disabled={draft.length <= 1}
+                  style={{ width:28, height:28, background:"#7f1d1d",
+                    border:"1px solid #ef444455", borderRadius:5,
+                    color:"#fca5a5", cursor: draft.length <= 1 ? "not-allowed" : "pointer",
+                    fontSize:12, fontFamily:"inherit",
+                    opacity: draft.length <= 1 ? 0.3 : 1 }}>✕</button>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Footer */}
+      <div style={{ display:"flex", gap:6, marginTop:2 }}>
+        <button onClick={addTeam} disabled={atMax}
+          style={{ flex:1, padding:"8px", background: atMax ? "#0f172a" : "#0a1a2a",
+            border:`1px solid ${atMax ? "#1e293b" : "#38bdf855"}`,
+            color: atMax ? "#334155" : "#38bdf8", borderRadius:6,
+            cursor: atMax ? "not-allowed" : "pointer", fontFamily:"inherit",
+            fontSize:10, fontWeight:700, opacity: atMax ? 0.4 : 1 }}>
+          + ADD TEAM
+        </button>
+        <button onClick={handleSave}
+          style={{ flex:2, padding:"8px", fontWeight:800, fontSize:11, letterSpacing:"0.06em",
+            background: saved
+              ? "linear-gradient(135deg,#166534,#15803d)"
+              : "linear-gradient(135deg,#1e3a5f,#1d4ed8)",
+            border:"none", borderRadius:6, color:"#fff",
+            cursor:"pointer", fontFamily:"inherit", transition:"all 0.3s" }}>
+          {saved ? "✓ TEAMS SAVED!" : "💾 SAVE TEAMS"}
+        </button>
+      </div>
+
+      {atMax && (
+        <div style={{ fontSize:9, color:"#ef4444", textAlign:"center", marginTop:-4 }}>
+          Maximum {MAX_TEAMS} teams reached
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════════════════════════════
+function App() {
+  const [screen,       setScreen]       = useState("login");
+  const [loginTab,     setLoginTab]     = useState("player");
+  const [nameInput,    setNameInput]    = useState("");
+  const [passInput,    setPassInput]    = useState("");
+  const [gmPass,       setGmPass]       = useState("");
+  const [loginBusy,    setLoginBusy]    = useState(false);
+  const [loginErr,     setLoginErr]     = useState("");
+  const [currentTeam,  setCurrentTeam]  = useState(null);
+  const [teams,        setTeams]        = useState(DEFAULT_TEAMS);
+
+  // Market
+  const [prices,       setPrices]       = useState(initPrices);
+  const [history,      setHistory]      = useState(() => initHistory(initPrices()));
+  const [prevPrices,   setPrevPrices]   = useState(initPrices);
+  const [bots,         setBots]         = useState(initBots);
+  const [aiLog,        setAiLog]        = useState([]);
+  const [news,         setNews]         = useState([]);
+  const [tick,         setTick]         = useState(0);
+  const [sentiment,    setSentiment]    = useState("neutral");
+  const [activeSector, setActiveSector] = useState("all");
+  const [orderFlowSnapshot, setOrderFlowSnapshot] = useState({});
+  const [sharedOrderFlowSnapshot, setSharedOrderFlowSnapshot] = useState({});
+  // Per-sector biases: override global sentiment for each sector
+  const [sectorBiases,         setSectorBiases]         = useState(() => Object.fromEntries(SECTORS.map(s=>[s.id,"neutral"])));
+  // Live sector disruption news (AI-generated, applied continuously when automation is on)
+  const [sectorDisruptions,    setSectorDisruptions]    = useState({});
+  const [generatingSector,     setGeneratingSector]     = useState(null);
+  const [activeDisruptSectors, setActiveDisruptSectors] = useState(new Set());
+  const [selectedSectors,      setSelectedSectors]      = useState(new Set());
+
+  // Player portfolio — holdings store signed qty (long > 0, short < 0)
+  const [cash,         setCash]         = useState(INITIAL_CASH);
+  const [restrictedCash, setRestrictedCash] = useState(0);
+  const [accruedBorrowCost, setAccruedBorrowCost] = useState(0);
+  const [accruedFundingCost, setAccruedFundingCost] = useState(0);
+  const [holdings,     setHoldings]     = useState({});
+  const [transactions, setTransactions] = useState([]);
+  const [derivativePositions, setDerivativePositions] = useState({});
+  const [derivativeTransactions, setDerivativeTransactions] = useState([]);
+  const [tab,          setTab]          = useState("market");
+  const [selTicker,    setSelTicker]    = useState(null);
+  const [orderQty,     setOrderQty]     = useState(1);
+  const [selectedDerivativeId, setSelectedDerivativeId] = useState(null);
+  const [derivativeQty, setDerivativeQty] = useState(1);
+  const [strategyTicker, setStrategyTicker] = useState(() => ALL_STOCKS[0]?.ticker || "");
+  const [derivativeStrategyId, setDerivativeStrategyId] = useState("protective_put");
+  const [strategyLots, setStrategyLots] = useState(1);
+  const [strategyExecutionState, setStrategyExecutionState] = useState(null);
+  const [marketSearch, setMarketSearch] = useState("");
+  const [derivativeSearch, setDerivativeSearch] = useState("");
+  const [derivativeSector, setDerivativeSector] = useState("all");
+  const [derivativeKind, setDerivativeKind] = useState("all");
+  const [marginStatus, setMarginStatus] = useState("safe");
+  const [marginAlert,  setMarginAlert]  = useState(null);
+  const [clientTradeAlert, setClientTradeAlert] = useState(null);
+
+  // Player stat tracking
+  const [peakValue,    setPeakValue]    = useState(INITIAL_CASH);
+  const [maxDrawdown,  setMaxDrawdown]  = useState(0);
+
+  // Game flow
+  const [gamePhase,    setGamePhase]    = useState("idle");
+  const [roundNum,     setRoundNum]     = useState(1);
+  const [roundDurations, setRoundDurations] = useState([...DEFAULT_ROUND_DURATIONS]); // per-round seconds
+  const roundDur = roundDurations[Math.min(roundNum - 1, TOTAL_ROUNDS - 1)]; // current round's duration
+  const [startTime,    setStartTime]    = useState(null);
+  const [roundEndsAt,  setRoundEndsAt]  = useState(null);
+  const [timeLeft,     setTimeLeft]     = useState(null);
+  const [bufferLeft,   setBufferLeft]   = useState(null);
+  const [bufferStart,  setBufferStart]  = useState(null);
+  const [bufferEndsAt, setBufferEndsAt] = useState(null);
+  const [settlementViewEndsAt, setSettlementViewEndsAt] = useState(null);
+  const [settlementViewRound, setSettlementViewRound] = useState(null);
+  const [settlementViewLeft, setSettlementViewLeft] = useState(null);
+  const [initCash,     setInitCash]     = useState(INITIAL_CASH);
+  const [gmTab,        setGmTab]        = useState("control");
+  // Round identity + special mechanics
+  const [roundRules,   setRoundRules]   = useState(ROUND_RULES[0]);
+  const [volMultiplier,setVolMultiplier]= useState(1.0);
+  const [leaderHidden, setLeaderHidden] = useState(false);
+  const [taxPending,   setTaxPending]   = useState(false);
+  const [taxAmount,    setTaxAmount]    = useState(0);
+  const [portfolioResetSignal, setPortfolioResetSignal] = useState(null);
+  // Power-up cards
+  const [usedCards,    setUsedCards]    = useState(new Set());
+  const usedCardsRef = useRef(new Set()); // mirror for stale-closure-free reads in gmCmd
+  const [frozenUntil,  setFrozenUntil]  = useState(null);
+  const [haltedUntil,  setHaltedUntil]  = useState(null);
+  const [activePowerup,setActivePowerup]= useState(null);
+  // Prediction market
+  const [predictionOpen,  setPredictionOpen]  = useState(false);
+  const [predictionSession, setPredictionSession] = useState(null);
+  const [playerPrediction,setPlayerPrediction]= useState(null);
+  const [playerPredictionRound, setPlayerPredictionRound] = useState(null);
+  const [playerPredictionSessionId, setPlayerPredictionSessionId] = useState(null);
+  const [predResult,      setPredResult]      = useState(null);
+  // Achievements
+  const [achievements, setAchievements] = useState([]);
+  // GM rulebook panel
+  const [showRulebook, setShowRulebook] = useState(false);
+  // 60-team score throttle
+  const lastScoreWrite = useRef(0);
+  const predCorrectCount = useRef({ total: 0, correct: 0 });
+  const [scoreLedger, setScoreLedger] = useState(() => createEmptyScoreLedger());
+  const [detailStock,  setDetailStock]  = useState(null);
+  const [shockTicker,  setShockTicker]  = useState(ALL_STOCKS[0].ticker);
+  const [polEventIdx,  setPolEventIdx]  = useState(0);
+  const [generatingPol, setGeneratingPol] = useState(false);
+  const [shockPct,     setShockPct]     = useState(15);
+
+  // Inter-round
+  const [disruptions,   setDisruptions]   = useState([]);
+  const [showCeremony,  setShowCeremony]  = useState(false);
+  const [showBlast,     setShowBlast]     = useState(false);
+  const [showEmergency, setShowEmergency] = useState(false);
+  const [generating,    setGenerating]    = useState(false);
+  const [winnerRanked,  setWinnerRanked]  = useState([]);
+
+  // Shared
+  const [sharedLB,   setSharedLB]   = useState([]);
+  const [broadcast,  setBroadcast]  = useState(null);
+
+  const pricesRef      = useRef(prices);
+  const historyRef     = useRef(history);
+  const holdingsRef    = useRef(holdings);
+  const transactionsRef = useRef(transactions);
+  const derivativePositionsRef = useRef(derivativePositions);
+  const derivativeTransactionsRef = useRef(derivativeTransactions);
+  const cashRef        = useRef(cash);
+  const roundEndsAtRef = useRef(roundEndsAt);
+  const timeLeftRef    = useRef(timeLeft);
+  const roundDurationsRef = useRef(roundDurations);
+  const restrictedCashRef = useRef(restrictedCash);
+  const accruedBorrowCostRef = useRef(accruedBorrowCost);
+  const accruedFundingCostRef = useRef(accruedFundingCost);
+  const phaseRef       = useRef(gamePhase);
+  const tickRef        = useRef(0);
+  const aiRef          = useRef(false);
+  const sentimentRef   = useRef(sentiment);
+  const sectorBiasRef  = useRef(sectorBiases);
+  const lastBcRef      = useRef(null);
+  const volMultiplierRef= useRef(1.0);
+  const frozenRef       = useRef(null);
+  const haltedRef       = useRef(null);
+  const predictionSessionRef = useRef(predictionSession);
+  const gameStartedRef  = useRef(false);
+  const currentBufferDurationRef = useRef(BUFFER_SECS);
+  const lastPublishedRoundLeftRef = useRef(null);
+  const scheduleInRoundDisruptionsRef = useRef(null);
+  const screenRef       = useRef(screen); // always current screen, safe to read in closures
+  const archivedDisruptionKeyRef = useRef(null);
+  const processedPortfolioResetRef = useRef(null);
+  const lastPoliticalShockQuestionIdRef = useRef(null);
+  const scoreLedgerRef = useRef(scoreLedger);
+  const tradeTapeRef = useRef([]);
+  const orderFlowRef = useRef(orderFlowSnapshot);
+  const syntheticOrderFlowRef = useRef({});
+  const seenTradeFeedKeysRef = useRef(new Set());
+  const activeLedgerRoundRef = useRef(null);
+  const lastFinalizedRoundRef = useRef(null);
+  const roundStartValueRef = useRef(INITIAL_CASH);
+  const roundBallStartPriceRef = useRef(BALL_BASE);
+  const roundPredictionShownRef = useRef(false);
+  const roundPredictionAnsweredRef = useRef(false);
+  const roundPredictionCorrectRef = useRef(false);
+  const roundDerivativeBaseRef = useRef(buildRoundDerivativeBases(prices));
+  const roundBorrowCostBaseRef = useRef(0);
+  const roundFundingCostBaseRef = useRef(0);
+  const roundMarginBufferSumRef = useRef(0);
+  const roundMarginBufferSamplesRef = useRef(0);
+  const roundMarginBreachesRef = useRef(0);
+  const roundMarginBreachActiveRef = useRef(false);
+  const marginGraceEndsAtRef = useRef(null);
+  const autoDeleveragingRef = useRef(false);
+  const clientTradeAlertTimeoutRef = useRef(null);
+  pricesRef.current     = prices;
+  historyRef.current    = history;
+  holdingsRef.current   = holdings;
+  transactionsRef.current = transactions;
+  derivativePositionsRef.current = derivativePositions;
+  derivativeTransactionsRef.current = derivativeTransactions;
+  cashRef.current       = cash;
+  roundEndsAtRef.current = roundEndsAt;
+  timeLeftRef.current   = timeLeft;
+  roundDurationsRef.current = roundDurations;
+  restrictedCashRef.current = restrictedCash;
+  accruedBorrowCostRef.current = accruedBorrowCost;
+  accruedFundingCostRef.current = accruedFundingCost;
+  phaseRef.current      = gamePhase;
+  tickRef.current       = tick;
+  sentimentRef.current  = sentiment;
+  sectorBiasRef.current  = sectorBiases;
+  volMultiplierRef.current = volMultiplier;
+  frozenRef.current      = frozenUntil;
+  haltedRef.current      = haltedUntil;
+  predictionSessionRef.current = predictionSession;
+  screenRef.current      = screen;
+  scoreLedgerRef.current = scoreLedger;
+  orderFlowRef.current = orderFlowSnapshot;
+
+  useEffect(() => () => {
+    if (clientTradeAlertTimeoutRef.current) clearTimeout(clientTradeAlertTimeoutRef.current);
+  }, []);
+
+  const CSS = `
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@700;800;900&family=Bebas+Neue&display=swap');
+    *{box-sizing:border-box;margin:0;padding:0;}body{background:#020817;}
+    ::-webkit-scrollbar{width:4px;}::-webkit-scrollbar-track{background:#0f172a;}
+    ::-webkit-scrollbar-thumb{background:#1e293b;border-radius:2px;}
+    input:focus,textarea:focus,select:focus{outline:none;border-color:#00f5c4!important;}
+    button:hover{opacity:0.82;}
+    @keyframes fadeup{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:none}}
+    @keyframes fadein{from{opacity:0}to{opacity:1}}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+    @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+    @keyframes ticker{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
+    @keyframes slidedown{from{transform:translateY(-60px);opacity:0}to{transform:none;opacity:1}}
+  `;
+
+  // ─── STORAGE ──────────────────────────────────────────────────────────────────
+  const clearScoreLedgerState = useCallback((startingCapital = INITIAL_CASH) => {
+    const fresh = createEmptyScoreLedger();
+    scoreLedgerRef.current = fresh;
+    setScoreLedger(fresh);
+    activeLedgerRoundRef.current = null;
+    lastFinalizedRoundRef.current = null;
+    roundStartValueRef.current = startingCapital;
+    roundBallStartPriceRef.current = pricesRef.current?.BALL || BALL_BASE;
+    roundDerivativeBaseRef.current = buildRoundDerivativeBases(pricesRef.current);
+    roundPredictionShownRef.current = false;
+    roundPredictionAnsweredRef.current = false;
+    roundPredictionCorrectRef.current = false;
+    roundBorrowCostBaseRef.current = 0;
+    roundFundingCostBaseRef.current = 0;
+    roundMarginBufferSumRef.current = 0;
+    roundMarginBufferSamplesRef.current = 0;
+    roundMarginBreachesRef.current = 0;
+    roundMarginBreachActiveRef.current = false;
+    marginGraceEndsAtRef.current = null;
+    autoDeleveragingRef.current = false;
+    predCorrectCount.current = { total: 0, correct: 0 };
+    setRestrictedCash(0);
+    setAccruedBorrowCost(0);
+    setAccruedFundingCost(0);
+    setDerivativePositions({});
+    setDerivativeTransactions([]);
+    setSelectedDerivativeId(null);
+    setMarginStatus("safe");
+    setMarginAlert(null);
+  }, []);
+
+  const startScoreLedgerRound = useCallback((targetRound, options = {}) => {
+    if (screenRef.current !== "player" || !currentTeam?.name || !targetRound) return;
+    activeLedgerRoundRef.current = targetRound;
+    roundStartValueRef.current = Number.isFinite(options.startingCapital)
+      ? options.startingCapital
+      : (cashRef.current + calcHoldingsValue(holdingsRef.current, pricesRef.current));
+    roundBallStartPriceRef.current = Number.isFinite(options.ballStartPrice)
+      ? options.ballStartPrice
+      : (pricesRef.current?.BALL || BALL_BASE);
+    roundDerivativeBaseRef.current = buildRoundDerivativeBases(pricesRef.current);
+    roundPredictionShownRef.current = !!options.predShown;
+    roundPredictionAnsweredRef.current = !!options.predAnswered;
+    roundPredictionCorrectRef.current = !!options.predCorrect;
+    roundBorrowCostBaseRef.current = accruedBorrowCostRef.current || 0;
+    roundFundingCostBaseRef.current = accruedFundingCostRef.current || 0;
+    roundMarginBufferSumRef.current = 0;
+    roundMarginBufferSamplesRef.current = 0;
+    roundMarginBreachesRef.current = 0;
+    roundMarginBreachActiveRef.current = false;
+    marginGraceEndsAtRef.current = null;
+    autoDeleveragingRef.current = false;
+  }, [currentTeam?.name]);
+
+  const finalizeScoreLedgerRound = useCallback((roundOverride = null) => {
+    if (screenRef.current !== "player" || !currentTeam?.name) return scoreLedgerRef.current;
+    const targetRound = roundOverride || activeLedgerRoundRef.current || prevRoundRef.current || roundNum;
+    if (!targetRound || lastFinalizedRoundRef.current === targetRound) return scoreLedgerRef.current;
+    const targetRule = ROUND_RULES[Math.min(Math.max(targetRound - 1, 0), TOTAL_ROUNDS - 1)] || ROUND_RULES[0];
+    const derivativeQuoteMap = buildDerivativeQuoteMapForRound({
+      round: targetRound,
+      prices: pricesRef.current,
+      roundRule: targetRule,
+      timeLeft: 0,
+      roundDur: roundDurationsRef.current?.[targetRound - 1] || DEFAULT_ROUND_DURATIONS[Math.max(0, targetRound - 1)] || roundDur,
+      gamePhase: "idle",
+      roundBases: roundDerivativeBaseRef.current,
+    });
+    const snapshot = buildRoundScoreSnapshot({
+      round: targetRound,
+      startingCapital: roundStartValueRef.current,
+      cash: cashRef.current,
+      restrictedCash: restrictedCashRef.current,
+      holdings: holdingsRef.current,
+      derivativePositions: derivativePositionsRef.current,
+      derivativeQuoteMap,
+      prices: pricesRef.current,
+      history: historyRef.current,
+      transactions: [...(transactionsRef.current || []), ...(derivativeTransactionsRef.current || [])],
+      ballStartPrice: roundBallStartPriceRef.current,
+      prediction: {
+        shown: roundPredictionShownRef.current,
+        answered: roundPredictionAnsweredRef.current,
+        correct: roundPredictionCorrectRef.current,
+      },
+      accruedBorrowCost: accruedBorrowCostRef.current,
+      accruedFundingCost: accruedFundingCostRef.current,
+      roundBorrowCost: Math.max(0, (accruedBorrowCostRef.current || 0) - (roundBorrowCostBaseRef.current || 0)),
+      roundFundingCost: Math.max(0, (accruedFundingCostRef.current || 0) - (roundFundingCostBaseRef.current || 0)),
+      avgMarginBufferPct: roundMarginBufferSamplesRef.current > 0
+        ? roundMarginBufferSumRef.current / roundMarginBufferSamplesRef.current
+        : 0,
+      marginBreaches: roundMarginBreachesRef.current || 0,
+    });
+    const existing = sanitizeScoreLedger(scoreLedgerRef.current);
+    const completedRounds = [
+      ...existing.completedRounds.filter(round => round.round !== targetRound),
+      snapshot
+    ].sort((a, b) => (a.round || 0) - (b.round || 0));
+    const nextLedger = {
+      ...existing,
+      completedRounds,
+      maxDrawdownOverall: Math.max(existing.maxDrawdownOverall || 0, maxDrawdownRef.current || 0),
+    };
+    scoreLedgerRef.current = nextLedger;
+    setScoreLedger(nextLedger);
+    lastFinalizedRoundRef.current = targetRound;
+    activeLedgerRoundRef.current = null;
+    roundPredictionShownRef.current = false;
+    roundPredictionAnsweredRef.current = false;
+    roundPredictionCorrectRef.current = false;
+    roundBorrowCostBaseRef.current = accruedBorrowCostRef.current || 0;
+    roundFundingCostBaseRef.current = accruedFundingCostRef.current || 0;
+    roundMarginBufferSumRef.current = 0;
+    roundMarginBufferSamplesRef.current = 0;
+    roundMarginBreachesRef.current = 0;
+    roundMarginBreachActiveRef.current = false;
+    marginGraceEndsAtRef.current = null;
+    return nextLedger;
+  }, [currentTeam?.name, roundNum]);
+
+  const saveScore = useCallback(async (name, color, total, cash_, holdings_, transactions_, initC, maxDD) => {
+    if (SERVER_PORTFOLIO_AUTH) return;
+    const shouldIncludeLiveRound = (
+      phaseRef.current === "running" &&
+      activeLedgerRoundRef.current &&
+      lastFinalizedRoundRef.current !== activeLedgerRoundRef.current
+    );
+    const liveRound = shouldIncludeLiveRound
+      ? buildRoundScoreSnapshot({
+          round: activeLedgerRoundRef.current || roundNum,
+          startingCapital: roundStartValueRef.current || initC || INITIAL_CASH,
+          cash: cash_,
+          restrictedCash: restrictedCashRef.current,
+          holdings: holdings_,
+          derivativePositions: derivativePositionsRef.current,
+          derivativeQuoteMap: buildDerivativeQuoteMapForRound({
+            round: activeLedgerRoundRef.current || roundNum,
+            prices: pricesRef.current,
+            roundRule: ROUND_RULES[Math.min(Math.max((activeLedgerRoundRef.current || roundNum) - 1, 0), TOTAL_ROUNDS - 1)] || ROUND_RULES[0],
+            timeLeft: timeLeftRef.current || 0,
+            roundDur: roundDurationsRef.current?.[(activeLedgerRoundRef.current || roundNum) - 1] || DEFAULT_ROUND_DURATIONS[Math.max(0, (activeLedgerRoundRef.current || roundNum) - 1)] || roundDur,
+            gamePhase: phaseRef.current,
+            roundBases: roundDerivativeBaseRef.current,
+          }),
+          prices: pricesRef.current,
+          history: historyRef.current,
+          transactions: [...(transactions_ || []), ...(derivativeTransactionsRef.current || [])],
+          ballStartPrice: roundBallStartPriceRef.current || BALL_BASE,
+          prediction: {
+            shown: roundPredictionShownRef.current,
+            answered: roundPredictionAnsweredRef.current,
+            correct: roundPredictionCorrectRef.current,
+          },
+          accruedBorrowCost: accruedBorrowCostRef.current,
+          accruedFundingCost: accruedFundingCostRef.current,
+          roundBorrowCost: Math.max(0, (accruedBorrowCostRef.current || 0) - (roundBorrowCostBaseRef.current || 0)),
+          roundFundingCost: Math.max(0, (accruedFundingCostRef.current || 0) - (roundFundingCostBaseRef.current || 0)),
+          avgMarginBufferPct: roundMarginBufferSamplesRef.current > 0
+            ? roundMarginBufferSumRef.current / roundMarginBufferSamplesRef.current
+            : 0,
+          marginBreaches: roundMarginBreachesRef.current || 0,
+        })
+      : null;
+    const nextLedger = {
+      ...sanitizeScoreLedger(scoreLedgerRef.current),
+      maxDrawdownOverall: Math.max(scoreLedgerRef.current?.maxDrawdownOverall || 0, maxDD || 0),
+    };
+    const allSnapshots = [...nextLedger.completedRounds, ...(liveRound ? [liveRound] : [])];
+    const summary = summarizeScoreSnapshots(allSnapshots);
+    const currentAssetBeta = calcAverageAssetBeta(holdings_, pricesRef.current, historyRef.current);
+    const currentPortfolioBeta = calcPortfolioBeta(holdings_, pricesRef.current, historyRef.current);
+    const assetBeta = summary.assetBeta != null ? summary.assetBeta : currentAssetBeta;
+    const portfolioBeta = summary.portfolioBeta != null ? summary.portfolioBeta : currentPortfolioBeta;
+    const ballReturn = compoundPercentSeries(allSnapshots.map(round => round.ballReturn)) ?? calcBallReturn(pricesRef.current);
+    const netEquity = calcNetEquityFromState({
+      cash: cash_,
+      restrictedCash: restrictedCashRef.current,
+      holdings: holdings_,
+      prices: pricesRef.current,
+      derivativePositions: derivativePositionsRef.current,
+      derivativeQuoteMap: buildDerivativeQuoteMapForRound({
+        round: activeLedgerRoundRef.current || roundNum,
+        prices: pricesRef.current,
+        roundRule: ROUND_RULES[Math.min(Math.max((activeLedgerRoundRef.current || roundNum) - 1, 0), TOTAL_ROUNDS - 1)] || ROUND_RULES[0],
+        timeLeft: timeLeftRef.current || 0,
+        roundDur: roundDurationsRef.current?.[(activeLedgerRoundRef.current || roundNum) - 1] || DEFAULT_ROUND_DURATIONS[Math.max(0, (activeLedgerRoundRef.current || roundNum) - 1)] || roundDur,
+        gamePhase: phaseRef.current,
+        roundBases: roundDerivativeBaseRef.current,
+      }),
+      accruedBorrowCost: accruedBorrowCostRef.current,
+      accruedFundingCost: accruedFundingCostRef.current,
+    });
+
+    try {
+      await window.storage.set(`lb:${name}`, JSON.stringify({
+        name, color, total: netEquity, netEquity, cash: cash_,
+        restrictedCash: restrictedCashRef.current,
+        uniqueSectors: summary.uniqueSectors,
+        closedTrades: summary.closedTrades,
+        wins: summary.wins,
+        maxDrawdown: nextLedger.maxDrawdownOverall || maxDD || 1,
+        isBot: false,
+        assetBeta,
+        portfolioBeta,
+        beta: portfolioBeta,
+        ballReturn,
+        lastTradeTs: summary.lastTradeTs || Date.now(),
+        predAsked:   summary.predShown,
+        predTotal:   summary.predAnswered,
+        predCorrect: summary.predCorrect,
+        currentRound: activeLedgerRoundRef.current || roundNum,
+        roundReturns: summary.roundReturns,
+        marginBufferPct: summary.avgMarginBufferPct,
+        marginBreaches: summary.marginBreaches,
+        totalBorrowCost: summary.totalBorrowCost,
+        totalFundingCost: summary.totalFundingCost,
+        totalCarryCost: (summary.totalBorrowCost || 0) + (summary.totalFundingCost || 0),
+        scoreLedger: nextLedger,
+        liveRound,
+        updatedAt: nowShort()
+      }), true);
+    } catch {}
+  }, [roundNum]);
+
+  const loadLB = useCallback(async () => {
+    try {
+      const res  = await window.storage.list("lb:", true);
+      const keys = res?.keys || [];
+      const rows = (await Promise.all(keys.map(async k => {
+        try { const r = await window.storage.get(k, true); return r ? JSON.parse(r.value) : null; }
+        catch { return null; }
+      }))).filter(Boolean);
+      const scored = rows.map(e => ({ ...e, ...calcScore(e, INITIAL_CASH, rows) }));
+      const ranked  = sortLiveLeaderboard(scored);
+      setSharedLB(ranked);
+      return ranked;
+    } catch { return []; }
+  }, []);
+
+  const pushGMState  = useCallback(async (o={}) => {
+    try { await window.storage.set("gm:state", JSON.stringify({
+      phase:phaseRef.current,
+      round:roundNum,
+      roundLeft:timeLeft,
+      roundEndsAt,
+      bufferLeft,
+      bufferEndsAt,
+      settlementViewEndsAt,
+      settlementViewRound,
+      initCash,
+      sentiment,
+      volMultiplier,
+      leaderHidden,
+      frozenUntil,
+      haltedUntil,
+      predictionOpen,
+      portfolioReset: portfolioResetSignal,
+      roundRulesIdx:roundNum-1,
+      ...o
+    }), true); } catch {}
+  }, [roundNum, timeLeft, roundEndsAt, bufferLeft, bufferEndsAt, settlementViewEndsAt, settlementViewRound, initCash, sentiment, volMultiplier, leaderHidden, frozenUntil, haltedUntil, predictionOpen, portfolioResetSignal]);
+
+  const pushPrices   = useCallback(async (p, h) => {
+    try { await window.storage.set("gm:prices", JSON.stringify({ prices:p, history:h }), true); } catch {}
+  }, []);
+
+  const pushOrderFlow = useCallback(async snapshot => {
+    try { await window.storage.set(GM_ORDER_FLOW_KEY, JSON.stringify({ snapshot, ts:Date.now() }), true); } catch {}
+  }, []);
+
+  const pushTeams    = useCallback(async t => {
+    try { await window.storage.set("gm:teams", JSON.stringify(t), true); } catch {}
+  }, []);
+
+  const pushDisrupts = useCallback(async evts => {
+    try { await window.storage.set("gm:disruptions", JSON.stringify({ events:evts }), true); } catch {}
+  }, []);
+
+  const pushNews = useCallback(async items => {
+    try { await window.storage.set("gm:news", JSON.stringify({ items }), true); } catch {}
+  }, []);
+
+  const pushPrediction = useCallback(async session => {
+    try { await window.storage.set("gm:prediction", JSON.stringify(session || { phase:"closed" }), true); } catch {}
+  }, []);
+
+  const refreshTeams = useCallback(async () => {
+    try {
+      const response = await window.storage.get("gm:teams", true);
+      if (!response?.value) return null;
+      const parsed = JSON.parse(response.value);
+      if (Array.isArray(parsed) && parsed.length) {
+        setTeams(parsed);
+        return parsed;
+      }
+    } catch {}
+    return null;
+  }, []);
+
+  const handleExitToLogin = useCallback(() => {
+    window.auth?.logout?.();
+    setScreen("login");
+    setCurrentTeam(null);
+    setGmPass("");
+    setPassInput("");
+    setLoginErr("");
+    setLoginBusy(false);
+    refreshTeams();
+  }, [refreshTeams]);
+
+  const handlePlayerLogin = useCallback(async () => {
+    if (!nameInput || !passInput) {
+      setLoginErr("Select a team and enter the password.");
+      return;
+    }
+    setLoginBusy(true);
+    setLoginErr("");
+    try {
+      const result = await window.auth?.loginTeam?.(nameInput, passInput);
+      if (result?.ok && result?.team) {
+        setCurrentTeam(result.team);
+        setPassInput("");
+        await refreshTeams();
+        setScreen("player");
+        return;
+      }
+      window.auth?.logout?.();
+      setLoginErr(result?.error || "Invalid team or password.");
+    } catch {
+      window.auth?.logout?.();
+      setLoginErr("Unable to reach the server.");
+    } finally {
+      setLoginBusy(false);
+    }
+  }, [nameInput, passInput, refreshTeams]);
+
+  const handleGMLogin = useCallback(async () => {
+    if (!gmPass) {
+      setLoginErr("Enter the GM password.");
+      return;
+    }
+    setLoginBusy(true);
+    setLoginErr("");
+    try {
+      const result = await window.auth?.loginGM?.(gmPass);
+      if (result?.ok) {
+        setCurrentTeam(null);
+        setGmPass("");
+        await refreshTeams();
+        setScreen("gm");
+        return;
+      }
+      window.auth?.logout?.();
+      setLoginErr(result?.error || "Incorrect GM password.");
+    } catch {
+      window.auth?.logout?.();
+      setLoginErr("Unable to reach the server.");
+    } finally {
+      setLoginBusy(false);
+    }
+  }, [gmPass, refreshTeams]);
+
+  const applyServerTeamState = useCallback((serverState, serverTeam = null) => {
+    if (!serverState || typeof serverState !== "object") return;
+    if (serverTeam) setCurrentTeam(serverTeam);
+    setCash(Number.isFinite(serverState.cash) ? serverState.cash : INITIAL_CASH);
+    setRestrictedCash(Number.isFinite(serverState.restrictedCash) ? serverState.restrictedCash : 0);
+    setAccruedBorrowCost(Number.isFinite(serverState.accruedBorrowCost) ? serverState.accruedBorrowCost : 0);
+    setAccruedFundingCost(Number.isFinite(serverState.accruedFundingCost) ? serverState.accruedFundingCost : 0);
+    setHoldings(serverState.holdings && typeof serverState.holdings === "object" ? serverState.holdings : {});
+    setTransactions(Array.isArray(serverState.transactions) ? serverState.transactions : []);
+    setDerivativePositions(serverState.derivativePositions && typeof serverState.derivativePositions === "object" ? serverState.derivativePositions : {});
+    setDerivativeTransactions(Array.isArray(serverState.derivativeTransactions) ? serverState.derivativeTransactions : []);
+    setPeakValue(Number.isFinite(serverState.peakValue) ? serverState.peakValue : INITIAL_CASH);
+    setMaxDrawdown(Number.isFinite(serverState.maxDrawdown) ? serverState.maxDrawdown : 0);
+    setScoreLedger(sanitizeScoreLedger(serverState.scoreLedger));
+    setMarginStatus(serverState.marginStatus || "safe");
+    setMarginAlert(serverState.marginAlert || null);
+    setPlayerPrediction(serverState.playerPrediction || null);
+    setPlayerPredictionRound(Number.isFinite(serverState.playerPredictionRound) ? serverState.playerPredictionRound : null);
+    setPlayerPredictionSessionId(normalizePredictionSessionId(serverState.playerPredictionSessionId));
+    activeLedgerRoundRef.current = Number.isFinite(serverState.activeLedgerRound) ? serverState.activeLedgerRound : null;
+    lastFinalizedRoundRef.current = Number.isFinite(serverState.lastFinalizedRound) ? serverState.lastFinalizedRound : null;
+    roundStartValueRef.current = Number.isFinite(serverState.roundStartValue) ? serverState.roundStartValue : roundStartValueRef.current;
+    roundBallStartPriceRef.current = Number.isFinite(serverState.roundBallStartPrice) ? serverState.roundBallStartPrice : roundBallStartPriceRef.current;
+    roundPredictionShownRef.current = !!serverState.roundPredictionShown;
+    roundPredictionAnsweredRef.current = !!serverState.roundPredictionAnswered;
+    roundPredictionCorrectRef.current = !!serverState.roundPredictionCorrect;
+  }, []);
+
+  const loadServerTeamState = useCallback(async () => {
+    if (!SERVER_PORTFOLIO_AUTH || screen !== "player" || !currentTeam) return null;
+    try {
+      const response = await window.auth?.request?.("/team/state");
+      if (!response?.ok) return null;
+      const data = await response.json();
+      if (data?.team) setCurrentTeam(data.team);
+      if (data?.state) applyServerTeamState(data.state, data.team || null);
+      return data?.state || null;
+    } catch {
+      return null;
+    }
+  }, [applyServerTeamState, currentTeam, screen]);
+
+  const clearClientTradeAlert = useCallback(() => {
+    if (clientTradeAlertTimeoutRef.current) {
+      clearTimeout(clientTradeAlertTimeoutRef.current);
+      clientTradeAlertTimeoutRef.current = null;
+    }
+    setClientTradeAlert(null);
+  }, []);
+
+  const showClientTradeAlert = useCallback((text, type = "warning") => {
+    if (clientTradeAlertTimeoutRef.current) clearTimeout(clientTradeAlertTimeoutRef.current);
+    setClientTradeAlert({ type, text });
+    clientTradeAlertTimeoutRef.current = setTimeout(() => {
+      clientTradeAlertTimeoutRef.current = null;
+      setClientTradeAlert(null);
+    }, 8000);
+  }, []);
+
+  const submitServerTrade = useCallback(async payload => {
+    if (!SERVER_PORTFOLIO_AUTH) return { ok:false, error:"Server portfolio mode is disabled." };
+    try {
+      const response = await window.auth?.request?.("/team/trade", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json();
+      if (!response.ok || !data?.state) {
+        const errorText = data?.error || "Trade rejected by the server.";
+        showClientTradeAlert(errorText);
+        return { ok:false, error:errorText };
+      }
+      if (data?.team) setCurrentTeam(data.team);
+      clearClientTradeAlert();
+      applyServerTeamState(data.state, data.team || null);
+      loadLB();
+      return { ok:true, state:data.state };
+    } catch {
+      const errorText = "Unable to reach the trade server.";
+      showClientTradeAlert(errorText);
+      return { ok:false, error:errorText };
+    }
+  }, [applyServerTeamState, clearClientTradeAlert, loadLB, showClientTradeAlert]);
+
+  const applyPortfolioReset = useCallback((resetInstruction) => {
+    if (SERVER_PORTFOLIO_AUTH) return;
+    if (!resetInstruction?.mode) return;
+    const currentHoldings = holdingsRef.current || {};
+    const currentPrices = pricesRef.current || {};
+
+    if (resetInstruction.mode === "equal_restart") {
+      const targetCash = resetInstruction.cashTarget || INITIAL_CASH;
+      setInitCash(targetCash);
+      setCash(targetCash);
+      setRestrictedCash(0);
+      setAccruedBorrowCost(0);
+      setAccruedFundingCost(0);
+      setHoldings({});
+      setTransactions([]);
+      setDerivativePositions({});
+      setDerivativeTransactions([]);
+      setSelectedDerivativeId(null);
+      setSelTicker(null);
+      return;
+    }
+
+    if (resetInstruction.mode === "liquidate_to_cash") {
+      const liquidationValue = Object.entries(currentHoldings).reduce((sum, [ticker, pos]) => (
+        sum + ((currentPrices[ticker] || pos?.avgCost || 0) * (pos?.qty || 0))
+      ), 0);
+      setCash(c => c + liquidationValue);
+      setRestrictedCash(0);
+      setHoldings({});
+      setTransactions([]);
+      setDerivativePositions({});
+      setDerivativeTransactions([]);
+      setSelectedDerivativeId(null);
+      setSelTicker(null);
+    }
+  }, []);
+
+  const appendTradeToTape = useCallback((rawTrade) => {
+    const trade = normalizeTradeFeedItem(rawTrade);
+    if (!trade) return;
+    const now = Date.now();
+    const nextTape = [...tradeTapeRef.current.filter(evt => (now - evt.ts) <= ORDER_FLOW_WINDOW_MS), trade]
+      .sort((a, b) => a.ts - b.ts)
+      .slice(-ORDER_FLOW_MAX_EVENTS);
+    tradeTapeRef.current = nextTape;
+    const nextSnapshot = buildOrderFlowSnapshot(nextTape, now);
+    orderFlowRef.current = nextSnapshot;
+    setOrderFlowSnapshot(nextSnapshot);
+  }, []);
+
+  const pushTrade    = useCallback(async trade => {
+    const ts = Date.now();
+    const event = normalizeTradeFeedItem({
+      ...trade,
+      id: trade?.id || ts,
+      ts,
+    });
+    if (!event) return;
+    appendTradeToTape(event);
+    const feedKey = `${TRADE_FEED_PREFIX}${ts}:${Math.random().toString(36).slice(2, 8)}`;
+    seenTradeFeedKeysRef.current.add(feedKey);
+    try {
+      await window.storage.set("cd:trades", JSON.stringify(event), true);
+      await window.storage.set(feedKey, JSON.stringify(event), true);
+    } catch {}
+  }, [appendTradeToTape]);
+
+  const sendBcast    = useCallback(async text => {
+    const m = { text, id:Date.now() };
+    setBroadcast(m); setTimeout(() => setBroadcast(null), 7000);
+    try { await window.storage.set("gm:broadcast", JSON.stringify(m), true); } catch {}
+  }, []);
+
+  const autoDeleveragePortfolio = useCallback(() => {
+    if (SERVER_PORTFOLIO_AUTH) return;
+    if (autoDeleveragingRef.current) return;
+    autoDeleveragingRef.current = true;
+    const activeRule = ROUND_RULES[Math.min(Math.max((activeLedgerRoundRef.current || roundNum) - 1, 0), TOTAL_ROUNDS - 1)] || ROUND_RULES[0];
+    const activeRound = activeLedgerRoundRef.current || roundNum;
+    let nextCash = cashRef.current || 0;
+    let nextRestrictedCash = restrictedCashRef.current || 0;
+    let nextHoldings = { ...(holdingsRef.current || {}) };
+    let nextDerivativePositions = { ...(derivativePositionsRef.current || {}) };
+    const pricesNow = pricesRef.current || {};
+    const generatedTransactions = [];
+    const generatedDerivativeTransactions = [];
+    const derivativeQuoteMap = buildDerivativeQuoteMapForRound({
+      round: activeRound,
+      prices: pricesNow,
+      roundRule: activeRule,
+      timeLeft: timeLeftRef.current || 0,
+      roundDur: roundDurationsRef.current?.[activeRound - 1] || DEFAULT_ROUND_DURATIONS[Math.max(0, activeRound - 1)] || roundDur,
+      gamePhase: phaseRef.current,
+      roundBases: roundDerivativeBaseRef.current,
+    });
+
+    const rankPositions = () => [
+      ...Object.entries(nextHoldings).map(([ticker, pos]) => {
+        const price = pricesNow[ticker] || pos?.avgCost || 0;
+        const qty = pos?.qty || 0;
+        const gross = Math.abs(price * qty);
+        const unrealized = (price - (pos?.avgCost || 0)) * qty;
+        return { kind:"equity", ticker, pos, price, qty, gross, unrealized };
+      }),
+      ...Object.entries(nextDerivativePositions).map(([id, position]) => {
+        const quote = derivativeQuoteMap[id];
+        if (!quote) return null;
+        return {
+          kind:"derivative",
+          id,
+          position,
+          quote,
+          gross: calcDerivativeExposure(position, quote),
+          unrealized: position.kind === "future"
+            ? calcDerivativePositionValue(position, quote)
+            : ((quote.mark - (position.avgCost || 0)) * (position.qty || 0) * (position.multiplier || quote.multiplier || 1) * (position.side === "short" ? -1 : 1)),
+        };
+      }).filter(Boolean)
+    ]
+      .sort((a, b) => (b.gross - a.gross) || (a.unrealized - b.unrealized));
+
+    const simulateMarginBuffer = () => {
+      const simulated = PortfolioAnalytics({
+        holdings: nextHoldings,
+        transactions: [
+          ...(transactionsRef.current || []),
+          ...(derivativeTransactionsRef.current || []),
+          ...generatedTransactions,
+          ...generatedDerivativeTransactions,
+        ],
+        prices: pricesNow,
+        cash: nextCash,
+        restrictedCash: nextRestrictedCash,
+        derivativePositions: nextDerivativePositions,
+        derivativeQuoteMap,
+        accruedBorrowCost: accruedBorrowCostRef.current,
+        accruedFundingCost: accruedFundingCostRef.current,
+        initCash,
+        history: historyRef.current,
+        roundRule: activeRule,
+      });
+      return simulated.marginBuffer;
+    };
+
+    for (const candidate of rankPositions()) {
+      if (simulateMarginBuffer() >= 0) break;
+      if (candidate.kind === "equity") {
+        const { ticker, pos, price, qty } = candidate;
+        const stk = ALL_STOCKS.find(stock => stock.ticker === ticker);
+        if (!stk || !qty) continue;
+        const absQty = Math.abs(qty);
+        if (qty > 0) {
+          const proceeds = price * absQty;
+          nextCash += proceeds;
+          delete nextHoldings[ticker];
+          generatedTransactions.push({
+            id: Date.now() + generatedTransactions.length,
+            type: "SELL",
+            auto: true,
+            ticker,
+            sectorId: stk.sectorId,
+            qty: absQty,
+            price,
+            avgCostAtSell: pos.avgCost,
+            proceeds,
+            gain: (price - pos.avgCost) * absQty,
+            gainPct: ((price - pos.avgCost) / pos.avgCost) * 100,
+            time: nowFull(),
+            date: new Date().toLocaleDateString(),
+          });
+        } else {
+          const releasedCollateral = (pos.avgCost || 0) * absQty;
+          nextRestrictedCash = Math.max(0, nextRestrictedCash - releasedCollateral);
+          nextCash += ((pos.avgCost || 0) - price) * absQty;
+          delete nextHoldings[ticker];
+          generatedTransactions.push({
+            id: Date.now() + generatedTransactions.length,
+            type: "COVER",
+            auto: true,
+            ticker,
+            sectorId: stk.sectorId,
+            qty: absQty,
+            price,
+            avgCostAtCover: pos.avgCost,
+            cost: price * absQty,
+            gain: ((pos.avgCost || 0) - price) * absQty,
+            gainPct: (((pos.avgCost || 0) - price) / (pos.avgCost || 1)) * 100,
+            time: nowFull(),
+            date: new Date().toLocaleDateString(),
+          });
+        }
+      } else {
+        const { id, position, quote } = candidate;
+        const qty = position?.qty || 0;
+        if (!qty || !quote) continue;
+        const closeUnitPrice = position.kind === "future"
+          ? (position.side === "short" ? quote.ask : quote.bid)
+          : (position.side === "short" ? quote.ask : quote.bid);
+        const multiplier = position.multiplier || quote.multiplier || 1;
+        const entryValue = (position.avgCost || 0) * qty * multiplier;
+        let realizedValue = 0;
+        let gain = 0;
+        if (position.kind === "future") {
+          realizedValue = entryValue + calcDerivativeCloseValue(position, quote);
+          gain = calcDerivativeCloseValue(position, quote);
+        } else if (position.side === "short") {
+          realizedValue = -closeUnitPrice * qty * multiplier;
+          gain = entryValue + realizedValue;
+        } else {
+          realizedValue = closeUnitPrice * qty * multiplier;
+          gain = realizedValue - entryValue;
+        }
+        nextCash += position.kind === "future" ? gain : realizedValue;
+        delete nextDerivativePositions[id];
+        generatedDerivativeTransactions.push({
+          id: Date.now() + generatedTransactions.length + generatedDerivativeTransactions.length,
+          type: "DERIV_CLOSE",
+          auto: true,
+          instrumentId: id,
+          label: position.label,
+          kind: position.kind,
+          side: position.side,
+          underlyingTicker: position.underlyingTicker,
+          sectorId: position.sectorId,
+          qty,
+          price: closeUnitPrice,
+          avgCostAtOpen: position.avgCost,
+          entryValue,
+          realizedValue,
+          gain,
+          gainPct: entryValue > 0 ? (gain / entryValue) * 100 : 0,
+          time: nowFull(),
+          date: new Date().toLocaleDateString(),
+        });
+      }
+    }
+
+    setCash(nextCash);
+    setRestrictedCash(nextRestrictedCash);
+    setHoldings(nextHoldings);
+    setDerivativePositions(nextDerivativePositions);
+    if (generatedTransactions.length > 0) {
+      setTransactions(prev => [...generatedTransactions, ...prev]);
+    }
+    if (generatedDerivativeTransactions.length > 0) {
+      setDerivativeTransactions(prev => [...generatedDerivativeTransactions, ...prev]);
+    }
+    setMarginAlert({
+      type: "forced",
+      text: (generatedTransactions.length + generatedDerivativeTransactions.length) > 0
+        ? `Auto-deleveraging closed ${generatedTransactions.length + generatedDerivativeTransactions.length} position${(generatedTransactions.length + generatedDerivativeTransactions.length) === 1 ? "" : "s"} to restore maintenance margin.`
+        : "Maintenance margin breached. Exposure remains elevated.",
+    });
+    setTimeout(() => setMarginAlert(null), 8000);
+    marginGraceEndsAtRef.current = null;
+    roundMarginBreachActiveRef.current = false;
+    autoDeleveragingRef.current = false;
+  }, [initCash, roundNum]);
+
+  const inferUpcomingNewsRound = useCallback(() => (
+    Math.min(gameStartedRef.current ? roundNum + 1 : 1, TOTAL_ROUNDS)
+  ), [roundNum]);
+
+  const inferNewsRound = useCallback((item = {}) => {
+    if (Number.isFinite(item.round) && item.round > 0) return item.round;
+    if (Number.isFinite(item.storylineRound) && item.storylineRound > 0) return item.storylineRound;
+    if (item.roundHint === "next") return inferUpcomingNewsRound();
+    if (item.storylineStage === "opening") return inferUpcomingNewsRound();
+    return Number.isFinite(roundNum) && roundNum > 0 ? roundNum : null;
+  }, [inferUpcomingNewsRound, roundNum]);
+
+  const normalizeNewsItem = useCallback((item = {}) => {
+    const resolvedTicker = item.ticker || item.underlyingTicker || "MARKET";
+    const stock = ALL_STOCKS.find(entry => entry.ticker === resolvedTicker);
+    return {
+      ...item,
+      ticker: resolvedTicker,
+      sectorId: item.sectorId || stock?.sectorId || null,
+      sentiment: item.sentiment || ((item.impact || 0) >= 0 ? "bull" : "bear"),
+      round: inferNewsRound(item),
+    };
+  }, [inferNewsRound]);
+
+  const normalizeNewsFeed = useCallback((items = []) => (
+    (Array.isArray(items) ? items : [])
+      .map(item => normalizeNewsItem(item))
+      .slice(0, NEWS_HISTORY_LIMIT)
+  ), [normalizeNewsItem]);
+
+  const updateNewsFeed = useCallback((updater) => {
+    setNews(prev => {
+      const next = normalizeNewsFeed(updater(normalizeNewsFeed(prev)));
+      if (screenRef.current === "gm") pushNews(next);
+      return next;
+    });
+  }, [normalizeNewsFeed, pushNews]);
+
+  const archiveDisruptionsToNews = useCallback((events, sourceLabel="DISRUPTION") => {
+    if (!events?.length) return;
+    const time = nowShort();
+    const targetRound = inferUpcomingNewsRound();
+    const shouldUseMacroEntry = events.every(evt => evt?.political || evt?.storyline);
+    const macroNews = shouldUseMacroEntry
+      ? buildMacroNewsEntry(events, { sourceLabel, targetRound })
+      : null;
+    updateNewsFeed(prev => [
+      ...(macroNews ? [{ ...macroNews, time }] : events.map(evt => ({
+        ticker: evt.ticker,
+        sectorId: evt.sectorId || ALL_STOCKS.find(stock => stock.ticker === evt.ticker)?.sectorId || null,
+        headline: evt.eventName
+          ? `${evt.eventIcon ? `${evt.eventIcon} ` : ""}${evt.eventName} — ${evt.headline}`
+          : evt.headline,
+        detail: evt.detail,
+        sentiment: evt.impact > 0 ? "bull" : "bear",
+        tag: evt.eventTag || (evt.political ? "POLITICAL EVENT" : sourceLabel),
+        time,
+        round: Number.isFinite(evt.storylineRound) ? evt.storylineRound : targetRound,
+        storylineStage: evt.storylineStage || null,
+      }))),
+      ...prev
+    ]);
+  }, [inferUpcomingNewsRound, updateNewsFeed]);
+
+  const buildDisruptionArchiveKey = useCallback((events, sourceLabel="DISRUPTION") => (
+    `${sourceLabel}:${(events || []).map(evt => [
+      evt.storylineId || evt.eventName || evt.headline || evt.ticker || "event",
+      evt.ticker || "MARKET",
+      evt.impact || 0,
+    ].join(":")).join("|")}`
+  ), []);
+
+  const archiveDisruptionsOnce = useCallback((events, sourceLabel="DISRUPTION") => {
+    if (!events?.length) return;
+    const archiveKey = buildDisruptionArchiveKey(events, sourceLabel);
+    if (archivedDisruptionKeyRef.current === archiveKey) return;
+    archivedDisruptionKeyRef.current = archiveKey;
+    archiveDisruptionsToNews(events, sourceLabel);
+  }, [archiveDisruptionsToNews, buildDisruptionArchiveKey]);
+
+  // ─── POLLING ──────────────────────────────────────────────────────────────────
+  const prevRoundRef     = useRef(1);
+
+  useEffect(() => {
+    loadLB();
+    const id = setInterval(() => { loadLB(); }, LEADERBOARD_POLL_MS);
+    return () => clearInterval(id);
+  }, [loadLB]);
+
+  useEffect(() => {
+    if (screen !== "gm") return undefined;
+    let alive = true;
+    const syncTradeFeed = async () => {
+      try {
+        const listed = await window.storage.list(TRADE_FEED_PREFIX, true);
+        const keys = (listed?.keys || []).sort().slice(-ORDER_FLOW_MAX_EVENTS * 2);
+        const unseen = keys.filter(key => !seenTradeFeedKeysRef.current.has(key)).slice(-120);
+        let appended = [];
+        if (unseen.length > 0) {
+          const loaded = await Promise.all(unseen.map(async (key) => {
+            try {
+              const item = await window.storage.get(key, true);
+              if (!item?.value) return null;
+              const parsed = normalizeTradeFeedItem(JSON.parse(item.value));
+              return parsed ? { key, trade: parsed } : null;
+            } catch {
+              return null;
+            }
+          }));
+          appended = loaded.filter(Boolean).map(item => {
+            seenTradeFeedKeysRef.current.add(item.key);
+            return item.trade;
+          });
+        }
+        if (!alive) return;
+        const now = Date.now();
+        const retained = tradeTapeRef.current.filter(evt => (now - evt.ts) <= ORDER_FLOW_WINDOW_MS);
+        const nextTape = [...retained, ...appended].sort((a, b) => a.ts - b.ts).slice(-ORDER_FLOW_MAX_EVENTS);
+        tradeTapeRef.current = nextTape;
+        const nextSnapshot = buildOrderFlowSnapshot(nextTape, now);
+        orderFlowRef.current = nextSnapshot;
+        setOrderFlowSnapshot(nextSnapshot);
+      } catch {}
+    };
+    syncTradeFeed();
+    const id = setInterval(syncTradeFeed, ORDER_FLOW_POLL_MS);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [screen]);
+
+  useEffect(() => {
+    loadLB();
+    refreshTeams();
+    const id = setInterval(async () => {
+      try {
+        const r = await window.storage.get("gm:broadcast", true);
+        if (r) {
+          const m = JSON.parse(r.value);
+          if (m.id !== lastBcRef.current) {
+            lastBcRef.current = m.id;
+            setBroadcast(m);
+            setTimeout(() => setBroadcast(null), 7000);
+          }
+        }
+      } catch {}
+      try {
+        const gs = await window.storage.get("gm:state", true);
+        if (gs) {
+          const parsed = JSON.parse(gs.value);
+          const prevRound = prevRoundRef.current || 0;
+          const nextRound = parsed.round;
+          const isPlayerScreen = screenRef.current !== "gm";
+          if (!SERVER_PORTFOLIO_AUTH && parsed.phase === "idle" && nextRound === 1 && prevRound > 1) {
+            clearScoreLedgerState(parsed.initCash || INITIAL_CASH);
+            prevRoundRef.current = 0;
+            processedPortfolioResetRef.current = null;
+          } else if (!SERVER_PORTFOLIO_AUTH && isPlayerScreen) {
+            if (parsed.portfolioReset?.id && parsed.portfolioReset.id !== processedPortfolioResetRef.current) {
+              const resetRound = parsed.portfolioReset.sourceRound || prevRound || nextRound || roundNum;
+              if (activeLedgerRoundRef.current === resetRound) {
+                settleExpiredDerivatives(resetRound);
+                finalizeScoreLedgerRound(resetRound);
+              }
+              processedPortfolioResetRef.current = parsed.portfolioReset.id;
+              applyPortfolioReset(parsed.portfolioReset);
+            } else if (nextRound && nextRound > prevRound && prevRound > 0 && activeLedgerRoundRef.current === prevRound) {
+              settleExpiredDerivatives(prevRound);
+              finalizeScoreLedgerRound(prevRound);
+            }
+            if (["ceremony", "ended"].includes(parsed.phase) && activeLedgerRoundRef.current === (nextRound || prevRound)) {
+              settleExpiredDerivatives(nextRound || prevRound);
+              finalizeScoreLedgerRound(nextRound || prevRound);
+            }
+          }
+          if (parsed.phase) setGamePhase(parsed.phase);
+          if (parsed.round !== undefined) setRoundNum(parsed.round);
+          if (parsed.roundLeft !== undefined) setTimeLeft(parsed.roundLeft);
+          if (parsed.roundEndsAt !== undefined) setRoundEndsAt(parsed.roundEndsAt);
+          if (parsed.bufferLeft !== undefined) setBufferLeft(parsed.bufferLeft);
+          if (parsed.bufferEndsAt !== undefined) setBufferEndsAt(parsed.bufferEndsAt);
+          if (parsed.settlementViewEndsAt !== undefined) setSettlementViewEndsAt(parsed.settlementViewEndsAt);
+          if (parsed.settlementViewRound !== undefined) setSettlementViewRound(parsed.settlementViewRound);
+          if (parsed.initCash !== undefined) setInitCash(parsed.initCash);
+          if (parsed.sentiment) setSentiment(parsed.sentiment);
+          if (parsed.volMultiplier !== undefined) setVolMultiplier(parsed.volMultiplier);
+          if (parsed.leaderHidden !== undefined) setLeaderHidden(parsed.leaderHidden);
+          if (parsed.frozenUntil !== undefined) setFrozenUntil(parsed.frozenUntil);
+          if (parsed.haltedUntil !== undefined) setHaltedUntil(parsed.haltedUntil);
+          if (parsed.roundRulesIdx !== undefined) setRoundRules(ROUND_RULES[parsed.roundRulesIdx] || ROUND_RULES[0]);
+          if (parsed.predictionOpen !== undefined && screenRef.current === "player") setPredictionOpen(parsed.predictionOpen);
+          if (parsed.round && parsed.round > prevRoundRef.current && parsed.round > 1) {
+            // Round transitions handled server-side via ROUND_RULES in startNextRound
+            prevRoundRef.current = parsed.round;
+          } else if (parsed.round) {
+            prevRoundRef.current = parsed.round;
+          }
+        }
+        const di = await window.storage.get("gm:disruptions", true);
+        if (di) { const d = JSON.parse(di.value); if (d.events) setDisruptions(d.events); }
+        const gn = await window.storage.get("gm:news", true);
+        if (gn) {
+          const data = JSON.parse(gn.value);
+          if (Array.isArray(data.items)) setNews(normalizeNewsFeed(data.items));
+        }
+        const gp = await window.storage.get("gm:prediction", true);
+        if (gp) {
+          const session = normalizePredictionSession(JSON.parse(gp.value));
+          setPredictionSession(session);
+          if (session?.phase === "closed") setPredictionOpen(false);
+        }
+        if (screenRef.current !== "gm") {
+          const gp2 = await window.storage.get("gm:prices", true);
+          if (gp2) {
+            const data = JSON.parse(gp2.value);
+            if (data.prices) {
+              setPrevPrices(pricesRef.current);
+              setPrices(data.prices);
+            }
+            if (data.history) setHistory(data.history);
+          }
+          const gof = await window.storage.get(GM_ORDER_FLOW_KEY, true);
+          if (gof) {
+            const data = JSON.parse(gof.value);
+            setSharedOrderFlowSnapshot(data?.snapshot || {});
+          } else {
+            setSharedOrderFlowSnapshot({});
+          }
+        }
+      } catch {}
+    }, STORAGE_SYNC_POLL_MS);
+    return () => clearInterval(id);
+  }, [applyPortfolioReset, clearScoreLedgerState, finalizeScoreLedgerRound, loadLB, normalizeNewsFeed, refreshTeams, roundNum]);
+
+  useEffect(() => {
+    if (screen !== "player" || gamePhase !== "buffer") return undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        const di = await window.storage.get("gm:disruptions", true);
+        if (!di || cancelled) return;
+        const parsed = JSON.parse(di.value);
+        if (!cancelled && Array.isArray(parsed?.events)) {
+          setDisruptions(parsed.events);
+        }
+      } catch {}
+    })();
+    return () => { cancelled = true; };
+  }, [gamePhase, screen]);
+
+  useEffect(() => {
+    if (screen !== "player") return;
+    if (!["buffer", "disruption"].includes(gamePhase)) return;
+    setTab("news");
+  }, [gamePhase, screen]);
+
+  useEffect(() => {
+    if (!SERVER_PORTFOLIO_AUTH || !currentTeam || screen !== "player") return undefined;
+    loadServerTeamState();
+    const id = setInterval(() => { loadServerTeamState(); }, TEAM_STATE_POLL_MS);
+    return () => clearInterval(id);
+  }, [currentTeam, loadServerTeamState, screen]);
+
+  // ─── SAVE SCORE periodically ──────────────────────────────────────────────────
+  // Use refs for peakValue/maxDrawdown to avoid them in deps causing infinite loop
+  const peakValueRef  = useRef(peakValue);
+  const maxDrawdownRef = useRef(maxDrawdown);
+  peakValueRef.current  = peakValue;
+  maxDrawdownRef.current = maxDrawdown;
+
+  useEffect(() => {
+    if (SERVER_PORTFOLIO_AUTH) return;
+    if (!currentTeam || screen !== "player" || gamePhase !== "running") return;
+    if (activeLedgerRoundRef.current === roundNum) return;
+    const currentDerivativeQuoteMap = buildDerivativeQuoteMapForRound({
+      round: roundNum,
+      prices,
+      roundRule: ROUND_RULES[Math.min(Math.max(roundNum - 1, 0), TOTAL_ROUNDS - 1)] || ROUND_RULES[0],
+      timeLeft: timeLeft,
+      roundDur: roundDurations[Math.min(Math.max(roundNum - 1, 0), TOTAL_ROUNDS - 1)] || roundDur,
+      gamePhase,
+      roundBases: roundDerivativeBaseRef.current,
+    });
+    startScoreLedgerRound(roundNum, {
+      startingCapital: calcNetEquityFromState({
+        cash,
+        restrictedCash,
+        holdings,
+        prices,
+        derivativePositions,
+        derivativeQuoteMap: currentDerivativeQuoteMap,
+        accruedBorrowCost,
+        accruedFundingCost,
+      }),
+      ballStartPrice: prices?.BALL || BALL_BASE,
+      predShown: predictionSession?.round === roundNum && predictionSession?.phase !== "closed",
+      predAnswered: false,
+      predCorrect: false,
+    });
+  }, [accruedBorrowCost, accruedFundingCost, cash, currentTeam, derivativePositions, gamePhase, holdings, predictionSession, prices, restrictedCash, roundDur, roundDurations, roundNum, screen, startScoreLedgerRound, timeLeft]);
+
+  useEffect(() => {
+    if (SERVER_PORTFOLIO_AUTH) return;
+    const session = predictionSession;
+    if (!session || !currentTeam || screen !== "player") return;
+    const activeRound = activeLedgerRoundRef.current || roundNum;
+    if (session.round === activeRound && session.question) {
+      roundPredictionShownRef.current = true;
+    }
+    const answeredCurrentSession = playerPredictionSessionId === session.id && playerPredictionRound === session.round;
+    if (answeredCurrentSession) {
+      roundPredictionAnsweredRef.current = true;
+    }
+    if (answeredCurrentSession && ["revealing", "closed"].includes(session.phase)) {
+      roundPredictionCorrectRef.current = playerPrediction === session.question?.correct;
+    }
+  }, [currentTeam, playerPrediction, playerPredictionRound, playerPredictionSessionId, predictionSession, roundNum, screen]);
+
+  useEffect(() => {
+    if (SERVER_PORTFOLIO_AUTH) return;
+    if (!currentTeam || screen !== "player" || gamePhase !== "running") return;
+    const activeRule = ROUND_RULES[Math.min(Math.max((activeLedgerRoundRef.current || roundNum) - 1, 0), TOTAL_ROUNDS - 1)] || ROUND_RULES[0];
+    const activeRound = activeLedgerRoundRef.current || roundNum;
+    const currentDerivativeQuoteMap = buildDerivativeQuoteMapForRound({
+      round: activeRound,
+      prices,
+      roundRule: activeRule,
+      timeLeft,
+      roundDur: roundDurations[Math.min(Math.max(activeRound - 1, 0), TOTAL_ROUNDS - 1)] || roundDur,
+      gamePhase,
+      roundBases: roundDerivativeBaseRef.current,
+    });
+    const liveAnalytics = PortfolioAnalytics({
+      holdings,
+      transactions: [...transactions, ...derivativeTransactions],
+      prices,
+      cash,
+      restrictedCash,
+      derivativePositions,
+      derivativeQuoteMap: currentDerivativeQuoteMap,
+      accruedBorrowCost,
+      accruedFundingCost,
+      initCash,
+      history,
+      roundRule: activeRule,
+    });
+    const roundSeconds = Math.max(1, roundDurations[Math.min(Math.max((activeLedgerRoundRef.current || roundNum) - 1, 0), TOTAL_ROUNDS - 1)] || roundDur);
+    const tickFraction = (TICK_MS / 1000) / roundSeconds;
+    const borrowDelta = liveAnalytics.shortExposure * (activeRule.borrowRate || 0) * tickFraction;
+    const fundingDelta = liveAnalytics.leverageUsed * (activeRule.fundingRate || 0) * tickFraction;
+    if (borrowDelta > 0) setAccruedBorrowCost(value => value + borrowDelta);
+    if (fundingDelta > 0) setAccruedFundingCost(value => value + fundingDelta);
+    if (liveAnalytics.grossExposure > 0) {
+      roundMarginBufferSumRef.current += liveAnalytics.marginBufferPct;
+      roundMarginBufferSamplesRef.current += 1;
+    }
+  }, [
+    accruedBorrowCost, accruedFundingCost, cash, currentTeam, derivativePositions, derivativeTransactions, gamePhase, history, holdings, initCash,
+    prices, restrictedCash, roundDur, roundDurations, roundNum, screen, tick, timeLeft, transactions
+  ]);
+
+  useEffect(() => {
+    if (SERVER_PORTFOLIO_AUTH) return;
+    if (!currentTeam || screen !== "player") return;
+    const currentDerivativeQuoteMap = buildDerivativeQuoteMapForRound({
+      round: activeLedgerRoundRef.current || roundNum,
+      prices,
+      roundRule: ROUND_RULES[Math.min(Math.max((activeLedgerRoundRef.current || roundNum) - 1, 0), TOTAL_ROUNDS - 1)] || ROUND_RULES[0],
+      timeLeft,
+      roundDur: roundDurations[Math.min(Math.max((activeLedgerRoundRef.current || roundNum) - 1, 0), TOTAL_ROUNDS - 1)] || roundDur,
+      gamePhase,
+      roundBases: roundDerivativeBaseRef.current,
+    });
+    const total = calcNetEquityFromState({
+      cash,
+      restrictedCash,
+      holdings,
+      prices,
+      derivativePositions,
+      derivativeQuoteMap: currentDerivativeQuoteMap,
+      accruedBorrowCost,
+      accruedFundingCost,
+    });
+    // drawdown tracking — read from refs, write to state without adding to deps
+    if (total > peakValueRef.current) setPeakValue(total);
+    const dd = peakValueRef.current > 0 ? ((peakValueRef.current - total) / peakValueRef.current) * 100 : 0;
+    if (dd > maxDrawdownRef.current) setMaxDrawdown(dd);
+    // Throttle score writes: max once per SCORE_WRITE_INTERVAL for 60-team scale
+    if (Date.now() - lastScoreWrite.current >= SCORE_WRITE_INTERVAL) {
+      saveScore(currentTeam.name, currentTeam.color, total, cash, holdings, transactions, initCash, maxDrawdownRef.current);
+      lastScoreWrite.current = Date.now();
+    }
+  }, [tick, accruedBorrowCost, accruedFundingCost, cash, currentTeam, derivativePositions, derivativeTransactions, gamePhase, holdings, initCash, prices, restrictedCash, roundDur, roundDurations, roundNum, screen, timeLeft, transactions, saveScore]);
+
+  useEffect(() => {
+    if (SERVER_PORTFOLIO_AUTH) return;
+    if (!currentTeam || screen !== "player") return;
+    const currentDerivativeQuoteMap = buildDerivativeQuoteMapForRound({
+      round: activeLedgerRoundRef.current || roundNum,
+      prices: pricesRef.current,
+      roundRule: ROUND_RULES[Math.min(Math.max((activeLedgerRoundRef.current || roundNum) - 1, 0), TOTAL_ROUNDS - 1)] || ROUND_RULES[0],
+      timeLeft: timeLeftRef.current || 0,
+      roundDur: roundDurationsRef.current?.[(activeLedgerRoundRef.current || roundNum) - 1] || DEFAULT_ROUND_DURATIONS[Math.max(0, (activeLedgerRoundRef.current || roundNum) - 1)] || roundDur,
+      gamePhase: phaseRef.current,
+      roundBases: roundDerivativeBaseRef.current,
+    });
+    const total = calcNetEquityFromState({
+      cash: cashRef.current,
+      restrictedCash: restrictedCashRef.current,
+      holdings: holdingsRef.current,
+      prices: pricesRef.current,
+      derivativePositions: derivativePositionsRef.current,
+      derivativeQuoteMap: currentDerivativeQuoteMap,
+      accruedBorrowCost: accruedBorrowCostRef.current,
+      accruedFundingCost: accruedFundingCostRef.current,
+    });
+    saveScore(
+      currentTeam.name,
+      currentTeam.color,
+      total,
+      cashRef.current,
+      holdingsRef.current,
+      transactionsRef.current,
+      initCash,
+      maxDrawdownRef.current
+    );
+    lastScoreWrite.current = Date.now();
+  }, [accruedBorrowCost, accruedFundingCost, currentTeam, initCash, restrictedCash, saveScore, scoreLedger, screen, roundNum]);
+
+  // push prices every tick when GM
+  useEffect(() => {
+    if (screen === "gm") pushPrices(prices, history);
+  }, [tick, prices, history, screen, pushPrices]);
+
+  const submitPredictionVote = useCallback(async (optionId) => {
+    const session = predictionSessionRef.current;
+    if (screenRef.current !== "player" || !currentTeam || !session || session.phase !== "polling") return;
+    const sessionId = normalizePredictionSessionId(session.id);
+    if (playerPredictionSessionId === sessionId) return;
+    roundPredictionShownRef.current = true;
+    roundPredictionAnsweredRef.current = true;
+    setPlayerPrediction(optionId);
+    setPlayerPredictionRound(session.round);
+    setPlayerPredictionSessionId(sessionId);
+    try {
+      await window.storage.set(`predvote:${sessionId}:${currentTeam.name}`, JSON.stringify({
+        team: currentTeam.name,
+        round: session.round,
+        option: optionId,
+        sessionId,
+        ts: Date.now()
+      }), true);
+      if (SERVER_PORTFOLIO_AUTH) await loadServerTeamState();
+    } catch {}
+  }, [currentTeam, loadServerTeamState, playerPredictionSessionId]);
+
+  const finalizePredictionPolling = useCallback(async (sessionArg) => {
+    const session = sessionArg || predictionSessionRef.current;
+    if (screenRef.current !== "gm" || !session || session.phase !== "polling") return;
+    let votes = [];
+    try {
+      const res = await window.storage.list(`predvote:${session.id}:`, true);
+      const keys = res?.keys || [];
+      votes = (await Promise.all(keys.map(async key => {
+        try {
+          const row = await window.storage.get(key, true);
+          return row ? JSON.parse(row.value) : null;
+        } catch {
+          return null;
+        }
+      }))).filter(Boolean);
+    } catch {}
+
+    const totalVotes = votes.length;
+    const results = Object.fromEntries((session.question?.options || []).map(opt => {
+      const voteCount = votes.filter(v => v.option === opt.id).length;
+      return [opt.id, {
+        votes: voteCount,
+        pct: totalVotes > 0 ? Math.round((voteCount / totalVotes) * 100) : 0
+      }];
+    }));
+
+    const revealSession = {
+      ...session,
+      phase:"revealing",
+      results,
+      totalVotes,
+      revealStartedAt: Date.now(),
+      revealEndsAt: Date.now() + PREDICTION_REVEAL_SECS * 1000
+    };
+    setPredictionSession(revealSession);
+    setPredictionOpen(true);
+    await pushPrediction(revealSession);
+    await pushGMState({ predictionOpen:true });
+    sendBcast("🎯 Prediction Market locked. Revealing the correct answer and team polling split now.");
+  }, [pushGMState, pushPrediction, sendBcast]);
+
+  useEffect(() => {
+    if (screen !== "gm" || !predictionSession || predictionSession.phase === "closed") return undefined;
+    const targetTime = predictionSession.phase === "polling"
+      ? predictionSession.endsAt
+      : predictionSession.revealEndsAt;
+    const waitMs = Math.max(0, (targetTime || Date.now()) - Date.now());
+    const id = setTimeout(async () => {
+      const active = predictionSessionRef.current;
+      if (!active || active.id !== predictionSession.id) return;
+      if (active.phase === "polling") {
+        await finalizePredictionPolling(active);
+        return;
+      }
+      if (active.phase === "revealing") {
+        const closedAt = Date.now();
+        const pauseMs = active.startedAt ? Math.max(0, closedAt - active.startedAt) : 0;
+        let resumedRoundEndsAt = roundEndsAtRef.current;
+        if (pauseMs > 0) {
+          setStartTime(prev => prev ? prev + pauseMs : prev);
+          resumedRoundEndsAt = roundEndsAtRef.current ? roundEndsAtRef.current + pauseMs : roundEndsAtRef.current;
+          if (resumedRoundEndsAt) setRoundEndsAt(resumedRoundEndsAt);
+        }
+        const resumedRoundLeft = resumedRoundEndsAt
+          ? Math.max(0, Math.ceil((resumedRoundEndsAt - Date.now()) / 1000))
+          : (timeLeftRef.current || 0);
+        const closedSession = { ...active, phase:"closed", closedAt };
+        setPredictionSession(closedSession);
+        setPredictionOpen(false);
+        await pushPrediction(closedSession);
+        await pushGMState({ predictionOpen:false, roundLeft:resumedRoundLeft, roundEndsAt:resumedRoundEndsAt || null });
+        sendBcast("▶ Prediction Market complete. Trading resumes immediately.");
+      }
+    }, waitMs + 50);
+    return () => clearTimeout(id);
+  }, [finalizePredictionPolling, predictionSession, pushGMState, pushPrediction, screen, sendBcast]);
+
+  // ─── TIMERS ───────────────────────────────────────────────────────────────────
+  const triggerRoundEndRef = useRef(null);
+
+  useEffect(() => {
+    if (screen !== "gm") return undefined;
+    if (phaseRef.current !== "running" || !roundEndsAt) return undefined;
+    lastPublishedRoundLeftRef.current = null;
+    const syncRoundCountdown = () => {
+      if (phaseRef.current !== "running") return;
+      if (["polling","revealing"].includes(predictionSessionRef.current?.phase)) return;
+      const left = Math.max(0, Math.ceil((roundEndsAt - Date.now()) / 1000));
+      setTimeLeft(left);
+      if (lastPublishedRoundLeftRef.current !== left) {
+        lastPublishedRoundLeftRef.current = left;
+        pushGMState({ roundLeft:left, roundEndsAt });
+      }
+      if (left <= 0) triggerRoundEndRef.current?.();
+    };
+    syncRoundCountdown();
+    const id = setInterval(syncRoundCountdown, 200);
+    return () => clearInterval(id);
+  }, [pushGMState, roundEndsAt, screen]);
+
+  useEffect(() => {
+    if (screen === "gm") return undefined;
+    if (gamePhase !== "running" || !roundEndsAt) return undefined;
+    const syncCountdown = () => {
+      setTimeLeft(Math.max(0, Math.ceil((roundEndsAt - Date.now()) / 1000)));
+    };
+    syncCountdown();
+    const id = setInterval(syncCountdown, 200);
+    return () => clearInterval(id);
+  }, [gamePhase, roundEndsAt, screen]);
+
+  useEffect(() => {
+    if (screen !== "gm") return undefined;
+    if (phaseRef.current !== "buffer" || !bufferStart) {
+      setBufferLeft(null);
+      setBufferEndsAt(null);
+      return;
+    }
+    const endsAt = bufferStart + (currentBufferDurationRef.current || BUFFER_SECS) * 1000;
+    setBufferEndsAt(endsAt);
+    const id = setInterval(() => {
+      const left = Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
+      setBufferLeft(left);
+      pushGMState({ phase:"buffer", bufferLeft:left, bufferEndsAt:endsAt });
+      if (left <= 0 && phaseRef.current === "buffer") {
+        clearInterval(id);
+        // Auto-apply disruption then start next round — no GM permission needed
+        setGamePhase("disruption");
+        setBufferEndsAt(null);
+        pushGMState({ phase:"disruption", bufferLeft:0, bufferEndsAt:null });
+      }
+    }, 1000);
+    return () => clearInterval(id);
+  }, [bufferStart, pushGMState, screen]);
+
+  useEffect(() => {
+    if (screen === "gm") return undefined;
+    if (gamePhase !== "buffer" || !bufferEndsAt) return undefined;
+    const syncCountdown = () => {
+      setBufferLeft(Math.max(0, Math.ceil((bufferEndsAt - Date.now()) / 1000)));
+    };
+    syncCountdown();
+    const id = setInterval(syncCountdown, 200);
+    return () => clearInterval(id);
+  }, [bufferEndsAt, gamePhase, screen]);
+
+  useEffect(() => {
+    if (!settlementViewEndsAt || !["buffer", "ceremony", "ended"].includes(gamePhase)) {
+      setSettlementViewLeft(null);
+      return undefined;
+    }
+    const syncSettlementCountdown = () => {
+      setSettlementViewLeft(Math.max(0, Math.ceil((settlementViewEndsAt - Date.now()) / 1000)));
+    };
+    syncSettlementCountdown();
+    const id = setInterval(syncSettlementCountdown, 200);
+    return () => clearInterval(id);
+  }, [gamePhase, settlementViewEndsAt]);
+
+  // When buffer expires and phase becomes "disruption", auto-apply disruption and start next round
+  // Uses a ref to avoid temporal dead zone — startNextRound is defined later via useCallback
+  const autoDisruptAppliedRef = useRef(false);
+  const startNextRoundRef = useRef(null);
+  useEffect(() => {
+    if (screen !== "gm") return;
+    if (gamePhase !== "disruption") {
+      autoDisruptAppliedRef.current = false;
+      return;
+    }
+    if (autoDisruptAppliedRef.current) return;
+    autoDisruptAppliedRef.current = true;
+    const cur = pricesRef.current;
+    const next = { ...cur };
+    disruptions.forEach(evt => {
+      if (next[evt.ticker]) next[evt.ticker] = Math.max(0.5, next[evt.ticker] * (1 + evt.impact / 100));
+    });
+    if (disruptions.length > 0) {
+      setPrices(next);
+      setHistory(prevH => {
+        const newH = { ...prevH };
+        disruptions.forEach(evt => {
+          if (newH[evt.ticker]) newH[evt.ticker] = [...newH[evt.ticker].slice(1), next[evt.ticker]];
+        });
+        pushPrices(next, newH); return newH;
+      });
+      const sourceLabel = disruptions.some(evt => evt.political && !evt.storyline)
+        ? "POLITICAL EVENT"
+        : "BUFFER EVENT";
+      archiveDisruptionsOnce(disruptions, sourceLabel);
+    }
+    setTimeout(() => { startNextRoundRef.current?.(); }, 600);
+  }, [archiveDisruptionsOnce, disruptions, pushPrices, screen]);
+
+  // ─── PRICE ENGINE ─────────────────────────────────────────────────────────────
+  const advancePrices = useCallback((cur, hist, sent, secBiases) => {
+    const globalBias = sent==="bull"?0.005:sent==="bear"?-0.005:0;
+    const globalVm   = sent==="volatile"?3:1;
+    const newP = {}, newH = { ...hist };
+    const tradeOrderFlow = orderFlowRef.current || {};
+    const syntheticOrderFlow = buildSyntheticOrderFlowSnapshot({
+      prices: cur,
+      history: hist,
+      sentiment: sent,
+      sectorBiases: secBiases,
+      previousSnapshot: syntheticOrderFlowRef.current,
+      tradeSnapshot: tradeOrderFlow,
+    });
+    syntheticOrderFlowRef.current = syntheticOrderFlow;
+    const liveOrderFlow = mergeOrderFlowSnapshots(syntheticOrderFlow, tradeOrderFlow);
+    // First pass: price all non-ETF stocks normally
+    ALL_STOCKS.forEach(s => {
+      if (ETF_CONSTITUENTS[s.ticker]) return; // ETFs handled in second pass
+      const secB = secBiases?.[s.sectorId] || "neutral";
+      const sectorBias = secB==="bull"?0.009:secB==="bear"?-0.009:globalBias;
+      const sectorVm   = secB==="volatile"?3.5:secB==="neutral"?globalVm:1;
+      const vol   = rnd(0.004, 0.018) * s.volatility * sectorVm;
+      const drift = sectorBias + rnd(-vol, vol);
+      const shock = Math.random() < 0.03 ? rnd(-0.08, 0.1) : 0;
+      const flowPressure = liveOrderFlow[s.ticker]?.pressure || 0;
+      const flowImpact = flowPressure * (0.008 + (0.006 * Math.min(1.6, s.volatility || 1)));
+      newP[s.ticker] = Math.max(0.5, cur[s.ticker] * (1 + drift + shock + flowImpact));
+      newH[s.ticker] = [...hist[s.ticker].slice(1), newP[s.ticker]];
+    });
+    // Helper: price an ETF from its constituents using prices already in newP
+    const priceEtf = (etfStock) => {
+      const tickers = ETF_CONSTITUENTS[etfStock.ticker];
+      const avgChg = tickers.reduce((sum, t) => {
+        const prev = cur[t] || 1;
+        const next = newP[t] || prev;  // newP has constituent prices by now
+        return sum + (next - prev) / prev;
+      }, 0) / tickers.length;
+      const etfNoise = rnd(-0.001, 0.001);
+      newP[etfStock.ticker] = Math.max(0.5, cur[etfStock.ticker] * (1 + avgChg + etfNoise));
+      newH[etfStock.ticker] = [...hist[etfStock.ticker].slice(1), newP[etfStock.ticker]];
+    };
+    // Second pass: sector ETFs (constituents are all non-ETF stocks, already priced)
+    ALL_STOCKS.forEach(s => {
+      if (!ETF_CONSTITUENTS[s.ticker]) return;
+      if (s.crossSector || s.totalMarket) return; // handled in third pass
+      priceEtf(s);
+    });
+    // Third pass: cross-sector + total market ETFs (may reference sector ETFs from pass 2)
+    ALL_STOCKS.forEach(s => {
+      if (!ETF_CONSTITUENTS[s.ticker]) return;
+      if (!s.crossSector && !s.totalMarket) return;
+      priceEtf(s);
+    });
+    return { newP, newH, liveOrderFlow };
+  }, []);
+
+  // ─── AI BOT TRADES ────────────────────────────────────────────────────────────
+  const runBotTrades = useCallback(async (curP, curBots) => {
+    if (aiRef.current) return curBots;
+    aiRef.current = true;
+    const updated = curBots.map(b => ({ ...b, holdings:{...b.holdings} }));
+    const tickerList = ALL_STOCKS.map(s=>`${s.ticker}(${s.sectorLabel})`).join(",");
+    for (let i = 0; i < updated.length; i++) {
+      const b = updated[i];
+      const held  = Object.entries(b.holdings).map(([t,d])=>`${t}:${d?.qty||d}@$${fmt(curP[t])}`).join(",") || "none";
+      const prStr = ALL_STOCKS.slice(0,10).map(s=>`${s.ticker}=$${fmt(curP[s.ticker])}`).join(",");
+      try {
+        const res = await fetch("https://api.anthropic.com/v1/messages", {
+          method:"POST", headers:{"Content-Type":"application/json","anthropic-dangerous-direct-browser-access":"true"},
+          body:JSON.stringify({ model:"claude-sonnet-4-20250514", max_tokens:130,
+            system:`You are ${b.name}, a ${b.personality}. 35 stocks across 7 sectors available.
+Respond ONLY JSON no markdown: {"action":"buy"|"sell"|"hold","ticker":"TICKER","qty":NUMBER,"reason":"max 8 words"}
+qty 1-15. Use REAL tickers from: ${tickerList.slice(0,200)}`,
+            messages:[{role:"user",content:`Sample prices:${prStr}... Cash:$${fmt(b.cash)}. Holdings:${held}. Pick a trade.`}]
+          })
+        });
+        const data = await res.json();
+        const raw  = data.content?.[0]?.text || "{}";
+        const dec  = JSON.parse(raw.replace(/```[\w]*|```/g,"").trim());
+        const stk  = ALL_STOCKS.find(s=>s.ticker===dec.ticker);
+        if (!stk) continue;
+        if (dec.action==="buy" && dec.qty>0) {
+          const cost = curP[dec.ticker]*dec.qty;
+          if (b.cash>=cost) {
+            b.cash -= cost;
+            const ex = b.holdings[dec.ticker];
+            if (ex) { const tc=ex.totalCost+cost; b.holdings[dec.ticker]={qty:ex.qty+dec.qty,avgCost:tc/(ex.qty+dec.qty),totalCost:tc}; }
+            else b.holdings[dec.ticker]={qty:dec.qty,avgCost:curP[dec.ticker],totalCost:cost};
+            b.trades++;
+            pushTrade({team:b.name,teamColor:b.color,action:"BUY",ticker:dec.ticker,qty:dec.qty,price:curP[dec.ticker],time:nowShort()});
+          }
+        } else if (dec.action==="sell" && (b.holdings[dec.ticker]?.qty||0)>=dec.qty) {
+          const pos = b.holdings[dec.ticker];
+          const gain = (curP[dec.ticker]-pos.avgCost)*dec.qty;
+          b.cash += curP[dec.ticker]*dec.qty;
+          b.holdings[dec.ticker].qty -= dec.qty;
+          b.holdings[dec.ticker].totalCost -= pos.avgCost*dec.qty;
+          if (b.holdings[dec.ticker].qty<=0) delete b.holdings[dec.ticker];
+          b.trades++; b.closedTrades++;
+          if (gain>0) b.wins++;
+          pushTrade({team:b.name,teamColor:b.color,action:"SELL",ticker:dec.ticker,qty:dec.qty,price:curP[dec.ticker],time:nowShort()});
+        }
+        const hv = Object.values(b.holdings).reduce((s,p)=>s+(curP[p.ticker]||0)*(p?.qty||0),0) +
+          Object.keys(b.holdings).reduce((s,t)=>s+(curP[t]||0)*(b.holdings[t]?.qty||0),0);
+        const totalHv = Object.entries(b.holdings).reduce((s,[t,p])=>s+(curP[t]||0)*(p?.qty||0),0);
+        b.pnl = b.cash + totalHv - INITIAL_CASH;
+        if (b.cash+totalHv > b.peakValue) b.peakValue=b.cash+totalHv;
+        b.uniqueSectors = new Set(Object.keys(b.holdings).map(t=>ALL_STOCKS.find(s=>s.ticker===t)?.sectorId).filter(Boolean)).size;
+        // save bot score
+        const botTotal = b.cash + totalHv;
+        try { await window.storage.set(`lb:${b.name}`, JSON.stringify({
+          name:b.name, color:b.color, total:botTotal, cash:b.cash,
+          uniqueSectors:b.uniqueSectors, closedTrades:b.closedTrades, wins:b.wins,
+          maxDrawdown:1, isBot:true, updatedAt:nowShort() }), true); } catch {}
+        setAiLog(p=>[{time:nowShort(),trader:b.name,action:dec.action,ticker:dec.ticker,qty:dec.qty,reason:dec.reason,color:b.color},...p.slice(0,39)]);
+      } catch {}
+    }
+    aiRef.current = false;
+    return updated;
+  }, [pushTrade]);
+
+  // ─── TICK NEWS ────────────────────────────────────────────────────────────────
+  const genNews = useCallback(async (newP, prevP) => {
+    if (screenRef.current !== "gm") return;
+    const movers = ALL_STOCKS.map(s=>({...s,chg:((newP[s.ticker]-prevP[s.ticker])/(prevP[s.ticker]||1))*100}))
+      .filter(s=>Math.abs(s.chg)>2).sort((a,b)=>Math.abs(b.chg)-Math.abs(a.chg));
+    if (!movers.length) return;
+    const top = movers[0];
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages",{
+        method:"POST",headers:{"Content-Type":"application/json","anthropic-dangerous-direct-browser-access":"true"},
+        body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:70,
+          system:"Write a fake financial news headline. Max 14 words. No quotes. Headline only.",
+          messages:[{role:"user",content:`${top.name} (${top.ticker}, ${top.sectorLabel}) ${top.chg>0?"surged":"dropped"} ${fmt(Math.abs(top.chg))}%. One-line headline:`}]
+        })
+      });
+      const data = await res.json();
+      const h    = data.content?.[0]?.text?.trim() || "";
+      if (h) updateNewsFeed(prev => [{ticker:top.ticker,sectorId:top.sectorId,headline:h,
+        sentiment:top.chg>0?"bull":"bear",time:nowShort(),round:roundNum},...prev]);
+    } catch {}
+  }, [roundNum, updateNewsFeed]);
+
+
+    // ─── GAME TICK ────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (screen !== "gm" || gamePhase !== "running") return;
+    const id = setInterval(() => {
+      if (haltedRef.current && Date.now() < haltedRef.current) return;
+      if (["polling","revealing"].includes(predictionSessionRef.current?.phase)) return;
+      const curP = pricesRef.current;
+      const curH = historyRef.current;
+      const { newP, newH, liveOrderFlow } = advancePrices(curP, curH, sentimentRef.current, sectorBiasRef.current);
+      setPrevPrices(curP);
+      setPrices(newP);
+      setHistory(newH);
+      setSharedOrderFlowSnapshot(liveOrderFlow || {});
+      setTick(t => t + 1);
+      genNews(newP, curP);
+      pushPrices(newP, newH);
+      pushOrderFlow(liveOrderFlow || {});
+      if (tickRef.current % 2 === 0) {
+        setBots(prevB => { runBotTrades(newP, prevB).then(u => setBots(u)); return prevB; });
+      }
+    }, TICK_MS);
+    return () => clearInterval(id);
+  }, [screen, gamePhase, advancePrices, genNews, pushOrderFlow, pushPrices, runBotTrades]);
+
+  // ─── ROUND END ────────────────────────────────────────────────────────────────
+  const generateDisruptionRef = useRef(null); // wired after generateDisruption is defined below
+  const triggerRoundEnd = useCallback(async () => {
+    if (["buffer","disruption","ceremony","ended"].includes(phaseRef.current)) return;
+    const isFinalRound = roundNum >= TOTAL_ROUNDS;
+    const settlementEndsAt = isFinalRound ? Date.now() + DERIVATIVE_SETTLEMENT_VIEW_SECS * 1000 : null;
+    setGamePhase(isFinalRound ? "ceremony" : "idle");
+    setRoundEndsAt(null);
+    setSettlementViewEndsAt(settlementEndsAt);
+    setSettlementViewRound(isFinalRound ? roundNum : null);
+    pushGMState({
+      phase: isFinalRound ? "ceremony" : "idle",
+      roundLeft:0,
+      roundEndsAt:null,
+      settlementViewEndsAt: settlementEndsAt,
+      settlementViewRound: isFinalRound ? roundNum : null,
+    });
+    const lb = await loadLB();
+    const botEntries = bots.map(b => {
+      const hv = Object.entries(b.holdings).reduce((s,[t,p])=>s+(pricesRef.current[t]||0)*(p?.qty||0),0);
+      return { name:b.name,color:b.color,total:b.cash+hv,cash:b.cash,
+        uniqueSectors:b.uniqueSectors||0,closedTrades:b.closedTrades||0,
+        wins:b.wins||0,maxDrawdown:1,isBot:true };
+    });
+    const all = [...lb.filter(e=>!e.isBot),...botEntries];
+    const rules = ROUND_RULES[roundNum-1] || ROUND_RULES[0];
+    // Calculate tax for this round
+    if (!isFinalRound) {
+      const nextRules = ROUND_RULES[roundNum] || ROUND_RULES[ROUND_RULES.length - 1];
+      if (nextRules) {
+        sendBcast(
+          `📉 NEXT REGIME: ${nextRules.name}. Margin ${Math.round((nextRules.maintenanceMargin || 0) * 100)}% · Borrow ${(nextRules.borrowRate || 0) * 100}% · Funding ${(nextRules.fundingRate || 0) * 100}%.`
+        );
+      }
+    }
+    // Achievements check
+    const newAch = [];
+    const currentDerivativeQuoteMap = buildDerivativeQuoteMapForRound({
+      round: activeLedgerRoundRef.current || roundNum,
+      prices: pricesRef.current,
+      roundRule: rules,
+      timeLeft: timeLeftRef.current || 0,
+      roundDur: roundDurationsRef.current?.[(activeLedgerRoundRef.current || roundNum) - 1] || DEFAULT_ROUND_DURATIONS[Math.max(0, (activeLedgerRoundRef.current || roundNum) - 1)] || roundDur,
+      gamePhase: phaseRef.current,
+      roundBases: roundDerivativeBaseRef.current,
+    });
+    const currentEquity = calcNetEquityFromState({
+      cash,
+      restrictedCash: restrictedCashRef.current,
+      holdings,
+      prices: pricesRef.current,
+      derivativePositions: derivativePositionsRef.current,
+      derivativeQuoteMap: currentDerivativeQuoteMap,
+      accruedBorrowCost: accruedBorrowCostRef.current,
+      accruedFundingCost: accruedFundingCostRef.current,
+    });
+    const roundProfit = currentEquity - INITIAL_CASH;
+    if (sentiment === "bear" && roundProfit > 0) newAch.push({ id:"bull_whisperer", icon:"🐂", name:"Bull Whisperer", desc:"Profited in a BEAR round — against the trend" });
+    // Prediction market result
+    const pq = PREDICTION_QUESTIONS.find(q => q.round === roundNum);
+    if (pq && playerPrediction && playerPredictionRound === roundNum) {
+      if (playerPrediction === pq.correct) {
+        newAch.push({ id:`pred_correct_r${roundNum}`, icon:"🎯", name:"Market Oracle", desc:`Correct prediction: ${pq.concept}` });
+        const bonus = Math.round(currentEquity * pq.bonus);
+        setCash(c => c + bonus);
+        predCorrectCount.current.correct += 1;
+        sendBcast(`🎯 ${currentTeam?.name} predicted correctly! +${Math.round(pq.bonus*100)}% capital bonus applied.`);
+        setPredResult({ correct:true, answer:pq.options.find(o=>o.id===pq.correct)?.text, explanation:pq.explanation, bonus });
+      } else {
+        setPredResult({ correct:false, answer:pq.options.find(o=>o.id===pq.correct)?.text, explanation:pq.explanation, bonus:0 });
+      }
+      predCorrectCount.current.total += 1;
+    }
+    setAchievements(prev => {
+      const ids = prev.map(a=>a.id);
+      return [...prev, ...newAch.filter(a=>!ids.includes(a.id))];
+    });
+    const allScored = all.map(e => ({ ...e, ...calcScore(e, initCash, all) }));
+    setWinnerRanked(sortLeaderboard(allScored));
+    // Only show ceremony after the final round
+    if (isFinalRound) {
+      setShowCeremony(true);
+      sendBcast(`🏆 GAME OVER! Final results are in — check the leaderboard!`);
+    } else {
+      // Automatically generate disruption for next round — no GM needed
+      sendBcast(`⏱ ROUND ${roundNum} ENDED — Preparing next round automatically…`);
+      // generateDisruption will be called via the ref below after state settles
+      setTimeout(() => { generateDisruptionRef.current?.(); }, 800);
+    }
+    setPlayerPrediction(null);
+    setPlayerPredictionRound(null);
+    setPlayerPredictionSessionId(null);
+  }, [bots, currentTeam?.name, initCash, loadLB, pushGMState, roundNum, cash, holdings, playerPrediction, playerPredictionRound, sentiment, sendBcast]);
+  triggerRoundEndRef.current = triggerRoundEnd;
+
+  const getRoundStoryline = useCallback((targetRound) => {
+    const safeRound = Math.min(Math.max(targetRound || 1, 1), ROUND_STORYLINES.length);
+    return ROUND_STORYLINES[safeRound - 1] || ROUND_STORYLINES[0];
+  }, []);
+
+  const buildStorylineStockCopy = useCallback((storyEvent, stock, sector, impact) => {
+    const isPositive = impact > 0;
+    const positiveCopy = {
+      rates: `${stock.name} benefits as capital rotates toward rate resilience`,
+      trade: `${stock.name} gains on domestic-policy and procurement tailwinds`,
+      oil: `${stock.name} benefits from the energy-security repricing`,
+      funding: `${stock.name} catches relief as funding stress eases`,
+      election: `${stock.name} rises on election-year policy tailwinds`,
+      credit: `${stock.name} attracts defensive capital in the credit scare`,
+      repricing: `${stock.name} gains as liquidity relief changes the tape`,
+    };
+    const negativeCopy = {
+      rates: `${stock.name} reprices under higher discount rates`,
+      trade: `${stock.name} faces export, compliance, and supply-chain pressure`,
+      oil: `${stock.name} absorbs oil-shock cost pressure`,
+      funding: `${stock.name} weakens as Washington funding stress spreads`,
+      election: `${stock.name} slips as campaign rhetoric targets the sector`,
+      credit: `${stock.name} sells off as credit stress tightens the vise`,
+      repricing: `${stock.name} falls as stagflation reprices risk assets`,
+    };
+    return {
+      headline: (isPositive ? positiveCopy : negativeCopy)[storyEvent.theme] || `${stock.name} reacts to the latest macro turn`,
+      detail: storyEvent.subheadline || `${sector.label} is repricing under the round storyline.`,
+    };
+  }, []);
+
+  const buildStorylineEvents = useCallback((storyEvent, { maxStocks = 6, stocksPerSector = 2, includeChallenge = true } = {}) => {
+    if (!storyEvent) return [];
+    let sharedQuestion = storyEvent.question || null;
+    if (!sharedQuestion && includeChallenge) {
+      const macroQuestion = getRandomPoliticalShockQuestion(lastPoliticalShockQuestionIdRef.current);
+      lastPoliticalShockQuestionIdRef.current = macroQuestion?.id || null;
+      sharedQuestion = macroQuestion?.prompt || null;
+    }
+    const rankedSectors = Object.entries(storyEvent.sectorMap || {})
+      .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+    const events = [];
+
+    rankedSectors.forEach(([sectorId, sectorImpact]) => {
+      if (events.length >= maxStocks || Math.abs(sectorImpact) < 4) return;
+      const sector = SECTORS.find(item => item.id === sectorId);
+      if (!sector) return;
+      sector.stocks.slice(0, stocksPerSector).forEach((stock, idx) => {
+        if (events.length >= maxStocks) return;
+        const variance = idx === 0 ? rnd(-3, 3) : rnd(-5, 5);
+        const impact = Math.round(clamp(sectorImpact + variance, -45, 45));
+        const copy = buildStorylineStockCopy(storyEvent, stock, sector, impact);
+        events.push({
+          ticker: stock.ticker,
+          sectorId,
+          headline: copy.headline,
+          detail: copy.detail,
+          impact,
+          political: true,
+          storyline: true,
+          theme: storyEvent.theme,
+          eventName: storyEvent.headline,
+          eventSubheadline: storyEvent.subheadline,
+          eventIcon: storyEvent.icon,
+          concept: storyEvent.concept,
+          macroQuestion: includeChallenge ? sharedQuestion : null,
+          playerClues: getMacroInferenceClues({ theme: storyEvent.theme, isStoryline: true }),
+          sectorMap: storyEvent.sectorMap || {},
+          storylineBlurb: storyEvent.storylineBlurb || storyEvent.subheadline,
+          eventTag: storyEvent.tag || (storyEvent.stage === "opening" ? "ROUND STORY" : "STORYLINE UPDATE"),
+          storylineStage: storyEvent.stage || "opening",
+          storylineRound: storyEvent.round,
+          storylineId: storyEvent.id,
+        });
+      });
+    });
+    return events;
+  }, [buildStorylineStockCopy]);
+
+  const applyStorylineEventPack = useCallback((events, { tagOverride = null, broadcastText = null } = {}) => {
+    if (!events?.length) return;
+    const cur = pricesRef.current;
+    const next = { ...cur };
+    events.forEach(evt => {
+      if (next[evt.ticker] != null) {
+        next[evt.ticker] = Math.max(0.5, next[evt.ticker] * (1 + evt.impact / 100));
+      }
+    });
+    setPrices(next);
+    setHistory(prev => {
+      const newH = { ...prev };
+      events.forEach(evt => {
+        if (newH[evt.ticker]) newH[evt.ticker] = [...newH[evt.ticker].slice(1), next[evt.ticker]];
+      });
+      pushPrices(next, newH);
+      return newH;
+    });
+    setSectorDisruptions(prev => {
+      const nextDisruptions = { ...prev };
+      events.forEach(evt => {
+        const existing = nextDisruptions[evt.sectorId] || [];
+        nextDisruptions[evt.sectorId] = [evt, ...existing.filter(item => item.ticker !== evt.ticker)].slice(0, 3);
+      });
+      return nextDisruptions;
+    });
+    const macroNews = buildMacroNewsEntry(events, {
+      sourceLabel: "STORYLINE UPDATE",
+      targetRound: events[0]?.storylineRound || roundNum,
+      tagOverride: tagOverride || events[0]?.eventTag || "STORYLINE UPDATE",
+    });
+    updateNewsFeed(prev => macroNews ? [macroNews, ...prev] : prev);
+    if (broadcastText) sendBcast(broadcastText);
+  }, [pushPrices, roundNum, sendBcast, updateNewsFeed]);
+
+  // ─── GENERATE ROUND STORYLINE BUFFER ─────────────────────────────────────────
+  const generateDisruption = useCallback(async () => {
+    setGenerating(true);
+    const targetRound = Math.min(gameStartedRef.current ? roundNum + 1 : 1, TOTAL_ROUNDS);
+    const storyline = getRoundStoryline(targetRound);
+    const events = buildStorylineEvents(storyline?.opening, { maxStocks: 6, stocksPerSector: 2, includeChallenge: true });
+
+    setSectorDisruptions({});
+    setDisruptions(events);
+    await pushDisrupts(events);
+    archiveDisruptionsOnce(events, "BUFFER EVENT");
+    setGenerating(false);
+    setShowCeremony(false);
+    const now = Date.now();
+    const endsAt = now + BUFFER_SECS * 1000;
+    const settlementEndsAt = now + DERIVATIVE_SETTLEMENT_VIEW_SECS * 1000;
+    currentBufferDurationRef.current = BUFFER_SECS;
+    setBufferStart(now);
+    setBufferLeft(BUFFER_SECS);
+    setBufferEndsAt(endsAt);
+    setSettlementViewEndsAt(settlementEndsAt);
+    setSettlementViewRound(roundNum);
+    setRoundEndsAt(null);
+    setGamePhase("buffer");
+    pushGMState({
+      phase:"buffer",
+      roundLeft:0,
+      roundEndsAt:null,
+      bufferLeft:BUFFER_SECS,
+      bufferEndsAt:endsAt,
+      settlementViewEndsAt: settlementEndsAt,
+      settlementViewRound: roundNum,
+    });
+    setShowEmergency(true);
+  }, [archiveDisruptionsOnce, buildStorylineEvents, getRoundStoryline, pushDisrupts, pushGMState, roundNum]);
+  generateDisruptionRef.current = generateDisruption;
+
+  const generatePoliticalDisruption = useCallback(async (eventIdxOrEvent) => {
+    const evt = typeof eventIdxOrEvent === "object" && eventIdxOrEvent
+      ? eventIdxOrEvent
+      : POLITICAL_EVENTS[eventIdxOrEvent ?? polEventIdx];
+    if (!evt) return;
+    setGeneratingPol(true);
+
+    // Build affected stocks: pick 1-2 stocks per impacted sector, weighted by impact magnitude
+    const affectedStocks = [];
+    for (const [sectorId, sectorImpact] of Object.entries(evt.sectors)) {
+      if (Math.abs(sectorImpact) < 5) continue; // skip negligible impacts
+      const sector = SECTORS.find(s => s.id === sectorId);
+      if (!sector) continue;
+      // Pick the 2 most representative stocks from this sector
+      const picks = sector.stocks.slice(0, 2);
+      for (const st of picks) {
+        // Add some variance per stock within the sector impact
+        const variance = rnd(-8, 8);
+        const stockImpact = Math.round(clamp(sectorImpact + variance, -60, 60));
+        affectedStocks.push({ ...st, sectorId, sectorLabel: sector.label, impact: stockImpact });
+      }
+    }
+
+    // Generate AI narrative for the political event
+    const macroQuestion = getRandomPoliticalShockQuestion(lastPoliticalShockQuestionIdRef.current);
+    lastPoliticalShockQuestionIdRef.current = macroQuestion?.id || null;
+    const events = [];
+    for (const st of affectedStocks) {
+      try {
+        const res = await fetch("https://api.anthropic.com/v1/messages", {
+          method:"POST",
+          headers:{"Content-Type":"application/json","anthropic-dangerous-direct-browser-access":"true"},
+          body: JSON.stringify({
+            model:"claude-sonnet-4-20250514", max_tokens:150,
+            system:`Respond ONLY with valid JSON: {"headline":"max 12 words","detail":"max 15 words"}`,
+            messages:[{ role:"user", content:
+              `Macro-economic event: "${evt.headline}". ` +
+              `Write a realistic follow-up consequence headline (under 12 words) for ${st.name}. ` +
+              `Do NOT mention stock prices, % moves, or signal direction. ` +
+              `Be factual — players must infer implications from economic reasoning. ` +
+              `Underlying direction: ${st.impact > 0 ? "positive" : "negative"} — do not reveal.`
+            }]
+          })
+        });
+        const data = await res.json();
+        const raw = (data.content?.[0]?.text || "{}").replace(/```[\w]*|```/g,"").trim();
+        const parsed = JSON.parse(raw.match(/\{[\s\S]*\}/)?.[0] || "{}");
+        events.push({
+          ticker: st.ticker,
+          sectorId: st.sectorId,
+          headline: parsed.headline || `${evt.headline.slice(0,50)} — consequences emerge`,
+          detail: parsed.detail || evt.subheadline,
+          impact: st.impact,
+          political: true,
+          eventName: evt.headline,
+          eventSubheadline: evt.subheadline,
+          eventIcon: evt.icon,
+          concept: evt.concept, // GM-only, not shown to players
+          macroQuestion: macroQuestion?.prompt,
+          playerClues: getMacroInferenceClues(),
+        });
+      } catch {
+        events.push({
+          ticker: st.ticker,
+          sectorId: st.sectorId,
+          headline: `${evt.headline.slice(0,50)} — ${st.name}`,
+          detail: evt.subheadline,
+          impact: st.impact,
+          political: true,
+          eventName: evt.headline,
+          eventSubheadline: evt.subheadline,
+          eventIcon: evt.icon,
+          concept: evt.concept,
+          macroQuestion: macroQuestion?.prompt,
+          playerClues: getMacroInferenceClues(),
+        });
+      }
+    }
+
+    setDisruptions(events);
+    await pushDisrupts(events);
+    archiveDisruptionsOnce(events, "POLITICAL EVENT");
+    setGeneratingPol(false);
+    setShowCeremony(false);
+    const now = Date.now();
+    const endsAt = now + POLITICAL_BUFFER_SECS * 1000;
+    currentBufferDurationRef.current = POLITICAL_BUFFER_SECS; // 30s buffer for GM political shock
+    setBufferStart(now); setBufferLeft(POLITICAL_BUFFER_SECS); setBufferEndsAt(endsAt); setRoundEndsAt(null);
+    setSettlementViewEndsAt(null); setSettlementViewRound(null);
+    setGamePhase("buffer");
+    pushGMState({
+      phase:"buffer",
+      roundLeft:0,
+      roundEndsAt:null,
+      bufferLeft:POLITICAL_BUFFER_SECS,
+      bufferEndsAt:endsAt,
+      settlementViewEndsAt:null,
+      settlementViewRound:null,
+    });
+    setShowEmergency(true);
+    sendBcast(`📊 MACRO EVENT: ${evt.icon} ${evt.headline}`);
+  }, [archiveDisruptionsOnce, polEventIdx, pushDisrupts, pushGMState, sendBcast]);
+
+    const applyDisruption = useCallback(() => {
+    const cur  = pricesRef.current;
+    const next = { ...cur };
+    disruptions.forEach(evt => {
+      if (next[evt.ticker]) next[evt.ticker] = Math.max(0.5, next[evt.ticker] * (1 + evt.impact / 100));
+    });
+    setPrices(next);
+    setHistory(prevH => {
+      const newH = { ...prevH };
+      disruptions.forEach(evt => {
+        if (newH[evt.ticker]) newH[evt.ticker] = [...newH[evt.ticker].slice(1), next[evt.ticker]];
+      });
+      pushPrices(next, newH); return newH;
+    });
+    const bulletin = disruptions[0]?.eventName
+      ? `${disruptions[0].eventIcon ? `${disruptions[0].eventIcon} ` : ""}${disruptions[0].eventName}`
+      : disruptions.map(e => `${e.ticker} ${e.impact>0?"+":""}${e.impact}%`).join(" · ");
+    sendBcast(`🚨 ${bulletin} — Round ${roundNum+1} begins.`);
+  }, [disruptions, pushPrices, sendBcast, roundNum]);
+
+  const startNextRound = useCallback(() => {
+    const next = gameStartedRef.current ? roundNum + 1 : 1;
+    if (next > TOTAL_ROUNDS) {
+      setGamePhase("ended"); pushGMState({ phase:"ended", allEnded:true });
+      setShowEmergency(false); return;
+    }
+    const rules = ROUND_RULES[next-1] || ROUND_RULES[ROUND_RULES.length-1];
+    setRoundRules(rules);
+
+    const portfolioReset = getRoundTransitionPortfolioReset(roundNum, next);
+    setPortfolioResetSignal(portfolioReset);
+    if (portfolioReset) {
+      applyPortfolioReset(portfolioReset);
+    }
+
+    // Apply round identity: volatility, sentiment lock, leaderboard hide
+    setVolMultiplier(rules.volMult || 1.0);
+    setLeaderHidden(rules.leaderHidden || false);
+    if (rules.sentLock) {
+      setSentiment(rules.sentLock);
+      sendBcast(`🔒 SENTIMENT LOCKED: ${rules.sentLock.toUpperCase()} for Round ${next} — ${rules.name}!`);
+    }
+
+    // Announce round identity
+    sendBcast(`🎯 ROUND ${next}: ${rules.icon} ${rules.name} — ${rules.briefing}`);
+    gameStartedRef.current = true;  // mark game as started so subsequent rounds increment correctly
+    setShowEmergency(false); setDisruptions([]); setSectorDisruptions({}); setActiveDisruptSectors(new Set()); setRoundNum(next);
+    pushDisrupts([]);
+    const st = Date.now(); setStartTime(st); setGamePhase("running");
+    const thisDur = roundDurations[next-1] || roundDur;
+    const endsAt = st + thisDur * 1000;
+    setRoundEndsAt(endsAt);
+    setTimeLeft(thisDur); setBufferLeft(null); setBufferStart(null); setBufferEndsAt(null);
+    setSettlementViewEndsAt(null); setSettlementViewRound(null); setSettlementViewLeft(null);
+    // Close prediction market
+    archivedDisruptionKeyRef.current = null;
+    setFrozenUntil(null); setHaltedUntil(null);
+    setMarginStatus("safe");
+    setMarginAlert(null);
+    setPredictionOpen(false); setPredictionSession({ phase:"closed" }); setPredResult(null);
+    pushPrediction({ phase:"closed" });
+    pushGMState({ phase:"running", round:next, roundLeft:thisDur, roundEndsAt:endsAt,
+      bufferLeft:0, bufferEndsAt:null, volMultiplier:rules.volMult||1.0, leaderHidden:rules.leaderHidden||false,
+      frozenUntil:null, haltedUntil:null, predictionOpen:false, portfolioReset,
+      settlementViewEndsAt:null, settlementViewRound:null });
+    // Schedule automated in-round AI disruptions via ref (defined after this callback)
+    scheduleInRoundDisruptionsRef.current?.(next - 1, thisDur, st);
+  }, [applyPortfolioReset, roundNum, roundDurations, roundDur,
+      sendBcast, pushDisrupts, pushGMState, pushPrediction]);
+  startNextRoundRef.current = startNextRound;
+
+  // ─── AUTOMATED IN-ROUND STORYLINE BEATS ──────────────────────────────────────
+  const autoDisruptionTimers = useRef([]);
+
+  const scheduleInRoundDisruptions = useCallback((roundIndex, roundDuration, roundStartTime) => {
+    autoDisruptionTimers.current.forEach(t => clearTimeout(t));
+    autoDisruptionTimers.current = [];
+    const storyline = getRoundStoryline(roundIndex + 1);
+    const beats = storyline?.beats || [];
+    beats.forEach(beat => {
+      const delayMs = Math.max(2500, Math.floor((beat.at || 0.5) * roundDuration * 1000));
+      if (delayMs >= roundDuration * 1000) return;
+      const timer = setTimeout(() => {
+        if (phaseRef.current !== "running") return;
+        const events = buildStorylineEvents(beat, { maxStocks: 4, stocksPerSector: 1, includeChallenge: false });
+        applyStorylineEventPack(events, { tagOverride: beat.tag || "STORYLINE UPDATE" });
+      }, delayMs);
+      autoDisruptionTimers.current.push(timer);
+    });
+  }, [applyStorylineEventPack, buildStorylineEvents, getRoundStoryline]);
+  scheduleInRoundDisruptionsRef.current = scheduleInRoundDisruptions;
+
+  // ─── SECTOR AUTOMATION ────────────────────────────────────────────────────────
+  const generateSectorNews = useCallback(async (sectorId, bias) => {
+    const sector = SECTORS.find(s => s.id === sectorId);
+    if (!sector) return;
+    setGeneratingSector(sectorId);
+    const events = [];
+
+    for (const st of sector.stocks.slice(0, 3)) {
+      const isBull = bias === "bull" || (bias === "volatile" && Math.random() > 0.45);
+      const impact = isBull ? rnd(8, 28) : -rnd(8, 28);
+      let headline = `${isBull ? "Surge" : "Crash"} hits ${st.name} amid sector upheaval`;
+      let detail   = "Analysts rapidly reassessing sector valuations.";
+
+      try {
+        const res = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "anthropic-dangerous-direct-browser-access": "true"
+          },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-20250514",
+            max_tokens: 200,
+            system: "You generate dramatic market disruption news for a stock simulation game. Respond ONLY with a valid JSON object. No markdown, no code fences. Format: {headline: string, detail: string}",
+            messages: [{
+              role: "user",
+              content: `Write a ${isBull ? "BULLISH" : "BEARISH"} breaking news event for ${st.name} (${st.ticker}) in the ${sector.label} sector that justifies a ${Math.abs(impact).toFixed(0)}% price ${isBull ? "surge" : "crash"}. Keep headline under 13 words, detail under 20 words. Be dramatic and company-specific.`
+            }]
+          })
+        });
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const rawText = data?.content?.[0]?.text || "";
+
+        // Robust JSON extraction — strip markdown fences and find first { ... }
+        const cleaned = rawText.replace(/```[\w]*/g, "").replace(/```/g, "").trim();
+        const match   = cleaned.match(/\{[\s\S]*\}/);
+        if (match) {
+          const parsed = JSON.parse(match[0]);
+          if (parsed.headline) headline = parsed.headline;
+          if (parsed.detail)   detail   = parsed.detail;
+        }
+      } catch (err) {
+        // Fallback headlines so the game never breaks
+        const bullHeadlines = [
+          `${st.name} reports record-breaking quarterly results`,
+          `Major institutional investors flood into ${st.ticker}`,
+          `${sector.label} sector surges on regulatory approval`,
+        ];
+        const bearHeadlines = [
+          `${st.name} faces unexpected regulatory investigation`,
+          `${st.ticker} misses earnings amid sector headwinds`,
+          `Analysts downgrade ${sector.label} sector outlook sharply`,
+        ];
+        const pool = isBull ? bullHeadlines : bearHeadlines;
+        headline = pool[Math.floor(Math.random() * pool.length)];
+      }
+
+      events.push({
+        ticker: st.ticker,
+        sectorId,
+        headline,
+        detail,
+        impact: Math.round(impact)
+      });
+    }
+
+    // Store disruption events
+    setSectorDisruptions(prev => ({ ...prev, [sectorId]: events }));
+
+    // Apply price shocks — use functional updates separately to avoid nesting
+    const priceUpdates = {};
+    events.forEach(evt => { priceUpdates[evt.ticker] = evt.impact; });
+
+    const curPForSector = pricesRef.current;
+    const nextPForSector = { ...curPForSector };
+    Object.entries(priceUpdates).forEach(([ticker, impactPct]) => {
+      if (nextPForSector[ticker] != null)
+        nextPForSector[ticker] = Math.max(0.5, nextPForSector[ticker] * (1 + impactPct / 100));
+    });
+    setPrices(nextPForSector);
+    setHistory(prev => {
+      const newH = { ...prev };
+      events.forEach(evt => {
+        if (newH[evt.ticker])
+          newH[evt.ticker] = [...newH[evt.ticker].slice(1), nextPForSector[evt.ticker] || Math.max(0.5, (curPForSector[evt.ticker] || 1) * (1 + evt.impact / 100))];
+      });
+      return newH;
+    });
+
+    // Push updated prices to central display
+    setTimeout(() => pushPrices(pricesRef.current, undefined), 100);
+
+    // Add to news feed
+    const timeStr = nowShort();
+    updateNewsFeed(prev => [
+      ...events.map(evt => ({
+        ticker: evt.ticker,
+        sectorId,
+        headline: evt.headline,
+        detail: evt.detail,
+        sentiment: evt.impact > 0 ? "bull" : "bear",
+        tag: "SECTOR NEWS",
+        time: timeStr,
+        round: roundNum,
+      })),
+      ...prev
+    ]);
+
+    // Broadcast to all players
+    const modeLabel = bias === "bull" ? "BULLISH SURGE" : bias === "bear" ? "BEARISH CRASH" : "VOLATILE SWING";
+    const summary   = events.map(e => `${e.ticker} ${e.impact > 0 ? "+" : ""}${e.impact}%`).join(" · ");
+    sendBcast(`${sector.icon} ${sector.label} ${modeLabel}: ${summary}`);
+
+    setGeneratingSector(null);
+  }, [pushPrices, roundNum, sendBcast, updateNewsFeed]);
+
+  // ─── LEGACY SECTOR AUTOMATION SAFETY KILL-SWITCH ────────────────────────────
+  // The new round-storyline system owns automated disruptions. If any stale
+  // sector automation state survives in-memory, clear it so the old engine
+  // cannot keep injecting generic shocks.
+  useEffect(() => {
+    if (activeDisruptSectors.size === 0) return;
+    setActiveDisruptSectors(new Set());
+  }, [activeDisruptSectors]);
+
+    // ─── GM COMMANDS ──────────────────────────────────────────────────────────────
+  const gmCmd = useCallback((cmd, payload={}) => {
+    if (cmd==="start")     {
+      const st = Date.now();
+      const endsAt = st + roundDur * 1000;
+      setStartTime(st);
+      setRoundEndsAt(endsAt);
+      setGamePhase("running");
+      setTimeLeft(roundDur);
+      pushGMState({ phase:"running", round:roundNum, roundLeft:roundDur, roundEndsAt:endsAt });
+    }
+    else if(cmd==="pause") {
+      const pausedLeft = roundEndsAtRef.current
+        ? Math.max(0, Math.ceil((roundEndsAtRef.current - Date.now()) / 1000))
+        : (timeLeftRef.current || 0);
+      setTimeLeft(pausedLeft);
+      setRoundEndsAt(null);
+      setGamePhase("paused");
+      pushGMState({ phase:"paused", roundLeft:pausedLeft, roundEndsAt:null });
+    }
+    else if(cmd==="resume"){
+      const resumeLeft = Math.max(0, timeLeftRef.current || roundDur);
+      const st = Date.now();
+      const endsAt = st + resumeLeft * 1000;
+      setStartTime(st);
+      setRoundEndsAt(endsAt);
+      setGamePhase("running");
+      setTimeLeft(resumeLeft);
+      pushGMState({ phase:"running", roundLeft:resumeLeft, roundEndsAt:endsAt });
+    }
+    else if(cmd==="stop")  {
+      setGamePhase("idle");
+      setRoundEndsAt(null);
+      setTimeLeft(null);
+      pushGMState({ phase:"idle", roundLeft:null, roundEndsAt:null });
+    }
+    else if(cmd==="forceEnd") { triggerRoundEnd(); }
+    else if(cmd==="shock") {
+      const cur  = pricesRef.current;
+      const next = { ...cur, [payload.ticker]: Math.max(0.5, cur[payload.ticker] * (1 + payload.pct / 100)) };
+      setPrices(next);
+      setHistory(prevH => {
+        const h = { ...prevH, [payload.ticker]: [...prevH[payload.ticker].slice(1), next[payload.ticker]] };
+        pushPrices(next, h); return h;
+      });
+    }
+    else if(cmd==="sentiment") { setSentiment(payload.s); pushGMState({sentiment:payload.s}); }
+    else if(cmd==="reset") {
+      const newP = initPrices(), newH = initHistory(newP);
+      const resetCash = payload.cash || initCash;
+      // Reset all game state
+      setPrices(newP); setHistory(newH); setPrevPrices(newP);
+      setBots(initBots()); setAiLog([]); setNews([]);
+      setCash(resetCash); setHoldings({}); setTransactions([]);
+      setDerivativePositions({}); setDerivativeTransactions([]);
+      setSelectedDerivativeId(null);
+      setTick(0); setRoundNum(1); setStartTime(null); setRoundEndsAt(null); setTimeLeft(null);
+      tradeTapeRef.current = [];
+      syntheticOrderFlowRef.current = {};
+      seenTradeFeedKeysRef.current = new Set();
+      orderFlowRef.current = {};
+      setOrderFlowSnapshot({});
+      setSharedOrderFlowSnapshot({});
+      gameStartedRef.current = false;
+      setRoundDurations([...DEFAULT_ROUND_DURATIONS]);
+      setBufferLeft(null); setBufferStart(null); setBufferEndsAt(null); setGamePhase("idle");
+      setSettlementViewEndsAt(null); setSettlementViewRound(null); setSettlementViewLeft(null);
+      // Clear all overlay modals
+      setShowCeremony(false); setShowEmergency(false); setShowBlast(false);
+      setDisruptions([]); setWinnerRanked([]);
+      setPeakValue(resetCash); setMaxDrawdown(0);
+      setFrozenUntil(null); setHaltedUntil(null);
+      setPortfolioResetSignal(null);
+      processedPortfolioResetRef.current = null;
+      clearScoreLedgerState(resetCash);
+      predCorrectCount.current = { total: 0, correct: 0 };
+      setPredictionOpen(false); setPredictionSession({ phase:"closed" });
+      setPlayerPrediction(null); setPlayerPredictionRound(null); setPlayerPredictionSessionId(null);
+      setPredResult(null); setNews([]);
+      // Reset sector state
+      setSectorBiases(Object.fromEntries(SECTORS.map(s=>[s.id,"neutral"])));
+      setActiveDisruptSectors(new Set());
+      setSectorDisruptions({});
+      setSelectedSectors(new Set());
+      setSentiment("neutral");
+      // Reset player-side round tracking ref so carry logic works on next game
+      prevRoundRef.current = 0;
+      usedCardsRef.current = new Set();
+      setUsedCards(new Set());
+      // Clear leaderboard scores from shared storage
+      (async () => {
+        try {
+          const res = await window.storage.list("lb:", true);
+          const keys = res?.keys || [];
+          await Promise.all(keys.map(k => window.storage.delete(k, true)));
+          const tradeRes = await window.storage.list(TRADE_FEED_PREFIX, true);
+          const tradeKeys = tradeRes?.keys || [];
+          await Promise.all(tradeKeys.map(k => window.storage.delete(k, true)));
+          await window.storage.delete("cd:trades", true);
+          await window.storage.delete(GM_ORDER_FLOW_KEY, true);
+        } catch {}
+      })();
+      pushPrices(newP, newH);
+      pushOrderFlow({});
+      pushDisrupts([]);
+      pushNews([]);
+      pushPrediction({ phase:"closed" });
+      pushGMState({ phase:"idle", round:1, roundLeft:null, roundEndsAt:null, bufferLeft:null, allEnded:false, sentiment:"neutral",
+        bufferEndsAt:null, frozenUntil:null, haltedUntil:null, predictionOpen:false, portfolioReset:null,
+        settlementViewEndsAt:null, settlementViewRound:null });
+    }
+    else if(cmd==="broadcast") { sendBcast(payload.text); }
+    else if(cmd==="powerup") {
+      const card = POWERUP_CARDS.find(c=>c.id===payload.id);
+      if (!card || usedCardsRef.current.has(card.id)) return;
+      usedCardsRef.current = new Set([...usedCardsRef.current, card.id]);
+      setUsedCards(new Set(usedCardsRef.current));
+      setActivePowerup(card);
+      setTimeout(() => setActivePowerup(null), 4000);
+      if (card.effect.type === "market") {
+        // Tsunami: crash everything
+        const cur = pricesRef.current;
+        const next2 = {};
+        ALL_STOCKS.forEach(s => { next2[s.ticker] = Math.max(0.5, cur[s.ticker]*(1+card.effect.pct/100)); });
+        setPrices(next2);
+        setHistory(prevH => {
+          const newH = {...prevH};
+          ALL_STOCKS.forEach(s => { newH[s.ticker]=[...newH[s.ticker].slice(1), next2[s.ticker]]; });
+          pushPrices(next2, newH); return newH;
+        });
+        sendBcast(`🌊 TSUNAMI CARD! Entire market ${card.effect.pct}% — chaos reigns!`);
+      } else if (card.effect.type === "spike") {
+        // Moon Shot: random stock +40% then corrects
+        const target = ALL_STOCKS.filter(s=>!s.constituents)[Math.floor(Math.random()*35)];
+        const cur = pricesRef.current;
+        const spiked = Math.max(0.5, cur[target.ticker]*(1+card.effect.pct/100));
+        setPrices(p => ({...p, [target.ticker]:spiked}));
+        sendBcast(`🚀 MOON SHOT! ${target.ticker} surges ${card.effect.pct}% for 60 seconds!`);
+        setTimeout(() => {
+          setPrices(p => ({...p, [target.ticker]: Math.max(0.5, spiked*0.75)}));
+          sendBcast(`📉 Moon Shot correction — ${target.ticker} pulling back.`);
+        }, card.effect.duration * 1000);
+      } else if (card.effect.type === "circuit") {
+        const until = Date.now() + card.effect.duration*1000;
+        setFrozenUntil(until);
+        setHaltedUntil(until);
+        pushGMState({ frozenUntil: until, haltedUntil: until });
+        sendBcast(`⛔ CIRCUIT BREAKER! Trading and price movement halted for ${card.effect.duration} seconds.`);
+        setTimeout(() => {
+          setFrozenUntil(null);
+          setHaltedUntil(null);
+          pushGMState({ frozenUntil:null, haltedUntil:null });
+          sendBcast("🔓 Circuit breaker lifted — the market is moving again.");
+        }, card.effect.duration*1000);
+      } else if (card.effect.type === "rotation") {
+        const shuffled = [...SECTORS].sort(() => Math.random() - 0.5);
+        const winner = shuffled[0];
+        const loser = shuffled.find(sec => sec.id !== winner?.id);
+        if (!winner || !loser) return;
+        const cur = pricesRef.current;
+        const next = { ...cur };
+        const rotationEvents = [];
+        winner.stocks.forEach(st => {
+          next[st.ticker] = Math.max(0.5, cur[st.ticker] * (1 + card.effect.pct / 100));
+          rotationEvents.push({
+            ticker: st.ticker,
+            sectorId: winner.id,
+            headline: `${winner.label} attracts fresh capital rotation`,
+            detail: `${winner.label} stocks catch a strong macro tailwind.`,
+            impact: card.effect.pct
+          });
+        });
+        loser.stocks.forEach(st => {
+          next[st.ticker] = Math.max(0.5, cur[st.ticker] * (1 - card.effect.pct / 100));
+          rotationEvents.push({
+            ticker: st.ticker,
+            sectorId: loser.id,
+            headline: `${loser.label} sees money rotate out`,
+            detail: `${loser.label} loses favor as capital rotates elsewhere.`,
+            impact: -card.effect.pct
+          });
+        });
+        setPrices(next);
+        setHistory(prevH => {
+          const newH = { ...prevH };
+          rotationEvents.forEach(evt => {
+            if (newH[evt.ticker]) newH[evt.ticker] = [...newH[evt.ticker].slice(1), next[evt.ticker]];
+          });
+          pushPrices(next, newH); return newH;
+        });
+        updateNewsFeed(prev => [
+          ...rotationEvents.slice(0, 6).map(evt => ({
+            ticker: evt.ticker,
+            sectorId: evt.sectorId,
+            headline: evt.headline,
+            detail: evt.detail,
+            sentiment: evt.impact > 0 ? "bull" : "bear",
+            tag: "SECTOR ROTATION",
+            time: nowShort(),
+            round: roundNum,
+          })),
+          ...prev
+        ]);
+        sendBcast(`🔄 SECTOR ROTATION! ${winner.icon} ${winner.label} rallies while ${loser.icon} ${loser.label} sells off.`);
+      } else if (card.effect.type === "political") {
+        // Pick a random political event not already used this game
+        const usedEvtIds = usedCardsRef.current._polEventIds || [];
+        const available  = POLITICAL_EVENTS.filter(e => !usedEvtIds.includes(e.id));
+        const evt        = available.length > 0
+          ? available[Math.floor(Math.random() * available.length)]
+          : POLITICAL_EVENTS[Math.floor(Math.random() * POLITICAL_EVENTS.length)];
+        // Track used event ids on the ref
+        usedCardsRef.current._polEventIds = [...usedEvtIds, evt.id];
+        generatePoliticalDisruption(evt);
+      }
+    }
+    else if(cmd==="openPrediction") {
+      const question = PREDICTION_QUESTIONS.find(q => q.round === roundNum) || PREDICTION_QUESTIONS[0];
+      if (!question || ["polling","revealing"].includes(predictionSessionRef.current?.phase)) return;
+      const now = Date.now();
+      const session = {
+        id: String(now),
+        round: roundNum,
+        phase: "polling",
+        startedAt: now,
+        endsAt: now + PREDICTION_POLL_SECS * 1000,
+        question,
+        results: null
+      };
+      setPredictionOpen(true);
+      setPredictionSession(session);
+      pushPrediction(session);
+      pushGMState({ predictionOpen:true, predictionRound:roundNum });
+      sendBcast(`🎯 PREDICTION MARKET OPEN! ${PREDICTION_POLL_SECS}s polling buffer started for Round ${roundNum}.`);
+    }
+    else if(cmd==="closePrediction") {
+      if (predictionSessionRef.current?.phase === "polling") finalizePredictionPolling(predictionSessionRef.current);
+      else {
+        setPredictionOpen(false);
+        setPredictionSession({ phase:"closed" });
+        pushPrediction({ phase:"closed" });
+        pushGMState({ predictionOpen:false });
+      }
+    }
+    else if(cmd==="setInitCash") {
+      setInitCash(payload.cash);
+      setCash(payload.cash);
+      setRestrictedCash(0);
+      setAccruedBorrowCost(0);
+      setAccruedFundingCost(0);
+      setHoldings({});
+      setTransactions([]);
+      setDerivativePositions({});
+      setDerivativeTransactions([]);
+      setSelectedDerivativeId(null);
+    }
+  }, [clearScoreLedgerState, finalizePredictionPolling, generatePoliticalDisruption, initCash, pushDisrupts, pushGMState, pushNews, pushOrderFlow, pushPrediction, pushPrices, roundDur, roundNum, sendBcast, triggerRoundEnd, updateNewsFeed]);
+
+  // ─── DERIVED ──────────────────────────────────────────────────────────────────
+  const currentRoundRule = ROUND_RULES[Math.min(Math.max(roundNum - 1, 0), TOTAL_ROUNDS - 1)] || ROUND_RULES[0];
+  const storyPreviewRound = gamePhase === "running"
+    ? roundNum
+    : Math.min(gameStartedRef.current ? roundNum + 1 : 1, TOTAL_ROUNDS);
+  const storyPreview = getRoundStoryline(storyPreviewRound);
+  const currentStoryline = getRoundStoryline(roundNum);
+  const tradeSpreadRate = BASE_SPREAD_RATE * (currentRoundRule?.spreadMult || 1);
+  const derivativeCatalog = buildDerivativeCatalog({
+    round: activeLedgerRoundRef.current || roundNum,
+    prices,
+    roundRule: currentRoundRule,
+    timeLeft,
+    roundDur,
+    gamePhase,
+    roundBases: roundDerivativeBaseRef.current,
+  });
+  const displayOrderFlowSnapshot = Object.keys(sharedOrderFlowSnapshot || {}).length
+    ? sharedOrderFlowSnapshot
+    : orderFlowSnapshot;
+  const derivativeQuoteMap = getDerivativeQuoteMap(derivativeCatalog);
+  const combinedTransactions = [...transactions, ...derivativeTransactions];
+  const analytics = PortfolioAnalytics({
+    holdings,
+    transactions: combinedTransactions,
+    prices,
+    cash,
+    restrictedCash,
+    derivativePositions,
+    derivativeQuoteMap,
+    accruedBorrowCost,
+    accruedFundingCost,
+    initCash,
+    history,
+    roundRule: currentRoundRule,
+  });
+  const totalVal  = analytics.totalVal;
+  const myRank    = sharedLB.findIndex(e => e.name === currentTeam?.name) + 1;
+  const selStock  = ALL_STOCKS.find(s => s.ticker === selTicker);
+  const selPrice  = selTicker ? prices[selTicker] : null;
+  const buyTotal  = selTicker ? selPrice * orderQty * (1 + tradeSpreadRate) : 0;
+  const selPosition = selTicker ? holdings[selTicker] : null;
+  const derivativeSearchLower = derivativeSearch.trim().toLowerCase();
+  const filteredDerivativeCatalog = derivativeCatalog.filter(instrument => {
+    const underlying = ALL_STOCKS.find(stock => stock.ticker === instrument.underlyingTicker);
+    const inSearch = !derivativeSearchLower
+      || instrument.underlyingTicker.toLowerCase().includes(derivativeSearchLower)
+      || instrument.label.toLowerCase().includes(derivativeSearchLower)
+      || underlying?.name?.toLowerCase().includes(derivativeSearchLower);
+    const inSector = derivativeSector === "all" || underlying?.sectorId === derivativeSector;
+    const inKind = derivativeKind === "all" || instrument.kind === derivativeKind;
+    return inSearch && inSector && inKind;
+  });
+  const selectedDerivative = filteredDerivativeCatalog.find(instrument => instrument.id === selectedDerivativeId) || filteredDerivativeCatalog[0] || null;
+  const selectedDerivativeQuote = selectedDerivative ? derivativeQuoteMap[selectedDerivative.id] : null;
+  const selectedDerivativePosition = selectedDerivative ? derivativePositions[selectedDerivative.id] : null;
+  const selectedDerivativeFlow = selectedDerivative ? displayOrderFlowSnapshot[selectedDerivative.underlyingTicker] : null;
+  const selectedDerivativeFlowDisplay = getOrderFlowDisplay(selectedDerivativeFlow);
+  const activeStrategyPreset = DERIVATIVE_STRATEGY_PRESETS.find(entry => entry.id === derivativeStrategyId) || DERIVATIVE_STRATEGY_PRESETS[0];
+  const effectiveStrategyTicker = strategyTicker || selectedDerivative?.underlyingTicker || ALL_STOCKS[0]?.ticker || "";
+  const strategyPreview = buildDerivativeStrategyPreview({
+    catalog: derivativeCatalog,
+    derivativeQuoteMap,
+    holdings,
+    ticker: effectiveStrategyTicker,
+    strategyId: derivativeStrategyId,
+    lots: strategyLots,
+  });
+  const selectedStockFlow = selTicker ? displayOrderFlowSnapshot[selTicker] : null;
+  const selectedStockFlowDisplay = getOrderFlowDisplay(selectedStockFlow);
+  const activePredictionPhase = ["polling","revealing"].includes(predictionSession?.phase);
+  const currentPredictionVote = normalizePredictionSessionId(predictionSession?.id) === playerPredictionSessionId ? playerPrediction : null;
+  const isFrozen  = frozenUntil && Date.now() < frozenUntil;
+  const isHalted  = haltedUntil && Date.now() < haltedUntil;
+  const buyingPower = analytics.buyingPower;
+  const shortCapacity = buyingPower;
+  const canTrade  = gamePhase === "running" && !isFrozen && !isHalted && !activePredictionPhase;
+  const canBuy    = canTrade && buyTotal <= buyingPower && orderQty > 0 && selTicker && shortQty(selPosition) === 0;
+  const canSell   = canTrade && selTicker && longQty(selPosition) >= orderQty && orderQty > 0;
+  const canShort  = canTrade && selTicker && orderQty > 0 && longQty(selPosition) === 0 && buyTotal <= shortCapacity;
+  const canCover  = canTrade && selTicker && shortQty(selPosition) >= orderQty;
+  const timerMins = timeLeft != null ? Math.floor(timeLeft/60) : null;
+  const timerSecs = timeLeft != null ? timeLeft % 60 : null;
+  const bufMins   = bufferLeft != null ? Math.floor(bufferLeft/60) : null;
+  const bufSecs   = bufferLeft != null ? bufferLeft % 60 : null;
+  const marginGraceSecs = marginGraceEndsAtRef.current
+    ? Math.max(0, Math.ceil((marginGraceEndsAtRef.current - Date.now()) / 1000))
+    : 0;
+  const derivativeLongOrderExposure = selectedDerivative && selectedDerivativeQuote
+    ? getDerivativeRiskEquivalent(selectedDerivativeQuote, "long") * derivativeQty
+    : 0;
+  const derivativeShortOrderExposure = selectedDerivative && selectedDerivativeQuote
+    ? getDerivativeRiskEquivalent(selectedDerivativeQuote, "short") * derivativeQty
+    : 0;
+  const derivativeOrderExposure = derivativeLongOrderExposure;
+  const derivativeCanOpenLong = !!(canTrade && selectedDerivative && selectedDerivativeQuote && derivativeQty > 0 && derivativeLongOrderExposure <= buyingPower && (!selectedDerivativePosition || selectedDerivativePosition.side === "long"));
+  const derivativeCanOpenShort = !!(canTrade && selectedDerivative && selectedDerivativeQuote && derivativeQty > 0 && derivativeShortOrderExposure <= buyingPower && (!selectedDerivativePosition || selectedDerivativePosition.side === "short"));
+  const derivativeCanClose = !!(canTrade && selectedDerivativePosition && derivativeQty > 0 && (selectedDerivativePosition.qty || 0) >= derivativeQty);
+  const strategyCanExecute = !!(canTrade && !strategyPreview.error && (strategyPreview.totalRisk || 0) <= buyingPower && (strategyPreview.orderLegs?.length || 0) > 0);
+  const strategySubmitting = strategyExecutionState?.type === "pending";
+
+  useEffect(() => {
+    if (!filteredDerivativeCatalog.length) {
+      if (selectedDerivativeId) setSelectedDerivativeId(null);
+      return;
+    }
+    if (!selectedDerivativeId || !filteredDerivativeCatalog.some(instrument => instrument.id === selectedDerivativeId)) {
+      setSelectedDerivativeId(filteredDerivativeCatalog[0].id);
+    }
+  }, [filteredDerivativeCatalog, selectedDerivativeId]);
+
+  useEffect(() => {
+    if (!strategyTicker && selectedDerivative?.underlyingTicker) {
+      setStrategyTicker(selectedDerivative.underlyingTicker);
+    }
+  }, [selectedDerivative, strategyTicker]);
+
+  useEffect(() => {
+    setStrategyExecutionState(null);
+  }, [derivativeStrategyId, effectiveStrategyTicker, strategyLots]);
+
+  useEffect(() => {
+    if (SERVER_PORTFOLIO_AUTH) return;
+    if (!currentTeam || screen !== "player") return;
+    if (analytics.grossExposure <= 0) {
+      setMarginStatus("safe");
+      roundMarginBreachActiveRef.current = false;
+      marginGraceEndsAtRef.current = null;
+      return;
+    }
+    const status = analytics.marginBuffer < 0
+      ? "call"
+      : analytics.marginBufferPct < 5
+        ? "watch"
+        : "safe";
+    setMarginStatus(status);
+
+    if (gamePhase !== "running") return;
+    if (analytics.marginBuffer < 0) {
+      if (!roundMarginBreachActiveRef.current) {
+        roundMarginBreachActiveRef.current = true;
+        roundMarginBreachesRef.current += 1;
+        marginGraceEndsAtRef.current = Date.now() + MARGIN_CALL_GRACE_SECS * 1000;
+        setMarginAlert({
+          type: "warning",
+          text: `Margin call active. Restore maintenance margin within ${MARGIN_CALL_GRACE_SECS}s or the game will auto-deleverage.`,
+        });
+      } else if (marginGraceEndsAtRef.current && Date.now() >= marginGraceEndsAtRef.current) {
+        autoDeleveragePortfolio();
+      }
+    } else if (roundMarginBreachActiveRef.current) {
+      roundMarginBreachActiveRef.current = false;
+      marginGraceEndsAtRef.current = null;
+      setMarginAlert({
+        type: "recovered",
+        text: "Maintenance margin restored. Positions remain open.",
+      });
+      setTimeout(() => setMarginAlert(null), 5000);
+    }
+  }, [analytics.grossExposure, analytics.marginBuffer, analytics.marginBufferPct, autoDeleveragePortfolio, currentTeam, gamePhase, screen]);
+
+  useEffect(() => {
+    if (SERVER_PORTFOLIO_AUTH) return;
+    if (screen !== "player") return;
+    if (!Object.keys(derivativePositions).length) return;
+    if (!["idle", "buffer", "disruption", "ceremony", "ended"].includes(gamePhase)) return;
+    settleExpiredDerivatives(activeLedgerRoundRef.current || roundNum);
+  }, [derivativePositions, gamePhase, roundNum, screen]);
+
+  // Filtered stocks for market tab
+  const filteredStocks = ALL_STOCKS.filter(s => {
+    const inSector = activeSector === "all" || s.sectorId === activeSector;
+    const inSearch = !marketSearch || s.ticker.includes(marketSearch.toUpperCase()) || s.name.toLowerCase().includes(marketSearch.toLowerCase());
+    return inSector && inSearch;
+  });
+
+  async function execBuy(ticker, qty) {
+    if (SERVER_PORTFOLIO_AUTH) {
+      if (qty <= 0) return;
+      await submitServerTrade({ action:"BUY", ticker, qty });
+      return;
+    }
+    const stk   = ALL_STOCKS.find(s => s.ticker === ticker);
+    const p     = prices[ticker];
+    const fillPrice = p * (1 + tradeSpreadRate);
+    const total = fillPrice * qty;
+    const ex = holdings[ticker];
+    if (!stk || !p || total > analytics.buyingPower || qty <= 0 || shortQty(ex) > 0) return;
+    const existingQty = longQty(ex);
+    const nextQty = existingQty + qty;
+    const nextAvgCost = existingQty > 0
+      ? ((ex.avgCost * existingQty) + total) / nextQty
+      : fillPrice;
+    setCash(c => c - total);
+    setHoldings(h => ({ ...h, [ticker]:{ qty:nextQty, avgCost:nextAvgCost } }));
+    const tx = { id:Date.now(), type:"BUY", ticker, sectorId:stk.sectorId,
+      qty, price:fillPrice, avgCostAtBuy:fillPrice, total,
+      time:nowFull(), date:new Date().toLocaleDateString() };
+    setTransactions(prev => [tx, ...prev]);
+    pushTrade({ team:currentTeam?.name, teamColor:currentTeam?.color, action:"BUY",
+      ticker, qty, price:fillPrice, time:nowShort() });
+  }
+
+  async function execSell(ticker, qty) {
+    if (SERVER_PORTFOLIO_AUTH) {
+      if (qty <= 0) return;
+      await submitServerTrade({ action:"SELL", ticker, qty });
+      return;
+    }
+    const stk = ALL_STOCKS.find(s => s.ticker === ticker);
+    const p   = prices[ticker];
+    const fillPrice = p * (1 - tradeSpreadRate);
+    const pos = holdings[ticker];
+    const heldQty = longQty(pos);
+    if (!stk || !p || !pos || heldQty < qty || qty <= 0) return;
+    const proceeds = fillPrice * qty;
+    const gain     = (fillPrice - pos.avgCost) * qty;
+    const newQty   = heldQty - qty;
+    setCash(c => c + proceeds);
+    setHoldings(h => {
+      const n = { ...h };
+      if (newQty <= 0) delete n[ticker];
+      else n[ticker] = { qty:newQty, avgCost:pos.avgCost };
+      return n;
+    });
+    const tx = { id:Date.now(), type:"SELL", ticker, sectorId:stk.sectorId,
+      qty, price:fillPrice, avgCostAtSell:pos.avgCost, proceeds,
+      gain, gainPct:((fillPrice-pos.avgCost)/pos.avgCost)*100,
+      time:nowFull(), date:new Date().toLocaleDateString() };
+    setTransactions(prev => [tx, ...prev]);
+    pushTrade({ team:currentTeam?.name, teamColor:currentTeam?.color, action:"SELL",
+      ticker, qty, price:fillPrice, time:nowShort() });
+  }
+
+  async function execShort(ticker, qty) {
+    if (SERVER_PORTFOLIO_AUTH) {
+      if (qty <= 0) return;
+      await submitServerTrade({ action:"SHORT", ticker, qty });
+      return;
+    }
+    const stk = ALL_STOCKS.find(s => s.ticker === ticker);
+    const p   = prices[ticker];
+    const fillPrice = p * (1 - tradeSpreadRate);
+    const pos = holdings[ticker];
+    const orderValue = fillPrice * qty;
+    const existingShortQty = shortQty(pos);
+    if (!stk || !p || qty <= 0 || longQty(pos) > 0 || orderValue > analytics.buyingPower) return;
+    const nextAbsQty = existingShortQty + qty;
+    const nextAvgCost = existingShortQty > 0
+      ? ((pos.avgCost * existingShortQty) + orderValue) / nextAbsQty
+      : fillPrice;
+    setRestrictedCash(c => c + orderValue);
+    setHoldings(h => ({ ...h, [ticker]:{ qty:-nextAbsQty, avgCost:nextAvgCost } }));
+    const tx = { id:Date.now(), type:"SHORT", ticker, sectorId:stk.sectorId,
+      qty, price:fillPrice, avgCostAtShort:fillPrice, proceeds:orderValue,
+      time:nowFull(), date:new Date().toLocaleDateString() };
+    setTransactions(prev => [tx, ...prev]);
+    pushTrade({ team:currentTeam?.name, teamColor:currentTeam?.color, action:"SHORT",
+      ticker, qty, price:fillPrice, time:nowShort() });
+  }
+
+  async function execCover(ticker, qty) {
+    if (SERVER_PORTFOLIO_AUTH) {
+      if (qty <= 0) return;
+      await submitServerTrade({ action:"COVER", ticker, qty });
+      return;
+    }
+    const stk = ALL_STOCKS.find(s => s.ticker === ticker);
+    const p   = prices[ticker];
+    const fillPrice = p * (1 + tradeSpreadRate);
+    const pos = holdings[ticker];
+    const currentShortQty = shortQty(pos);
+    if (!stk || !p || !pos || currentShortQty < qty || qty <= 0) return;
+    const gain = (pos.avgCost - fillPrice) * qty;
+    const remainingShort = currentShortQty - qty;
+    const releasedCollateral = pos.avgCost * qty;
+    setRestrictedCash(c => Math.max(0, c - releasedCollateral));
+    setCash(c => c + gain);
+    setHoldings(h => {
+      const n = { ...h };
+      if (remainingShort <= 0) delete n[ticker];
+      else n[ticker] = { qty:-remainingShort, avgCost:pos.avgCost };
+      return n;
+    });
+    const tx = { id:Date.now(), type:"COVER", ticker, sectorId:stk.sectorId,
+      qty, price:fillPrice, avgCostAtCover:pos.avgCost, cost:fillPrice * qty,
+      gain, gainPct:((pos.avgCost-fillPrice)/pos.avgCost)*100,
+      time:nowFull(), date:new Date().toLocaleDateString() };
+    setTransactions(prev => [tx, ...prev]);
+    pushTrade({ team:currentTeam?.name, teamColor:currentTeam?.color, action:"COVER",
+      ticker, qty, price:fillPrice, time:nowShort() });
+  }
+
+  async function openDerivativePosition(instrument, qty, requestedSide = "long") {
+    if (SERVER_PORTFOLIO_AUTH) {
+      if (!instrument || qty <= 0) return;
+      await submitServerTrade({
+        action:"DERIV_OPEN",
+        instrumentId: instrument.id,
+        qty,
+        side: requestedSide === "short" ? "short" : "long",
+      });
+      return;
+    }
+    if (!instrument || qty <= 0 || !canTrade) return;
+    const quote = derivativeQuoteMap[instrument.id];
+    if (!quote) return;
+    const existing = derivativePositions[instrument.id];
+    const isFuture = instrument.kind === "future";
+    const side = requestedSide === "short" ? "short" : "long";
+    if (existing && existing.side !== side) return;
+    const multiplier = instrument.multiplier || quote.multiplier || 1;
+    const orderExposure = getDerivativeRiskEquivalent(quote, side) * qty;
+    if (orderExposure > analytics.buyingPower) return;
+
+    const openUnitPrice = side === "short" ? quote.bid : quote.ask;
+    const premiumCashflow = isFuture ? 0 : (openUnitPrice * qty * multiplier * (side === "short" ? 1 : -1));
+    const nextQty = (existing?.qty || 0) + qty;
+    const weightedAvg = existing?.qty
+      ? (((existing.avgCost || 0) * existing.qty) + (openUnitPrice * qty)) / nextQty
+      : openUnitPrice;
+
+    if (premiumCashflow !== 0) setCash(value => value + premiumCashflow);
+    setDerivativePositions(prev => ({
+      ...prev,
+      [instrument.id]: {
+        id: instrument.id,
+        round: instrument.round,
+        label: instrument.label,
+        kind: instrument.kind,
+        side,
+        underlyingTicker: instrument.underlyingTicker,
+        underlyingName: instrument.underlyingName,
+        sectorId: instrument.sectorId,
+        strike: instrument.strike,
+        multiplier,
+        qty: nextQty,
+        avgCost: weightedAvg,
+        openedAt: existing?.openedAt || Date.now(),
+      }
+    }));
+    const tx = {
+      id: Date.now(),
+      type: "DERIV_OPEN",
+      instrumentId: instrument.id,
+      label: instrument.label,
+      kind: instrument.kind,
+      side,
+      underlyingTicker: instrument.underlyingTicker,
+      sectorId: instrument.sectorId,
+      qty,
+      price: openUnitPrice,
+      entryValue: openUnitPrice * qty * multiplier,
+      time: nowFull(),
+      date: new Date().toLocaleDateString(),
+    };
+    setDerivativeTransactions(prev => [tx, ...prev]);
+    pushTrade({
+      team: currentTeam?.name,
+      teamColor: currentTeam?.color,
+      action: getDerivativeOpenActionLabel(instrument.kind, side),
+      ticker: instrument.underlyingTicker,
+      underlyingTicker: instrument.underlyingTicker,
+      qty,
+      price: openUnitPrice,
+      time: nowShort(),
+      assetType: "derivative",
+      derivativeKind: instrument.kind,
+      derivativeSide: side,
+      multiplier,
+      flowDirection: getDerivativeTradeFlowDirection(instrument.kind, side, "open"),
+      flowWeight: (getDerivativeRiskEquivalent(quote, side) || openUnitPrice * multiplier) * qty * (isFuture ? 1 : 0.85),
+    });
+  }
+
+  async function executeDerivativeStrategy(preview = strategyPreview) {
+    if (!preview || preview.error || !preview.orderLegs?.length || !canTrade) return;
+    const strategyLabel = preview.preset?.label || activeStrategyPreset.label;
+    if (SERVER_PORTFOLIO_AUTH) {
+      setStrategyExecutionState({ type:"pending", text:`Submitting ${strategyLabel}...` });
+      const result = await submitServerTrade({
+        action:"DERIV_STRATEGY",
+        strategyId: derivativeStrategyId,
+        strategyName: strategyLabel,
+        legs: preview.orderLegs,
+      });
+      setStrategyExecutionState(
+        result?.ok
+          ? { type:"success", text:`${strategyLabel} executed. Check the derivative book below.` }
+          : { type:"error", text: result?.error ? `${strategyLabel} was rejected: ${result.error}` : `${strategyLabel} was rejected.` }
+      );
+      return;
+    }
+    setStrategyExecutionState({ type:"pending", text:`Executing ${strategyLabel}...` });
+    for (const leg of preview.orderLegs) {
+      const instrument = derivativeCatalog.find(entry => entry.id === leg.instrumentId);
+      if (!instrument) {
+        setStrategyExecutionState({ type:"error", text:`${strategyLabel} could not find one of its contracts.` });
+        return;
+      }
+      await openDerivativePosition(instrument, leg.qty, leg.side);
+    }
+    setStrategyExecutionState({ type:"success", text:`${strategyLabel} executed. Check the derivative book below.` });
+  }
+
+  async function closeDerivativePosition(instrumentId, qty) {
+    if (SERVER_PORTFOLIO_AUTH) {
+      if (!instrumentId || qty <= 0) return;
+      await submitServerTrade({ action:"DERIV_CLOSE", instrumentId, qty });
+      return;
+    }
+    const position = derivativePositions[instrumentId];
+    const quote = derivativeQuoteMap[instrumentId];
+    if (!position || !quote || qty <= 0 || !canTrade) return;
+    const closeQty = Math.min(qty, position.qty || 0);
+    if (closeQty <= 0) return;
+    const multiplier = position.multiplier || quote.multiplier || 1;
+    const entryValue = (position.avgCost || 0) * closeQty * multiplier;
+    let realizedValue = 0;
+    let gain = 0;
+    let closeUnitPrice = 0;
+
+    if (position.kind === "future") {
+      closeUnitPrice = position.side === "short" ? quote.ask : quote.bid;
+      gain = (closeUnitPrice - (position.avgCost || 0)) * closeQty * multiplier * (position.side === "short" ? -1 : 1);
+      realizedValue = entryValue + gain;
+      setCash(value => value + gain);
+    } else {
+      closeUnitPrice = position.side === "short" ? quote.ask : quote.bid;
+      realizedValue = closeUnitPrice * closeQty * multiplier * (position.side === "short" ? -1 : 1);
+      gain = position.side === "short"
+        ? (entryValue + realizedValue)
+        : (realizedValue - entryValue);
+      setCash(value => value + realizedValue);
+    }
+
+    setDerivativePositions(prev => {
+      const next = { ...prev };
+      const remaining = (position.qty || 0) - closeQty;
+      if (remaining <= 0) delete next[instrumentId];
+      else next[instrumentId] = { ...position, qty: remaining };
+      return next;
+    });
+
+    const tx = {
+      id: Date.now(),
+      type: "DERIV_CLOSE",
+      instrumentId,
+      label: position.label,
+      kind: position.kind,
+      side: position.side,
+      underlyingTicker: position.underlyingTicker,
+      sectorId: position.sectorId,
+      qty: closeQty,
+      price: closeUnitPrice,
+      avgCostAtOpen: position.avgCost,
+      entryValue,
+      realizedValue,
+      gain,
+      gainPct: entryValue > 0 ? (gain / entryValue) * 100 : 0,
+      time: nowFull(),
+      date: new Date().toLocaleDateString(),
+    };
+    setDerivativeTransactions(prev => [tx, ...prev]);
+    pushTrade({
+      team: currentTeam?.name,
+      teamColor: currentTeam?.color,
+      action: position.kind === "future" ? "FUT CLOSE" : "OPT CLOSE",
+      ticker: position.underlyingTicker,
+      underlyingTicker: position.underlyingTicker,
+      qty: closeQty,
+      price: closeUnitPrice,
+      time: nowShort(),
+      assetType: "derivative",
+      derivativeKind: position.kind,
+      derivativeSide: position.side,
+      multiplier,
+      flowDirection: getDerivativeTradeFlowDirection(position.kind, position.side, "close"),
+      flowWeight: (getDerivativeRiskEquivalent(quote, position.side) || closeUnitPrice * multiplier) * closeQty * (position.kind === "future" ? 1 : 0.7),
+    });
+  }
+
+  function settleExpiredDerivatives(settlementRound = activeLedgerRoundRef.current || roundNum) {
+    const positions = derivativePositionsRef.current || {};
+    const ids = Object.keys(positions);
+    if (!ids.length) return;
+    const settlementRule = ROUND_RULES[Math.min(Math.max((settlementRound || 1) - 1, 0), TOTAL_ROUNDS - 1)] || ROUND_RULES[0];
+    const settlementQuoteMap = buildDerivativeQuoteMapForRound({
+      round: settlementRound,
+      prices: pricesRef.current,
+      roundRule: settlementRule,
+      timeLeft: 0,
+      roundDur: roundDurationsRef.current?.[(settlementRound || 1) - 1] || DEFAULT_ROUND_DURATIONS[Math.max(0, (settlementRound || 1) - 1)] || roundDur,
+      gamePhase: "idle",
+      roundBases: roundDerivativeBaseRef.current,
+    });
+
+    let cashDelta = 0;
+    const settlements = [];
+
+    ids.forEach((id, index) => {
+      const position = positions[id];
+      const quote = settlementQuoteMap[id];
+      if (!position || !quote) return;
+      const qty = position.qty || 0;
+      const multiplier = position.multiplier || quote.multiplier || 1;
+      const entryValue = (position.avgCost || 0) * qty * multiplier;
+      let realizedValue = 0;
+      let gain = 0;
+      let settlementPrice = quote.mark;
+
+      if (position.kind === "future") {
+        gain = (quote.mark - (position.avgCost || 0)) * qty * multiplier * (position.side === "short" ? -1 : 1);
+        realizedValue = entryValue + gain;
+        cashDelta += gain;
+      } else {
+        settlementPrice = quote.intrinsic || 0;
+        realizedValue = settlementPrice * qty * multiplier * (position.side === "short" ? -1 : 1);
+        gain = position.side === "short"
+          ? (entryValue + realizedValue)
+          : (realizedValue - entryValue);
+        cashDelta += realizedValue;
+      }
+
+      settlements.push({
+        id: Date.now() + index,
+        type: "DERIV_EXPIRE",
+        instrumentId: id,
+        label: position.label,
+        kind: position.kind,
+        side: position.side,
+        underlyingTicker: position.underlyingTicker,
+        sectorId: position.sectorId,
+        qty,
+        price: settlementPrice,
+        avgCostAtOpen: position.avgCost,
+        entryValue,
+        realizedValue,
+        cashEffect: position.kind === "future" ? gain : realizedValue,
+        gain,
+        gainPct: entryValue > 0 ? (gain / entryValue) * 100 : 0,
+        settlementRound,
+        time: nowFull(),
+        date: new Date().toLocaleDateString(),
+      });
+    });
+
+    if (cashDelta !== 0) setCash(value => value + cashDelta);
+    setDerivativePositions({});
+    setDerivativeTransactions(prev => [...settlements, ...prev]);
+  }
+
+  function doBuy()  { execBuy(selTicker, orderQty); }
+  function doSell() { execSell(selTicker, orderQty); }
+  function doShort(){ execShort(selTicker, orderQty); }
+  function doCover(){ execCover(selTicker, orderQty); }
+
+  // ─── GM RULEBOOK MODAL ────────────────────────────────────────────────────────
+  if (showRulebook) return (
+    <div style={{ position:"fixed", inset:0, zIndex:10000, background:"rgba(2,8,23,0.97)",
+      display:"flex", alignItems:"center", justifyContent:"center",
+      fontFamily:"'JetBrains Mono','Courier New',monospace", padding:20 }}>
+      <div style={{ width:"min(900px,98vw)", maxHeight:"96vh", background:"#0a0f1e",
+        border:"1px solid #a78bfa", borderRadius:16, overflow:"hidden",
+        display:"flex", flexDirection:"column" }}>
+        {/* Header */}
+        <div style={{ padding:"16px 24px", borderBottom:"1px solid #1e293b",
+          background:"linear-gradient(135deg,#1a0a2e,#0a0f1e)",
+          display:"flex", alignItems:"center", gap:12 }}>
+          <span style={{ fontSize:24 }}>📖</span>
+          <div style={{ flex:1 }}>
+            <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:800, fontSize:18, color:"#a78bfa" }}>
+              BULL PIT — GM RULEBOOK
+            </div>
+            <div style={{ fontSize:10, color:"#475569" }}>Complete Game Master Reference — 30 Teams</div>
+          </div>
+          <button onClick={() => setShowRulebook(false)}
+            style={{ background:"none", border:"1px solid #334155", color:"#94a3b8",
+              padding:"6px 14px", borderRadius:6, cursor:"pointer", fontFamily:"inherit", fontSize:11 }}>
+            CLOSE
+          </button>
+        </div>
+        <div style={{ overflowY:"auto", padding:"20px 24px" }}>
+
+          {/* Overview */}
+          <div style={{ background:"#060c18", border:"1px solid #1e293b", borderRadius:10,
+            padding:"14px 18px", marginBottom:16 }}>
+            <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:800, fontSize:13,
+              color:"#00f5c4", marginBottom:10 }}>COMPETITION OVERVIEW</div>
+            {[
+              ["Teams",        "Up to 60 teams, each with $100,000 starting capital"],
+              ["Rounds",       "7 rounds, each with a unique identity and special rules"],
+              ["Storyline",    "Every round opens with an America-focused macro bulletin built for inference; players never get direct ticker or sector hints on the disruption screen"],
+              ["Duration",     "~90 minutes total (60 min play + 30 min buffers + breaks), including a 5-second team-specific derivative settlement reveal after each round"],
+              ["Carry Model",  "No resets. Capital carries through the full storyline with borrow and funding drag applied each round"],
+              ["Margin",       "Short proceeds are restricted collateral; margin calls trigger after a short warning window"],
+              ["Derivatives",  "Every listed Bull Pit stock has a round-expiry future, call, and put"],
+              ["Winner",       "Highest locked composite score after Round 7, with live play ranked by net equity during the game"],
+              ["Power-Ups",    "GM has 5 one-time-use cards: Tsunami, Moon Shot, Circuit Breaker, Sector Rotation, Political Shock"],
+            ].map(([k,v]) => (
+              <div key={k} style={{ display:"flex", gap:12, marginBottom:6, fontSize:11 }}>
+                <div style={{ width:110, color:"#fbbf24", fontWeight:700, flexShrink:0 }}>{k}</div>
+                <div style={{ color:"#94a3b8" }}>{v}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Round-by-round guide */}
+          <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:800, fontSize:13,
+            color:"#f1f5f9", marginBottom:10 }}>ROUND-BY-ROUND GM GUIDE</div>
+          {ROUND_RULES.map((rules, i) => (
+            <div key={i} style={{ background:"#060c18",
+              border:`1px solid ${rules.color}44`, borderRadius:10,
+              padding:"14px 18px", marginBottom:10 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:10 }}>
+                <span style={{ fontSize:20 }}>{rules.icon}</span>
+                <div style={{ flex:1 }}>
+                  <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:800,
+                    fontSize:13, color:rules.color }}>
+                    Round {rules.round}: {rules.name}
+                  </div>
+                  <div style={{ display:"flex", gap:6, marginTop:4, flexWrap:"wrap" }}>
+                    <span style={{ fontSize:8, padding:"1px 6px", borderRadius:3,
+                      background:`${rules.color}20`, color:rules.color, fontWeight:700 }}>
+                      {rules.volMult}× VOLATILITY
+                    </span>
+                    {rules.sentLock && <span style={{ fontSize:8, padding:"1px 6px", borderRadius:3,
+                      background:"#fbbf2420", color:"#fbbf24", fontWeight:700 }}>
+                      SENTIMENT LOCKED: {rules.sentLock.toUpperCase()}
+                    </span>}
+                    <span style={{ fontSize:8, padding:"1px 6px", borderRadius:3,
+                      background:"#38bdf820", color:"#38bdf8", fontWeight:700 }}>
+                      IM {Math.round((rules.initialMargin || 0) * 100)}% / MM {Math.round((rules.maintenanceMargin || 0) * 100)}%
+                    </span>
+                    <span style={{ fontSize:8, padding:"1px 6px", borderRadius:3,
+                      background:"#f9731620", color:"#f97316", fontWeight:700 }}>
+                      BORROW {fmt((rules.borrowRate || 0) * 100, 1)}%
+                    </span>
+                    <span style={{ fontSize:8, padding:"1px 6px", borderRadius:3,
+                      background:"#a78bfa20", color:"#a78bfa", fontWeight:700 }}>
+                      FUNDING {fmt((rules.fundingRate || 0) * 100, 1)}%
+                    </span>
+                    <span style={{ fontSize:8, padding:"1px 6px", borderRadius:3,
+                      background:"#00f5c420", color:"#00f5c4", fontWeight:700 }}>
+                      SPREAD {fmt(rules.spreadMult || 1, 2)}×
+                    </span>
+                    {rules.leaderHidden && <span style={{ fontSize:8, padding:"1px 6px", borderRadius:3,
+                      background:"#a78bfa20", color:"#a78bfa", fontWeight:700 }}>LEADERBOARD HIDDEN</span>}
+                  </div>
+                </div>
+              </div>
+              <div style={{ fontSize:11, color:"#64748b", marginBottom:8 }}>{rules.briefing}</div>
+              <div style={{ background:"#0a0f1e", border:"1px solid #1e293b",
+                borderRadius:6, padding:"10px 14px" }}>
+                <div style={{ fontSize:9, color:"#fbbf24", fontWeight:700, marginBottom:6 }}>
+                  GM ACTION CHECKLIST
+                </div>
+                <div style={{ fontSize:10, color:"#94a3b8", lineHeight:1.8 }}>{rules.gmNote}</div>
+              </div>
+              {/* Storyline flow */}
+              <div style={{ marginTop:8, fontSize:9, color:"#334155" }}>
+                STORYLINE FLOW:{" "}
+                Buffer opener — {ROUND_STORYLINES[i]?.opening?.headline || "Opening bulletin pending"}
+                {" | "}
+                Silent beats — {(ROUND_STORYLINES[i]?.beats || []).map(beat => `~${Math.round((beat.at || 0) * 100)}%: ${beat.headline}`).join(" | ")}
+              </div>
+            </div>
+          ))}
+
+          {/* Power-up reference */}
+          <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:800, fontSize:13,
+            color:"#f1f5f9", marginBottom:10, marginTop:4 }}>POWER-UP CARD REFERENCE</div>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:16 }}>
+            {POWERUP_CARDS.map(card => (
+              <div key={card.id} style={{ background:"#060c18",
+                border:`1px solid ${card.color}44`, borderRadius:8, padding:"12px 14px" }}>
+                <div style={{ fontSize:20, marginBottom:4 }}>{card.icon}</div>
+                <div style={{ fontSize:12, color:card.color, fontWeight:800, marginBottom:4 }}>{card.name}</div>
+                <div style={{ fontSize:11, color:"#64748b", lineHeight:1.6 }}>{card.desc}</div>
+                <div style={{ fontSize:9, color:"#334155", marginTop:6 }}>
+                  One-time use. Click in GM Control tab during a live round.
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Scoring system */}
+          <div style={{ background:"#060c18", border:"1px solid #1e293b",
+            borderRadius:10, padding:"14px 18px", marginBottom:16 }}>
+            <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:800, fontSize:13,
+              color:"#fbbf24", marginBottom:4 }}>10-INDICATOR SCORECARD (105 pts total)</div>
+            <div style={{ fontSize:9, color:"#475569", marginBottom:12 }}>
+              Live leaderboard ranks teams by net equity. Final placement uses locked round snapshots after borrow, funding, and margin stress are applied.
+            </div>
+
+            {/* Tier 1 */}
+            <div style={{ marginBottom:10 }}>
+              <div style={{ fontSize:10, color:"#38bdf8", fontWeight:800, marginBottom:6 }}>
+                TIER 1 — PERFORMANCE (35 pts)
+              </div>
+              {[
+                ["20pts", "Net Return",    "Compounded locked round return after carry", "Tracks compounded performance after borrow and funding drag."],
+                ["15pts", "Alpha vs BALL", "Compounded team return − compounded BALL return", "Rewards teams that truly outperform the market benchmark."],
+              ].map(([pts,name,formula,why]) => (
+                <div key={name} style={{ display:"flex", gap:10, marginBottom:6, fontSize:10 }}>
+                  <div style={{ width:34, color:"#38bdf8", fontWeight:800, flexShrink:0 }}>{pts}</div>
+                  <div style={{ flex:1 }}>
+                    <div style={{ color:"#f1f5f9", fontWeight:700 }}>{name}</div>
+                    <div style={{ color:"#475569", fontSize:9 }}>Formula: {formula}</div>
+                    <div style={{ color:"#334155", fontSize:9 }}>{why}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Tier 2 */}
+            <div style={{ marginBottom:10 }}>
+              <div style={{ fontSize:10, color:"#a78bfa", fontWeight:800, marginBottom:6 }}>
+                TIER 2 — CAPITAL DISCIPLINE (40 pts)
+              </div>
+              {[
+                ["15pts", "Drawdown Control", "Lower max drawdown = more points", "Measures capital preservation across the full storyline."],
+                ["15pts", "Margin Discipline", "Average locked margin buffer % minus breach penalties", "Rewards teams that stay above maintenance margin."],
+                ["10pts", "Funding Efficiency", "Borrow + funding carry drag vs starting capital", "Penalises inefficient leverage and crowded shorts."],
+              ].map(([pts,name,formula,why]) => (
+                <div key={name} style={{ display:"flex", gap:10, marginBottom:6, fontSize:10 }}>
+                  <div style={{ width:34, color:"#a78bfa", fontWeight:800, flexShrink:0 }}>{pts}</div>
+                  <div style={{ flex:1 }}>
+                    <div style={{ color:"#f1f5f9", fontWeight:700 }}>{name}</div>
+                    <div style={{ color:"#475569", fontSize:9 }}>Formula: {formula}</div>
+                    <div style={{ color:"#334155", fontSize:9 }}>{why}</div>
+                  </div>
+                </div>
+              ))}
+              <div style={{ marginTop:8, padding:"8px 10px", borderRadius:8, background:"#060c18", border:"1px solid #1e293b" }}>
+                <div style={{ color:"#ddd6fe", fontSize:10, fontWeight:700, marginBottom:4 }}>Asset Beta</div>
+                <div style={{ color:"#475569", fontSize:9 }}>Formula: cov(asset, BALL) / var(BALL)</div>
+                <div style={{ color:"#334155", fontSize:9 }}>Calculated for every asset. Portfolio beta is Σ(weight × asset beta) for each locked round, and the score uses the average of those round portfolio betas.</div>
+              </div>
+            </div>
+
+            {/* Tier 3 */}
+            <div style={{ marginBottom:12 }}>
+              <div style={{ fontSize:10, color:"#00f5c4", fontWeight:800, marginBottom:6 }}>
+                TIER 3 — MARKET CRAFT (30 pts)
+              </div>
+              {[
+                ["10pts", "Crisis Alpha",            "Average alpha in R3, R6, R7", "Measures whether macro positioning worked when stress hit."],
+                ["5pts",  "Win Rate",                "Profitable closes ÷ Total closes × 100", "Closed-trade execution quality across longs and shorts."],
+                ["5pts",  "Sector Diversification",  "Unique sectors traded across all rounds (9 max)", "Rewards sustained diversification across industries."],
+                ["5pts",  "Prediction Accuracy",     "Correct economic predictions ÷ Answered", "Tests if teams understood the macro storyline."],
+                ["5pts",  "Prediction Participation","Answered predictions ÷ Questions shown", "Rewards teams that consistently commit to a prediction when one appears."],
+              ].map(([pts,name,formula,why]) => (
+                <div key={name} style={{ display:"flex", gap:10, marginBottom:6, fontSize:10 }}>
+                  <div style={{ width:34, color:"#00f5c4", fontWeight:800, flexShrink:0 }}>{pts}</div>
+                  <div style={{ flex:1 }}>
+                    <div style={{ color:"#f1f5f9", fontWeight:700 }}>{name}</div>
+                    <div style={{ color:"#475569", fontSize:9 }}>Formula: {formula}</div>
+                    <div style={{ color:"#334155", fontSize:9 }}>{why}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Tiebreaker chain */}
+            <div style={{ background:"#0a0f1e", border:"1px solid #fbbf2430",
+              borderRadius:6, padding:"10px 12px" }}>
+              <div style={{ fontSize:9, color:"#fbbf24", fontWeight:800, marginBottom:6 }}>
+                TIEBREAKER CHAIN (sequential — applied only when scores are equal)
+              </div>
+              {[
+                ["TB1", "Net Equity",       "Higher ending net equity wins"],
+                ["TB2", "Crisis Alpha",     "Higher crisis alpha wins"],
+                ["TB3", "Margin Breaches",  "Fewer margin breaches wins"],
+                ["TB4", "Max Drawdown",     "Lower drawdown wins"],
+                ["TB5", "Last Trade Time",  "Earlier timestamp wins — more decisive"],
+              ].map(([tb,name,desc]) => (
+                <div key={tb} style={{ display:"flex", gap:8, marginBottom:4, fontSize:9 }}>
+                  <span style={{ color:"#fbbf24", fontWeight:800, width:28, flexShrink:0 }}>{tb}</span>
+                  <span style={{ color:"#f1f5f9", width:110, flexShrink:0 }}>{name}</span>
+                  <span style={{ color:"#475569" }}>{desc}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Margin + carry rules */}
+          <div style={{ background:"#060c18", border:"1px solid #ef444444",
+            borderRadius:10, padding:"14px 18px", marginBottom:16 }}>
+            <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:800, fontSize:13,
+              color:"#ef4444", marginBottom:10 }}>MARGIN, BORROW & FUNDING RULES</div>
+            {[
+              ["Short proceeds", "Restricted collateral", "Cash raised by shorting is locked as collateral and cannot be reused as free cash."],
+              ["Maintenance stress", "Every round", "Each round sets its own initial margin, maintenance margin, borrow rate, funding rate, and spread multiplier."],
+              ["Margin call", `${MARGIN_CALL_GRACE_SECS}s grace`, "If net equity drops below maintenance margin, teams get a warning window before auto-deleveraging."],
+              ["Auto-deleveraging", "Largest risk first", "The game closes the biggest gross exposures until maintenance margin is restored."],
+              ["No resets", "Capital carries forward", "There is no forced liquidation or equal-cash restart. The storyline compounds and so do the consequences."],
+            ].map(([k,w,v]) => (
+              <div key={k} style={{ marginBottom:8, fontSize:11 }}>
+                <span style={{ color:"#ef4444", fontWeight:700 }}>{k}</span>
+                <span style={{ color:"#fbbf24", marginLeft:8 }}>({w})</span>
+                <div style={{ color:"#64748b", marginTop:2 }}>{v}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* 30-team tips */}
+          <div style={{ background:"#060c18", border:"1px solid #38bdf844",
+            borderRadius:10, padding:"14px 18px" }}>
+            <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:800, fontSize:13,
+              color:"#38bdf8", marginBottom:10 }}>30-TEAM OPERATION TIPS</div>
+            {[
+              "Assign 1 co-facilitator to monitor leaderboard and announce top 3 every 2 minutes",
+              "Disable bot AI trades before the event to reduce API load (GM Panel → Market Tab)",
+              "Use the Prediction Market at the start of each buffer to keep teams engaged during breaks",
+              "Let the scheduled silent storyline beats land naturally instead of injecting generic shocks mid-round",
+              "Announce the round identity and special rules on a speaker before each round starts",
+              "Keep the Central Display on a projector visible to all teams at all times",
+              "Use the Circuit Breaker card when you need a clean halt and regroup moment",
+              "In Round 5 (Dark Pool), do NOT show the leaderboard on the projector either",
+            ].map((tip, i) => (
+              <div key={i} style={{ display:"flex", gap:8, marginBottom:8, fontSize:11 }}>
+                <span style={{ color:"#38bdf8", flexShrink:0 }}>{i+1}.</span>
+                <span style={{ color:"#64748b" }}>{tip}</span>
+              </div>
+            ))}
+          </div>
+
+        </div>
+      </div>
+    </div>
+  );
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // LOGIN
+  // ════════════════════════════════════════════════════════════════════════════
+  if (screen === "login") return (
+    <div style={{ minHeight:"100vh", background:"#020817", display:"flex", alignItems:"center",
+      justifyContent:"center", fontFamily:"'JetBrains Mono','Courier New',monospace" }}>
+      <style>{CSS}</style>
+      <div style={{ width:440, padding:44, animation:"fadeup 0.5s ease" }}>
+        <div style={{ textAlign:"center", marginBottom:36 }}>
+          <div style={{ fontSize:9, letterSpacing:"0.4em", color:"#334155", marginBottom:12 }}>
+            7 ROUNDS · 58 STOCKS · 9 SECTORS
+          </div>
+          <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:68, lineHeight:1,
+            background:"linear-gradient(135deg,#00f5c4,#38bdf8)",
+            WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent", marginBottom:6 }}>
+            BULL PIT
+          </div>
+          <div style={{ fontSize:11, color:"#475569" }}>Where fortunes are forged in seconds</div>
+          <div style={{ display:"flex", justifyContent:"center", gap:6, marginTop:12, flexWrap:"wrap" }}>
+            {SECTORS.map(s => (
+              <span key={s.id} style={{ fontSize:9, padding:"2px 7px", borderRadius:4,
+                background:`${s.color}18`, border:`1px solid ${s.color}44`, color:s.color }}>
+                {s.icon} {s.label}
+              </span>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ display:"flex", background:"#0f172a", borderRadius:10, padding:4, marginBottom:24 }}>
+          {["player","gm"].map(t => (
+            <button key={t} onClick={() => setLoginTab(t)} style={{
+              flex:1, padding:"10px", background:loginTab===t?"#1e293b":"none",
+              border:"none", borderRadius:7, color:loginTab===t?"#f1f5f9":"#475569",
+              cursor:"pointer", fontFamily:"inherit", fontSize:11,
+              fontWeight:loginTab===t?700:400, letterSpacing:"0.08em", textTransform:"uppercase"
+            }}>{t==="gm"?"⚡ Game Master":"👤 Team Login"}</button>
+          ))}
+        </div>
+
+        {loginTab === "player" ? (
+          <div style={{ animation:"fadein 0.3s ease" }}>
+            <div style={{ fontSize:10, color:"#475569", marginBottom:6 }}>SELECT YOUR TEAM</div>
+            <div style={{ position:"relative", marginBottom:12 }}>
+              {nameInput && (() => {
+                const t = teams.find(x => x.name === nameInput);
+                return t ? (
+                  <div style={{ position:"absolute", left:14, top:"50%", transform:"translateY(-50%)",
+                    width:10, height:10, borderRadius:"50%", background:t.color,
+                    pointerEvents:"none", zIndex:1 }}/>
+                ) : null;
+              })()}
+              <select value={nameInput} onChange={e => { setNameInput(e.target.value); setLoginErr(""); }}
+                style={{ width:"100%", padding:`12px 14px 12px ${nameInput ? "32px" : "14px"}`,
+                  background:"#0f172a",
+                  border:`1px solid ${nameInput ? (teams.find(x=>x.name===nameInput)?.color || "#1e293b") : "#1e293b"}`,
+                  color: nameInput ? (teams.find(x=>x.name===nameInput)?.color || "#f1f5f9") : "#475569",
+                  borderRadius:8, fontSize:13, fontFamily:"inherit",
+                  cursor:"pointer", appearance:"none", WebkitAppearance:"none", outline:"none" }}>
+                <option value="" disabled style={{ color:"#475569", background:"#0f172a" }}>
+                  Choose your team...
+                </option>
+                {teams.map(t => (
+                  <option key={t.id} value={t.name}
+                    style={{ color:t.color, background:"#0f172a", fontWeight:700 }}>
+                    {t.name}
+                  </option>
+                ))}
+              </select>
+              <div style={{ position:"absolute", right:14, top:"50%", transform:"translateY(-50%)",
+                pointerEvents:"none", color:"#475569", fontSize:12 }}>v</div>
+            </div>
+            <div style={{ fontSize:10, color:"#475569", marginBottom:6 }}>TEAM PASSWORD</div>
+            <input type="password" value={passInput}
+              onChange={e => { setPassInput(e.target.value); setLoginErr(""); }}
+              placeholder="Enter password…"
+              style={{ width:"100%", padding:"12px 14px", background:"#0f172a",
+                border:`1px solid ${loginErr?"#ef4444":"#1e293b"}`,
+                color:"#f1f5f9", borderRadius:8, fontSize:13, fontFamily:"inherit", marginBottom:8 }} />
+            {loginErr && <div style={{ color:"#ef4444", fontSize:11, marginBottom:8 }}>{loginErr}</div>}
+            <button onClick={handlePlayerLogin} disabled={loginBusy}
+              style={{ width:"100%", padding:"13px",
+              background:"linear-gradient(135deg,#00f5c4,#38bdf8)", border:"none",
+              borderRadius:9, color:"#020817", fontSize:13, fontWeight:800,
+              cursor:loginBusy?"wait":"pointer", opacity:loginBusy?0.65:1,
+              fontFamily:"inherit", letterSpacing:"0.08em" }}>
+              {loginBusy ? "SIGNING IN..." : "ENTER MARKET →"}
+            </button>
+          </div>
+        ) : loginTab === "gm" ? (
+          <div style={{ animation:"fadein 0.3s ease" }}>
+            <div style={{ fontSize:10, color:"#475569", marginBottom:8 }}>GM ACCESS</div>
+            <input type="password" value={gmPass}
+              onChange={e => { setGmPass(e.target.value); setLoginErr(""); }}
+              placeholder="GM password…"
+              style={{ width:"100%", padding:"12px 14px", background:"#0f172a",
+                border:`1px solid ${loginErr?"#ef4444":"#1e293b"}`,
+                color:"#f1f5f9", borderRadius:8, fontSize:13, fontFamily:"inherit", marginBottom:8 }} />
+            {loginErr && <div style={{ color:"#ef4444", fontSize:11, marginBottom:8 }}>{loginErr}</div>}
+            <button onClick={handleGMLogin} disabled={loginBusy}
+              style={{ width:"100%", padding:"13px",
+              background:"linear-gradient(135deg,#7c2d12,#dc2626)", border:"none",
+              borderRadius:9, color:"#fff", fontSize:13, fontWeight:800,
+              cursor:loginBusy?"wait":"pointer", opacity:loginBusy?0.65:1,
+              fontFamily:"inherit", letterSpacing:"0.08em" }}>
+              {loginBusy ? "SIGNING IN..." : "⚡ ENTER GM PANEL →"}
+            </button>
+          </div>
+        ) : (
+          <div style={{ animation:"fadein 0.3s ease" }}>
+            <div style={{ background:"#0a0f1e", border:"1px solid #1e293b",
+              borderRadius:10, padding:"16px 18px", marginBottom:12 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:10 }}>
+                <span style={{ fontSize:18 }}>📺</span>
+                <span style={{ fontFamily:"'Syne',sans-serif", fontWeight:800,
+                  fontSize:14, color:"#38bdf8" }}>CENTRAL DISPLAY</span>
+              </div>
+              <div style={{ fontSize:11, color:"#475569", lineHeight:1.7, marginBottom:12 }}>
+                The Central Display is a separate screen for projectors or main screens.
+                Open it in a new tab and enter the password below to launch.
+              </div>
+              <div style={{ background:"#020817", borderRadius:8, padding:"12px 14px",
+                border:"1px solid #38bdf830" }}>
+                <div style={{ fontSize:9, color:"#334155", letterSpacing:"0.15em", marginBottom:6 }}>
+                  DISPLAY PASSWORD
+                </div>
+                <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:28,
+                  color:"#38bdf8", letterSpacing:"0.1em" }}>
+                  BULLPIT2025
+                </div>
+              </div>
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:6, marginBottom:12 }}>
+              {[
+                { icon:"🏆", label:"Live Leaderboard", desc:"2-col, auto-updating" },
+                { icon:"📡", label:"Trade Stream",     desc:"Real-time buy/sell feed" },
+                { icon:"🚨", label:"Disruption News",  desc:"AI-generated events" },
+                { icon:"⏳", label:"Round Timer",      desc:"Countdown + phase status" },
+              ].map(f => (
+                <div key={f.label} style={{ background:"#0a0f1e", border:"1px solid #1e293b",
+                  borderRadius:7, padding:"8px 10px" }}>
+                  <div style={{ fontSize:12, marginBottom:3 }}>
+                    {f.icon}{" "}<span style={{ fontSize:10, color:"#64748b", fontWeight:700 }}>{f.label}</span>
+                  </div>
+                  <div style={{ fontSize:9, color:"#334155" }}>{f.desc}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{ fontSize:10, color:"#334155", textAlign:"center",
+              padding:"8px", background:"#0a0f1e", borderRadius:6, border:"1px solid #1e293b" }}>
+              Open central-display.jsx in a separate browser tab
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  // ─── GM BUTTON STYLE HELPER ───────────────────────────────────────────────
+  const gmBtn = (bg, col, enabled = true) => ({
+    padding: "9px 10px", background: enabled ? bg : "#0f172a",
+    border: `1px solid ${enabled ? col + "55" : "#1e293b"}`,
+    color: enabled ? col : "#334155", borderRadius: 6,
+    cursor: enabled ? "pointer" : "not-allowed", fontFamily: "inherit",
+    fontSize: 10, fontWeight: 700, letterSpacing: "0.06em",
+    opacity: enabled ? 1 : 0.45, transition: "opacity 0.2s",
+  });
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // GM SCREEN
+  // ════════════════════════════════════════════════════════════════════════════
+  if (screen === "gm") return (
+    <div style={{ minHeight:"100vh", background:"#020817",
+      fontFamily:"'JetBrains Mono','Courier New',monospace", color:"#f1f5f9",
+      display:"flex", flexDirection:"column" }}>
+      <style>{CSS}</style>
+      {showCeremony && <WinnerCeremony ranked={winnerRanked} teams={teams} />}
+      {showEmergency && <EmergencyModal events={disruptions} bufferLeft={bufferLeft}
+        onApply={applyDisruption} onClose={startNextRound} isFirstRound={!gameStartedRef.current && roundNum === 1} />}
+      {predictionSession && predictionSession.phase !== "closed" && (
+        <PredictionMarketOverlay
+          session={predictionSession}
+          playerPrediction={null}
+          onVote={() => {}}
+          isGM
+          teamName="GM"
+        />
+      )}
+
+      {/* Header */}
+      <div style={{ display:"flex", alignItems:"center", gap:12, padding:"10px 20px",
+        borderBottom:"1px solid #1e293b", background:"linear-gradient(90deg,#0a0518,#020817)" }}>
+        <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:28,
+          background:"linear-gradient(135deg,#f59e0b,#ef4444)",
+          WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent" }}>BULL PIT</div>
+        <div style={{ fontSize:10, color:"#475569", letterSpacing:"0.12em" }}>GAME MASTER</div>
+        <div style={{ display:"flex", gap:4 }}>
+          {Array.from({length:TOTAL_ROUNDS},(_,i) => {
+            const rn=i+1,done=rn<roundNum,active=rn===roundNum;
+            return <div key={i} style={{ width:active?20:12,height:12,borderRadius:6,
+              background:done?"#00f5c4":active?"#fbbf24":"#1e293b",
+              border:active?"2px solid #fbbf24":"2px solid transparent",transition:"all 0.3s" }}/>;
+          })}
+        </div>
+        <span style={{ fontSize:10, color:"#fbbf24", fontWeight:700 }}>
+          R{roundNum}/{TOTAL_ROUNDS} · {gamePhase.toUpperCase()}
+        </span>
+        {timerMins!=null && gamePhase==="running" && (
+          <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:22, color:timerMins<3?"#ef4444":"#f1f5f9" }}>
+            {String(timerMins).padStart(2,"0")}:{String(timerSecs).padStart(2,"0")}
+          </div>
+        )}
+        {bufMins!=null && gamePhase==="buffer" && (
+          <div style={{ fontSize:14, fontWeight:700, color:"#38bdf8" }}>
+            BUFFER {String(bufMins).padStart(2,"0")}:{String(bufSecs).padStart(2,"0")}
+          </div>
+        )}
+        <div style={{ marginLeft:"auto" }}>
+          <button onClick={handleExitToLogin} style={{ padding:"6px 14px", background:"#1e293b",
+            border:"1px solid #334155", color:"#94a3b8", borderRadius:6,
+            cursor:"pointer", fontFamily:"inherit", fontSize:11 }}>← EXIT</button>
+        </div>
+      </div>
+
+      <div style={{ display:"grid", gridTemplateColumns:"290px 1fr", flex:1, overflow:"hidden" }}>
+        {/* Left Panel */}
+        <div style={{ borderRight:"1px solid #1e293b", display:"flex", flexDirection:"column", overflowY:"auto" }}>
+          <div style={{ display:"flex", borderBottom:"1px solid #1e293b" }}>
+            {["control","market","teams","broadcast"].map(t => (
+              <button key={t} onClick={() => setGmTab(t)} style={{
+                flex:1, padding:"8px 2px", background:"none", border:"none",
+                color:gmTab===t?"#f59e0b":"#475569", cursor:"pointer",
+                borderBottom:gmTab===t?"2px solid #f59e0b":"2px solid transparent",
+                fontSize:9, letterSpacing:"0.08em", textTransform:"uppercase",
+                fontFamily:"inherit", fontWeight:gmTab===t?700:400 }}>{t}</button>
+            ))}
+          </div>
+          <div style={{ padding:14, flex:1 }}>
+            {gmTab==="control" && (
+              <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+
+                {/* ── ROUND IDENTITY BANNER ── */}
+                {gamePhase === "running" && (() => {
+                  const rules = ROUND_RULES[roundNum-1] || ROUND_RULES[0];
+                  return (
+                    <div style={{ background:`linear-gradient(135deg,${rules.color}22,${rules.color}08)`,
+                      border:`1px solid ${rules.color}55`, borderRadius:10, padding:"10px 14px" }}>
+                      <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:6 }}>
+                        <span style={{ fontSize:20 }}>{rules.icon}</span>
+                        <div>
+                          <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:800,
+                            fontSize:14, color:rules.color }}>{rules.name}</div>
+                          <div style={{ fontSize:9, color:"#64748b" }}>Round {roundNum} of {TOTAL_ROUNDS}</div>
+                        </div>
+                        <div style={{ marginLeft:"auto", display:"flex", gap:6 }}>
+                          <span style={{ fontSize:9, padding:"2px 6px", borderRadius:4,
+                            background:"#38bdf822", border:"1px solid #38bdf840", color:"#38bdf8", fontWeight:700 }}>
+                            IM {Math.round((rules.initialMargin || 0) * 100)} / MM {Math.round((rules.maintenanceMargin || 0) * 100)}
+                          </span>
+                          <span style={{ fontSize:9, padding:"2px 6px", borderRadius:4,
+                            background:"#f9731622", border:"1px solid #f9731640", color:"#f97316", fontWeight:700 }}>
+                            BORROW {fmt((rules.borrowRate || 0) * 100, 1)}%
+                          </span>
+                          <span style={{ fontSize:9, padding:"2px 6px", borderRadius:4,
+                            background:"#a78bfa22", border:"1px solid #a78bfa40", color:"#a78bfa", fontWeight:700 }}>
+                            FUND {fmt((rules.fundingRate || 0) * 100, 1)}%
+                          </span>
+                          {rules.leaderHidden && <span style={{ fontSize:9, padding:"2px 6px", borderRadius:4,
+                            background:"#a78bfa22", border:"1px solid #a78bfa40", color:"#a78bfa", fontWeight:700 }}>HIDDEN LB</span>}
+                          <span style={{ fontSize:9, padding:"2px 6px", borderRadius:4,
+                            background:"#38bdf822", border:"1px solid #38bdf840", color:"#38bdf8", fontWeight:700 }}>
+                            {rules.volMult}× VOL · {fmt(rules.spreadMult || 1, 2)}× SPR
+                          </span>
+                        </div>
+                      </div>
+                      <div style={{ fontSize:10, color:"#64748b", lineHeight:1.5 }}>{rules.briefing}</div>
+                    </div>
+                  );
+                })()}
+
+                {/* ── POWER-UP CARDS ── */}
+                <div style={{ background:"#0f172a", border:"1px solid #1e293b", borderRadius:8, padding:10 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
+                    <div style={{ fontSize:9, color:"#475569", letterSpacing:"0.1em" }}>POWER-UP CARDS</div>
+                    <div style={{ fontSize:8, color:"#334155" }}>{5 - usedCards.size} remaining</div>
+                  </div>
+                  <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:5 }}>
+                    {POWERUP_CARDS.map(card => {
+                      const used = usedCards.has(card.id);
+                      const isPol = card.id === "polshock";
+                      return (
+                        <button key={card.id} onClick={() => gmCmd("powerup",{id:card.id})}
+                          disabled={used || gamePhase !== "running"}
+                          style={{ padding:"8px 6px", background: used?"#0a0f1e":`${card.color}15`,
+                            border:`1px solid ${used?"#1e293b":card.color+"55"}`,
+                            borderRadius:7, cursor:used?"not-allowed":"pointer",
+                            fontFamily:"inherit", opacity:used?0.35:1, textAlign:"left",
+                            gridColumn: isPol ? "1/-1" : undefined,
+                            display: isPol ? "flex" : undefined,
+                            alignItems: isPol ? "center" : undefined,
+                            gap: isPol ? 10 : undefined,
+                          }}>
+                          <div style={{ fontSize:14, marginBottom: isPol?0:2 }}>{card.icon}</div>
+                          <div style={{ flex: isPol?1:undefined }}>
+                            <div style={{ fontSize:9, color:used?"#334155":card.color, fontWeight:700 }}>{card.name}</div>
+                            <div style={{ fontSize:8, color:"#475569", lineHeight:1.4, marginTop:2 }}>{card.desc}</div>
+                          </div>
+                          {used && <div style={{ fontSize:8, color:"#ef4444", marginTop: isPol?0:2 }}>USED</div>}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <button onClick={() => gmCmd("openPrediction")} disabled={predictionOpen || gamePhase!=="running"}
+                    style={{ width:"100%", marginTop:6, padding:"7px", fontSize:9, fontWeight:700,
+                      background: predictionOpen?"#0f172a":"rgba(0,245,196,0.1)",
+                      border:`1px solid ${predictionOpen?"#1e293b":"#00f5c4"}`,
+                      color:predictionOpen?"#334155":"#00f5c4", borderRadius:6,
+                      cursor:predictionOpen?"not-allowed":"pointer", fontFamily:"inherit" }}>
+                    {predictionOpen ? "🎯 Prediction Buffer LIVE" : `🎯 Start ${PREDICTION_POLL_SECS}s Prediction Buffer`}
+                  </button>
+                </div>
+
+                {/* ── RULEBOOK BUTTON ── */}
+                <button onClick={() => setShowRulebook(true)}
+                  style={{ width:"100%", padding:"8px", background:"rgba(168,139,250,0.1)",
+                    border:"1px solid #a78bfa44", borderRadius:8, color:"#a78bfa",
+                    cursor:"pointer", fontFamily:"inherit", fontSize:10, fontWeight:700 }}>
+                  📖 GM RULEBOOK
+                </button>
+
+                {/* Competition timeline summary */}
+                <div style={{ background:"#0f172a", border:"1px solid #1e293b", borderRadius:8, padding:10 }}>
+                  <div style={{ fontSize:9, color:"#475569", letterSpacing:"0.1em", marginBottom:8 }}>
+                    COMPETITION SCHEDULE
+                  </div>
+                  {roundDurations.map((dur, i) => {
+                    const rn = i + 1;
+                    const done   = rn < roundNum;
+                    const active = rn === roundNum && gamePhase === "running";
+                    const mins   = Math.floor(dur / 60);
+                    const label  = ROUND_LABELS[i];
+                    return (
+                      <div key={i} style={{
+                        display:"flex", alignItems:"center", gap:6,
+                        padding:"4px 0",
+                        borderBottom: i < 6 ? "1px solid #0f172a" : "none",
+                        opacity: done ? 0.4 : 1
+                      }}>
+                        {/* Pip */}
+                        <div style={{
+                          width:10, height:10, borderRadius:"50%", flexShrink:0,
+                          background: done?"#00f5c4" : active?"#fbbf24" : "#1e293b",
+                          border: active?"2px solid #fbbf24":"none",
+                          boxShadow: active?"0 0 6px #fbbf24":"none"
+                        }}/>
+                        {/* Label */}
+                        <span style={{ flex:1, fontSize:9,
+                          color: active?"#fbbf24" : done?"#334155" : "#64748b" }}>
+                          {label}
+                        </span>
+                        {/* Editable duration */}
+                        <div style={{ display:"flex", alignItems:"center", gap:3 }}>
+                          <input
+                            type="number" min={1} max={30} value={mins}
+                            onChange={e => {
+                              const v = Math.max(1, Math.min(30, +e.target.value || 1));
+                              setRoundDurations(prev => {
+                                const next = [...prev];
+                                next[i] = v * 60;
+                                return next;
+                              });
+                            }}
+                            style={{
+                              width:34, padding:"2px 4px", textAlign:"center",
+                              background:"#020817", border:`1px solid ${active?"#fbbf24":"#1e293b"}`,
+                              color: active?"#fbbf24":"#f1f5f9",
+                              borderRadius:4, fontFamily:"inherit", fontSize:11,
+                              opacity: done ? 0.4 : 1
+                            }}
+                          />
+                          <span style={{ fontSize:9, color:"#334155" }}>m</span>
+                        </div>
+                        {done && <span style={{ fontSize:9, color:"#00f5c4" }}>✓</span>}
+                      </div>
+                    );
+                  })}
+                  {/* Total + buffer summary */}
+                    <div style={{ marginTop:8, paddingTop:8, borderTop:"1px solid #1e293b",
+                    fontSize:9, color:"#334155" }}>
+                    <div style={{ display:"flex", justifyContent:"space-between", marginBottom:2 }}>
+                      <span>Play time</span>
+                      <span style={{ color:"#64748b" }}>
+                        {Math.floor(roundDurations.reduce((a,b)=>a+b,0)/60)}m
+                      </span>
+                    </div>
+                    <div style={{ display:"flex", justifyContent:"space-between", marginBottom:2 }}>
+                      <span>Buffer between rounds (×6)</span>
+                      <span style={{ color:"#64748b" }}>{Math.round(BUFFER_SECS/60*6)}m</span>
+                    </div>
+                    <div style={{ display:"flex", justifyContent:"space-between", marginBottom:2 }}>
+                      <span>Political shock buffer</span>
+                      <span style={{ color:"#a78bfa" }}>{POLITICAL_BUFFER_SECS}s</span>
+                    </div>
+                    <div style={{ display:"flex", justifyContent:"space-between", fontWeight:700 }}>
+                      <span style={{ color:"#94a3b8" }}>Total</span>
+                      <span style={{ color:"#fbbf24" }}>
+                        ~{Math.ceil((roundDurations.reduce((a,b)=>a+b,0) + BUFFER_SECS*6) / 60)}m
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Current round info */}
+                <div style={{ background:"#0f172a", border:"1px solid #1e293b", borderRadius:8, padding:"8px 10px",
+                  display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                  <div>
+                    <div style={{ fontSize:9, color:"#475569", letterSpacing:"0.1em" }}>CURRENT ROUND</div>
+                    <div style={{ fontSize:13, color:"#f1f5f9", fontWeight:700, marginTop:2 }}>
+                      {ROUND_LABELS[roundNum-1] || `Round ${roundNum}`}
+                    </div>
+                  </div>
+                  <div style={{ textAlign:"right" }}>
+                    <div style={{ fontSize:9, color:"#475569", letterSpacing:"0.1em" }}>DURATION</div>
+                    <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:22,
+                      color: roundNum <= 1 ? "#00f5c4" : roundNum <= 4 ? "#38bdf8" : "#f472b6" }}>
+                      {Math.floor(roundDur/60)}:00
+                    </div>
+                  </div>
+                </div>
+
+                {/* ── ROUND STORYLINE PREVIEW ── */}
+                <div style={{ background:"#0f172a", border:"1px solid #2563eb44", borderRadius:8, padding:10 }}>
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8, gap:8 }}>
+                    <div style={{ fontSize:9, color:"#60a5fa", letterSpacing:"0.1em", fontWeight:700 }}>
+                      {gamePhase === "running" ? "LIVE ROUND STORYLINE" : "NEXT ROUND STORYLINE"}
+                    </div>
+                    <div style={{ fontSize:8, color:"#334155" }}>
+                      Round {storyPreviewRound} · {storyPreview?.arc}
+                    </div>
+                  </div>
+                  <div style={{ background:"#020817", borderRadius:8, padding:"10px 12px", border:"1px solid #1e293b", marginBottom:8 }}>
+                    <div style={{ display:"flex", gap:10, alignItems:"flex-start" }}>
+                      <div style={{ fontSize:20 }}>{storyPreview?.opening?.icon}</div>
+                      <div style={{ flex:1 }}>
+                        <div style={{ fontSize:12, color:"#f1f5f9", fontWeight:800, lineHeight:1.4 }}>
+                          {storyPreview?.opening?.headline}
+                        </div>
+                        <div style={{ fontSize:10, color:"#64748b", marginTop:4, lineHeight:1.5 }}>
+                          {storyPreview?.opening?.subheadline}
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{ background:"#0a0f1e", borderRadius:6, padding:"8px 10px", marginTop:8, border:"1px solid #1e293b" }}>
+                      <div style={{ fontSize:8, color:"#60a5fa", fontWeight:800, letterSpacing:"0.12em", marginBottom:4 }}>
+                        GM ONLY — ECONOMIC LOGIC
+                      </div>
+                      <div style={{ fontSize:9, color:"#94a3b8", lineHeight:1.6 }}>
+                        {storyPreview?.opening?.concept}
+                      </div>
+                    </div>
+                    <div style={{ background:"#111827", borderRadius:6, padding:"8px 10px", marginTop:8, border:"1px solid #374151" }}>
+                      <div style={{ fontSize:8, color:"#fbbf24", fontWeight:800, letterSpacing:"0.12em", marginBottom:4 }}>
+                        TEAM CHALLENGE
+                      </div>
+                      <div style={{ fontSize:9, color:"#e5e7eb", lineHeight:1.6 }}>
+                        {storyPreview?.opening?.question}
+                      </div>
+                    </div>
+                    <div style={{ display:"flex", flexWrap:"wrap", gap:4, marginTop:8 }}>
+                      {Object.entries(storyPreview?.opening?.sectorMap || {}).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).slice(0, 6).map(([sid, impact]) => {
+                        const sec = SECTORS.find(s => s.id === sid);
+                        if (!sec) return null;
+                        const col = impact > 0 ? "#00f5c4" : "#ef4444";
+                        return (
+                          <span key={sid} style={{ fontSize:8, padding:"2px 6px", borderRadius:999, fontWeight:700,
+                            background:`${col}15`, border:`1px solid ${col}40`, color:col }}>
+                            {sec.icon} {sec.label}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <div style={{ fontSize:8, color:"#334155", letterSpacing:"0.1em", marginBottom:6 }}>SILENT MID-ROUND STORY BEATS</div>
+                  <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+                    {(storyPreview?.beats || []).map(beat => (
+                      <div key={beat.id} style={{ background:"#020817", borderRadius:7, border:"1px solid #111827", padding:"8px 10px" }}>
+                        <div style={{ display:"flex", justifyContent:"space-between", gap:8, marginBottom:4 }}>
+                          <div style={{ fontSize:10, color:"#e2e8f0", fontWeight:700 }}>{beat.icon} {beat.headline}</div>
+                          <div style={{ fontSize:8, color:"#64748b" }}>~{Math.round((beat.at || 0) * 100)}%</div>
+                        </div>
+                        <div style={{ fontSize:9, color:"#64748b", lineHeight:1.5 }}>{beat.subheadline}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:6 }}>
+                  {/* Generate Disruption — before every round */}
+                  <button
+                    onClick={generateDisruption}
+                    disabled={generating || gamePhase !== "idle"}
+                    style={{ ...gmBtn("#450a0a","#ef4444", gamePhase==="idle" && !generating),
+                      gridColumn:"1/-1", fontSize:11, letterSpacing:"0.06em" }}>
+                    {generating ? "🔄 PREPARING STORYLINE…" : `🚨 LAUNCH R${storyPreviewRound} STORYLINE BUFFER`}
+                  </button>
+                  {[
+                    {l:"⏸ PAUSE",    c:"pause",    col:"#fbbf24",bg:"#713f12",en:gamePhase==="running"},
+                    {l:"▶ RESUME",   c:"resume",   col:"#38bdf8",bg:"#0c4a6e",en:gamePhase==="paused"},
+                    {l:"■ STOP",     c:"stop",     col:"#ef4444",bg:"#7f1d1d",en:!["idle","ended","predisruption"].includes(gamePhase)},
+                    {l:"⏭ END ROUND",c:"forceEnd", col:"#a78bfa",bg:"#3b0764",en:gamePhase==="running"},
+                    {l:"🔄 RESET",   c:"reset",    col:"#64748b",bg:"#1e293b",en:true},
+                    {l:"⚡ RELAUNCH",  c:"relaunch", col:"#00f5c4",bg:"#064e3b",en:gamePhase==="predisruption"},
+                  ].map(b => (
+                    <button key={b.c}
+                      onClick={b.c==="relaunch" ? () => { setShowBlast(true); } : ()=>gmCmd(b.c)}
+                      disabled={!b.en} style={gmBtn(b.bg,b.col,b.en)}>{b.l}</button>
+                  ))}
+                </div>
+
+
+                <div style={{ borderTop:"1px solid #1e293b", paddingTop:10 }}>
+                  <div style={{ fontSize:9, color:"#475569", marginBottom:6 }}>STARTING CASH (per team)</div>
+                  <div style={{ display:"flex", gap:6 }}>
+                    <input type="number" value={initCash} onChange={e=>setInitCash(+e.target.value)}
+                      style={{ flex:1, padding:"7px 9px", background:"#0f172a", border:"1px solid #1e293b",
+                        color:"#f1f5f9", borderRadius:5, fontFamily:"inherit", fontSize:13 }} />
+                    <button onClick={()=>gmCmd("setInitCash",{cash:initCash})}
+                      style={{ padding:"7px 10px", background:"#1e293b", border:"1px solid #334155",
+                        color:"#94a3b8", borderRadius:5, cursor:"pointer", fontFamily:"inherit", fontSize:10, fontWeight:700 }}>SET</button>
+                  </div>
+                </div>
+                <div style={{ background:"#0f172a", borderRadius:8, padding:10, fontSize:10, color:"#64748b", lineHeight:1.9 }}>
+                  <div style={{ color:"#fbbf24", fontWeight:700, marginBottom:4 }}>10-INDICATOR SCORECARD</div>
+                  <div>35 pts – Performance</div>
+                  <div>40 pts – Capital Discipline</div>
+                  <div>30 pts – Market Craft</div>
+                  <div>Live rank = Net Equity · Final rank = Composite Score</div>
+                  <div style={{ marginTop:6, borderTop:"1px solid #1e293b", paddingTop:6, color:"#334155" }}>
+                    Buffer: {BUFFER_SECS}s between rounds · {POLITICAL_BUFFER_SECS}s after political shock · Margin call grace: {MARGIN_CALL_GRACE_SECS}s
+                  </div>
+                </div>
+              </div>
+            )}
+            {gmTab==="market" && (
+              <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+
+                {/* ── GLOBAL MARKET SENTIMENT ── */}
+                <div style={{ background:"#0f172a", border:"1px solid #1e293b", borderRadius:8, padding:10 }}>
+                  <div style={{ fontSize:9, color:"#475569", letterSpacing:"0.1em", marginBottom:7 }}>GLOBAL SENTIMENT</div>
+                  <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:5 }}>
+                    {[["bull","📈 BULL","#00f5c4"],["bear","📉 BEAR","#ef4444"],
+                      ["volatile","⚡ VOLATILE","#fbbf24"],["neutral","〰 NEUTRAL","#64748b"]].map(([s,l,c]) => (
+                      <button key={s} onClick={()=>gmCmd("sentiment",{s})}
+                        style={{ ...gmBtn(sentiment===s?"#1e293b":"#0f172a",c,true),
+                          border:`1px solid ${sentiment===s?c:"#1e293b"}` }}>{l}</button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* ── STORYLINE COMMAND CENTER ── */}
+                <div style={{ background:"#0f172a", border:"1px solid #1e293b", borderRadius:8, padding:10 }}>
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:9 }}>
+                    <div style={{ fontSize:9, color:"#60a5fa", letterSpacing:"0.1em", fontWeight:700 }}>STORYLINE COMMAND</div>
+                    <div style={{ fontSize:8, color:"#334155" }}>Round {roundNum} · {currentStoryline?.arc}</div>
+                  </div>
+                  <div style={{ background:"#020817", borderRadius:8, padding:"10px 12px", border:"1px solid #111827", marginBottom:8 }}>
+                    <div style={{ display:"flex", gap:10, alignItems:"flex-start", marginBottom:6 }}>
+                      <div style={{ fontSize:20 }}>{currentStoryline?.opening?.icon}</div>
+                      <div style={{ flex:1 }}>
+                        <div style={{ fontSize:11, color:"#f1f5f9", fontWeight:800, lineHeight:1.5 }}>
+                          {currentStoryline?.opening?.headline}
+                        </div>
+                        <div style={{ fontSize:9, color:"#64748b", marginTop:4, lineHeight:1.6 }}>
+                          {currentStoryline?.opening?.storylineBlurb || currentStoryline?.opening?.subheadline}
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{ display:"flex", flexWrap:"wrap", gap:4 }}>
+                      {Object.entries(currentStoryline?.opening?.sectorMap || {}).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).slice(0, 6).map(([sid, impact]) => {
+                        const sec = SECTORS.find(s => s.id === sid);
+                        if (!sec) return null;
+                        const col = impact > 0 ? "#00f5c4" : "#ef4444";
+                        return (
+                          <span key={sid} style={{ fontSize:8, padding:"2px 6px", borderRadius:999,
+                            background:`${col}15`, border:`1px solid ${col}40`, color:col, fontWeight:700 }}>
+                            {sec.icon} {impact > 0 ? "Tailwind" : "Pressure"}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <div style={{ fontSize:8, color:"#334155", letterSpacing:"0.1em", marginBottom:6 }}>SILENT MID-ROUND BEATS</div>
+                  <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+                    {(currentStoryline?.beats || []).map(beat => (
+                      <div key={beat.id} style={{ background:"#020817", border:"1px solid #111827", borderRadius:7, padding:"8px 10px" }}>
+                        <div style={{ display:"flex", justifyContent:"space-between", gap:8, marginBottom:4 }}>
+                          <div style={{ fontSize:10, color:"#e2e8f0", fontWeight:700 }}>{beat.icon} {beat.headline}</div>
+                          <div style={{ fontSize:8, color:"#64748b" }}>~{Math.round((beat.at || 0) * 100)}%</div>
+                        </div>
+                        <div style={{ fontSize:9, color:"#64748b", lineHeight:1.5 }}>{beat.subheadline}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ marginTop:8, padding:"8px 10px", background:"#0a0f1e", borderRadius:7, border:"1px solid #1e293b", fontSize:9, color:"#475569", lineHeight:1.6 }}>
+                    Legacy generic sector auto-disruptions are disabled. The running round now follows the America storyline only, and the mid-round beats post quietly into News without a full-screen alert.
+                  </div>
+                </div>
+
+                {/* ── SINGLE-STOCK SHOCK ── */}
+                <div style={{ background:"#0f172a", border:"1px solid #1e293b", borderRadius:8, padding:10 }}>
+                  <div style={{ fontSize:9, color:"#475569", letterSpacing:"0.1em", marginBottom:7 }}>SINGLE STOCK SHOCK</div>
+                  <select value={shockTicker} onChange={e=>setShockTicker(e.target.value)}
+                    style={{ width:"100%", padding:"7px", background:"#060c18", border:"1px solid #1e293b",
+                      color:"#f1f5f9", borderRadius:5, fontFamily:"inherit", fontSize:10, marginBottom:7 }}>
+                    {SECTORS.map(sec => (
+                      <optgroup key={sec.id} label={`${sec.icon} ${sec.label}`}>
+                        {sec.stocks.map(st => <option key={st.ticker} value={st.ticker}>{st.ticker} — {st.name}</option>)}
+                      </optgroup>
+                    ))}
+                  </select>
+                  <div style={{ display:"flex", gap:7, alignItems:"center", marginBottom:7 }}>
+                    <input type="range" min={-60} max={60} value={shockPct}
+                      onChange={e=>setShockPct(+e.target.value)}
+                      style={{ flex:1, accentColor:shockPct>=0?"#00f5c4":"#ef4444" }} />
+                    <span style={{ width:46, textAlign:"right", fontWeight:700, fontSize:11,
+                      color:shockPct>=0?"#00f5c4":"#ef4444" }}>{shockPct>=0?"+":""}{shockPct}%</span>
+                  </div>
+                  <button onClick={()=>gmCmd("shock",{ticker:shockTicker,pct:shockPct})}
+                    style={{ ...gmBtn(shockPct>=0?"#064e3b":"#7f1d1d",shockPct>=0?"#00f5c4":"#ef4444"), padding:"8px" }}>
+                    ⚡ SHOCK {shockTicker}
+                  </button>
+                </div>
+
+              </div>
+            )}
+            {gmTab==="teams" && <TeamEditor teams={teams} onSave={t=>{setTeams(t);pushTeams(t);}} />}
+            {gmTab==="broadcast" && (
+              <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+                {/* ── Broadcast message ── */}
+                <div style={{ fontSize:10, color:"#475569", letterSpacing:"0.1em" }}>BROADCAST TO ALL</div>
+                <BroadcastInline onSend={text=>gmCmd("broadcast",{text})} />
+
+                {/* ── Manual Disruption News ── */}
+                <div style={{ marginTop:6, borderTop:"1px solid #1e293b", paddingTop:10 }}>
+                  <div style={{ fontSize:10, color:"#ef4444", letterSpacing:"0.1em", marginBottom:8 }}>
+                    🚨 DISRUPTION NEWS UPDATE
+                  </div>
+                  <ManualDisruption
+                    stocks={ALL_STOCKS}
+                    prices={prices}
+                    onPublish={async (events) => {
+                      setDisruptions(events);
+                      await pushDisrupts(events);
+                      archiveDisruptionsOnce(events, "MANUAL DISRUPTION");
+                      setShowEmergency(true);
+                      sendBcast("🚨 BREAKING: New market disruption bulletin released!");
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Right */}
+        <div style={{ overflowY:"auto", padding:18 }}>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 360px", gap:18 }}>
+            <div>
+              <div style={{ fontSize:10, color:"#475569", letterSpacing:"0.1em", marginBottom:12 }}>
+                MARKET OVERVIEW · {ALL_STOCKS.length} STOCKS
+              </div>
+              {SECTORS.map(sec => {
+                const bias = sectorBiases[sec.id];
+                const biasColor = bias==="bull"?"#00f5c4":bias==="bear"?"#ef4444":bias==="volatile"?"#fbbf24":"#334155";
+                const isAuto = activeDisruptSectors.has(sec.id);
+                const isSelected = selectedSectors.has(sec.id);
+                const secNews = sectorDisruptions[sec.id] || [];
+                return (
+                  <div key={sec.id} style={{ marginBottom:14 }}>
+                    <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:7,
+                      padding:"6px 8px", borderRadius:7,
+                      background: isSelected ? `${sec.color}10` : "transparent",
+                      border: `1px solid ${isSelected ? sec.color+"40" : "transparent"}`,
+                      cursor:"pointer" }}
+                      onClick={() => setSelectedSectors(prev => {
+                        const n=new Set(prev); n.has(sec.id)?n.delete(sec.id):n.add(sec.id); return n;
+                      })}>
+                      <span style={{ fontSize:13 }}>{sec.icon}</span>
+                      <span style={{ fontWeight:700, color:isSelected?sec.color:sec.color+"99", fontSize:11 }}>{sec.label}</span>
+                      {bias !== "neutral" && (
+                        <span style={{ fontSize:8, padding:"1px 6px", borderRadius:3, fontWeight:800,
+                          background:`${biasColor}18`, border:`1px solid ${biasColor}40`, color:biasColor }}>
+                          {bias.toUpperCase()}
+                        </span>
+                      )}
+                      {isAuto && <span style={{ fontSize:9, color:"#a78bfa", animation:"pulse 1s infinite" }}>⚡AUTO</span>}
+                      {generatingSector===sec.id && <span style={{ fontSize:9, color:"#38bdf8", animation:"pulse 0.5s infinite" }}>🔄</span>}
+                      <div style={{ flex:1, height:1, background:"#111827" }} />
+                      {isSelected && <span style={{ fontSize:9, color:sec.color, fontWeight:700 }}>✓ SELECTED</span>}
+                    </div>
+                    <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:5 }}>
+                      {sec.stocks.map(st => {
+                        const p=prices[st.ticker]||0, prev=prevPrices[st.ticker]||p;
+                        const chg=((p-prev)/(prev||1))*100;
+                        const hasNews = secNews.find(e=>e.ticker===st.ticker);
+                        return (
+                          <div key={st.ticker} style={{ background:"#0a0f1e",
+                            border:`1px solid ${hasNews?(hasNews.impact>0?"#00f5c440":"#ef444440"):"#111827"}`,
+                            borderRadius:8, padding:"7px 9px",
+                            boxShadow: hasNews ? `0 0 8px ${hasNews.impact>0?"#00f5c420":"#ef444420"}` : "none" }}>
+                            <div style={{ fontWeight:700, color:sec.color, fontSize:10 }}>{st.ticker}</div>
+                            <div style={{ fontSize:8, color:"#1e293b", marginBottom:3, whiteSpace:"nowrap",
+                              overflow:"hidden", textOverflow:"ellipsis" }}>{st.name}</div>
+                            <div style={{ fontWeight:700, fontSize:11 }}>{fmtUSD(p)}</div>
+                            <div style={{ fontSize:9, color:chg>=0?"#00f5c4":"#ef4444" }}>
+                              {chg>=0?"▲":"▼"}{fmt(Math.abs(chg))}%
+                            </div>
+                            {hasNews && (
+                              <div style={{ fontSize:7, color:hasNews.impact>0?"#00f5c4":"#ef4444",
+                                marginTop:3, lineHeight:1.3, overflow:"hidden",
+                                textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                                {hasNews.impact>0?"+":""}{hasNews.impact}% · {hasNews.headline?.slice(0,30)}…
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {/* Sector news strip */}
+                    {secNews.length > 0 && (
+                      <div style={{ marginTop:5, padding:"5px 8px", background:"#060c18",
+                        borderRadius:6, borderLeft:`3px solid ${biasColor}` }}>
+                        <div style={{ fontSize:9, color:biasColor, fontWeight:700, marginBottom:3 }}>
+                          {sec.icon} ACTIVE DISRUPTION
+                        </div>
+                        {secNews.slice(0,2).map((n,i) => (
+                          <div key={i} style={{ fontSize:9, color:"#64748b", lineHeight:1.4 }}>
+                            <span style={{ color:n.impact>0?"#00f5c4":"#ef4444" }}>{n.ticker} {n.impact>0?"+":""}{n.impact}%</span>
+                            {" — "}{n.headline}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            <div>
+              <div style={{ fontSize:10, color:"#475569", letterSpacing:"0.1em", marginBottom:12 }}>LEADERBOARD</div>
+              <LeaderboardPanel entries={sharedLB} teams={teams} initCash={initCash} highlight="" showDetail mode={gamePhase === "ended" ? "final" : "live"} />
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // PLAYER SCREEN
+  // ════════════════════════════════════════════════════════════════════════════
+  const roundEndActive = ["ceremony","ended"].includes(gamePhase);
+  const pnlColor = analytics.totalPnL >= 0 ? "#00f5c4" : "#ef4444";
+  const activePortfolioAlert = clientTradeAlert || marginAlert;
+  const portfolioAlertTone = marginStatus === "call"
+    ? "#ef4444"
+    : marginStatus === "watch"
+      ? "#fbbf24"
+      : activePortfolioAlert?.type === "warning"
+        ? "#f97316"
+        : "#00f5c4";
+  const portfolioAlertTitle = marginStatus === "call"
+    ? "MARGIN CALL ACTIVE"
+    : marginStatus === "watch"
+      ? "MARGIN WATCH"
+      : activePortfolioAlert?.type === "warning"
+        ? "TRADE ALERT"
+        : "MARGIN STATUS";
+  const portfolioAlertBackground = marginStatus === "call"
+    ? "rgba(127,29,29,0.28)"
+    : marginStatus === "watch"
+      ? "rgba(120,53,15,0.24)"
+      : activePortfolioAlert?.type === "warning"
+        ? "rgba(67,20,7,0.34)"
+        : "rgba(2,44,34,0.28)";
+  const showTeamSettlementWindow = settlementViewRound != null
+    && (settlementViewLeft || 0) > 0
+    && ["buffer", "ceremony", "ended"].includes(gamePhase);
+  const teamSettlementTransactions = showTeamSettlementWindow
+    ? derivativeTransactions.filter(tx => tx.type === "DERIV_EXPIRE" && tx.settlementRound === settlementViewRound)
+    : [];
+  const showTeamDisruptionBuffer = gamePhase === "buffer" && disruptions.length > 0 && !showTeamSettlementWindow;
+  const newsRoundGroups = Object.entries(news.reduce((groups, item) => {
+    const roundKey = Number.isFinite(item?.round) && item.round > 0 ? String(item.round) : "general";
+    if (!groups[roundKey]) groups[roundKey] = [];
+    groups[roundKey].push(item);
+    return groups;
+  }, {})).sort((a, b) => {
+    if (a[0] === "general") return 1;
+    if (b[0] === "general") return -1;
+    return Number(b[0]) - Number(a[0]);
+  });
+
+  return (
+    <div style={{ minHeight:"100vh", background:"#020817", color:"#f1f5f9",
+      fontFamily:"'JetBrains Mono','Courier New',monospace", fontSize:13 }}>
+      <style>{CSS}</style>
+
+      {showTeamSettlementWindow && (
+        <DerivativeSettlementModal
+          teamName={currentTeam?.name}
+          round={settlementViewRound}
+          secondsLeft={settlementViewLeft}
+          settlements={teamSettlementTransactions}
+        />
+      )}
+
+      {showTeamDisruptionBuffer && (
+        <EmergencyModal
+          events={disruptions}
+          bufferLeft={bufferLeft}
+          onApply={() => {}}
+          onClose={() => {}}
+          isFirstRound={false}
+          passive
+          showConcept={false}
+        />
+      )}
+
+      {predictionSession && predictionSession.phase !== "closed" && (
+        <PredictionMarketOverlay
+          session={predictionSession}
+          playerPrediction={currentPredictionVote}
+          onVote={submitPredictionVote}
+          isGM={false}
+          teamName={currentTeam?.name}
+        />
+      )}
+
+      {/* ── CIRCUIT BREAKER BANNER ── */}
+      {isFrozen && (
+        <div style={{ position:"fixed", top:0, left:0, right:0, zIndex:8900,
+          background:"linear-gradient(90deg,#0c4a6e,#020817)",
+          border:"2px solid #38bdf8", padding:"10px 20px",
+          display:"flex", alignItems:"center", gap:12, fontFamily:"'JetBrains Mono',monospace" }}>
+          <span style={{ fontSize:22 }}>⛔</span>
+          <div style={{ flex:1 }}>
+            <div style={{ color:"#38bdf8", fontWeight:800, fontSize:13 }}>CIRCUIT BREAKER ACTIVE</div>
+            <div style={{ color:"#64748b", fontSize:10 }}>Trading and live price movement are paused until the halt expires.</div>
+          </div>
+          <span style={{ color:"#38bdf8", fontWeight:800 }}>⏳ {frozenUntil ? Math.max(0,Math.ceil((frozenUntil-Date.now())/1000)) : 0}s</span>
+        </div>
+      )}
+
+      {/* ── POWER-UP FLASH ── */}
+      {activePowerup && (
+        <div style={{ position:"fixed", inset:0, zIndex:9500, pointerEvents:"none",
+          display:"flex", alignItems:"center", justifyContent:"center",
+          background:"rgba(2,8,23,0.88)", animation:"fadein 0.2s" }}>
+          <div style={{ textAlign:"center", animation:"fadeup 0.3s" }}>
+            <div style={{ fontSize:80, marginBottom:12 }}>{activePowerup.icon}</div>
+            <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:52,
+              color:activePowerup.color, letterSpacing:"0.05em" }}>{activePowerup.name}</div>
+            <div style={{ fontSize:14, color:"#94a3b8", marginTop:8 }}>{activePowerup.desc}</div>
+          </div>
+        </div>
+      )}
+
+      {/* ── TAX NOTIFICATION ── */}
+      {taxPending && taxAmount > 0 && screen === "player" && (
+        <div style={{ position:"fixed", bottom:80, right:20, zIndex:8500,
+          background:"linear-gradient(135deg,#7f1d1d,#450a0a)",
+          border:"2px solid #ef4444", borderRadius:12, padding:"14px 18px",
+          fontFamily:"'JetBrains Mono',monospace", maxWidth:280, animation:"fadeup 0.4s",
+          boxShadow:"0 0 30px rgba(239,68,68,0.4)" }}>
+          <div style={{ color:"#ef4444", fontWeight:800, fontSize:13, marginBottom:4 }}>💸 ROUND TAX INCOMING</div>
+          <div style={{ color:"#94a3b8", fontSize:11, lineHeight:1.6 }}>20% profit tax at round end:</div>
+          <div style={{ color:"#fbbf24", fontWeight:800, fontSize:20, marginTop:4 }}>−${taxAmount.toLocaleString()}</div>
+          <div style={{ fontSize:9, color:"#64748b", marginTop:4 }}>Applied when next round begins</div>
+        </div>
+      )}
+
+      {/* ── ACHIEVEMENT TOAST ── */}
+      {achievements.length > 0 && achievements.slice(-1).map(ach => (
+        <div key={ach.id} style={{ position:"fixed", bottom:20, left:"50%",
+          transform:"translateX(-50%)", zIndex:8600,
+          background:"linear-gradient(135deg,#14532d,#064e3b)",
+          border:"2px solid #00f5c4", borderRadius:10, padding:"10px 18px",
+          display:"flex", alignItems:"center", gap:10,
+          fontFamily:"'JetBrains Mono',monospace", animation:"fadeup 0.4s",
+          boxShadow:"0 0 30px rgba(0,245,196,0.3)" }}>
+          <span style={{ fontSize:24 }}>{ach.icon}</span>
+          <div>
+            <div style={{ color:"#00f5c4", fontWeight:800, fontSize:12 }}>ACHIEVEMENT UNLOCKED: {ach.name}</div>
+            <div style={{ color:"#64748b", fontSize:10 }}>{ach.desc}</div>
+          </div>
+        </div>
+      ))}
+
+      {/* ── PREDICTION RESULT ── */}
+      {predResult && (
+        <div style={{ position:"fixed", inset:0, zIndex:8700, background:"rgba(2,8,23,0.95)",
+          display:"flex", alignItems:"center", justifyContent:"center",
+          fontFamily:"'JetBrains Mono',monospace" }}
+          onClick={() => setPredResult(null)}>
+          <div style={{ width:"min(520px,95vw)", background:"#0a0f1e",
+            border:`2px solid ${predResult.correct?"#00f5c4":"#ef4444"}`,
+            borderRadius:14, padding:"28px", animation:"fadeup 0.4s" }}>
+            <div style={{ textAlign:"center", marginBottom:20 }}>
+              <div style={{ fontSize:48, marginBottom:8 }}>{predResult.correct?"🎯":"❌"}</div>
+              <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:800, fontSize:20,
+                color:predResult.correct?"#00f5c4":"#ef4444", marginBottom:4 }}>
+                {predResult.correct?"CORRECT!":"INCORRECT"}
+              </div>
+              {predResult.correct && (
+                <div style={{ fontSize:14, color:"#fbbf24", fontWeight:700 }}>
+                  +${predResult.bonus.toLocaleString()} bonus applied!
+                </div>
+              )}
+            </div>
+            <div style={{ background:"#060c18", borderRadius:8, padding:"14px",
+              marginBottom:14, border:"1px solid #1e293b" }}>
+              <div style={{ fontSize:9, color:"#475569", marginBottom:6 }}>CORRECT ANSWER</div>
+              <div style={{ fontSize:12, color:"#f1f5f9", lineHeight:1.6 }}>{predResult.answer}</div>
+            </div>
+            <div style={{ background:"#060c18", borderRadius:8, padding:"14px",
+              border:"1px solid #7c3aed44" }}>
+              <div style={{ fontSize:9, color:"#7c3aed", fontWeight:700, marginBottom:6 }}>
+                ECONOMIC EXPLANATION
+              </div>
+              <div style={{ fontSize:11, color:"#94a3b8", lineHeight:1.7 }}>
+                {predResult.explanation}
+              </div>
+            </div>
+            <div style={{ textAlign:"center", marginTop:14, fontSize:9, color:"#334155" }}>
+              Tap anywhere to continue
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── ROUND IDENTITY BANNER (player view) ── */}
+      {gamePhase === "running" && (() => {
+        const rules = ROUND_RULES[roundNum-1] || ROUND_RULES[0];
+        return (
+          <div style={{ position:"fixed", bottom:0, left:0, right:0, zIndex:7000,
+            background:`${rules.color}18`, borderTop:`2px solid ${rules.color}55`,
+            padding:"6px 16px", display:"flex", alignItems:"center", gap:10,
+            fontFamily:"'JetBrains Mono',monospace" }}>
+            <span>{rules.icon}</span>
+            <span style={{ color:rules.color, fontWeight:800, fontSize:11 }}>{rules.name}</span>
+            <span style={{ color:"#475569", fontSize:9 }}>{rules.briefing}</span>
+            <span style={{ marginLeft:"auto", fontSize:9, padding:"2px 6px",
+              background:"#38bdf820", border:"1px solid #38bdf840", color:"#38bdf8",
+              borderRadius:4, fontWeight:700 }}>
+              IM {Math.round((rules.initialMargin || 0) * 100)} / MM {Math.round((rules.maintenanceMargin || 0) * 100)}
+            </span>
+            <span style={{ fontSize:9, padding:"2px 6px",
+              background:"#f9731620", border:"1px solid #f9731640", color:"#f97316",
+              borderRadius:4, fontWeight:700 }}>BORROW {fmt((rules.borrowRate || 0) * 100, 1)}%</span>
+            <span style={{ fontSize:9, padding:"2px 6px",
+              background:"#a78bfa20", border:"1px solid #a78bfa40", color:"#a78bfa",
+              borderRadius:4, fontWeight:700 }}>FUND {fmt((rules.fundingRate || 0) * 100, 1)}%</span>
+            {playerPrediction && playerPredictionRound === roundNum && (() => {
+              const pq = PREDICTION_QUESTIONS.find(q => q.round === roundNum);
+              const opt = pq?.options?.find(o => o.id === playerPrediction);
+              return (
+                <span style={{ fontSize:9, padding:"2px 6px",
+                  background:"#00f5c420", border:"1px solid #00f5c440", color:"#00f5c4",
+                  borderRadius:4 }}>
+                  Prediction locked: {opt ? `${opt.id.toUpperCase()}. ${opt.text.slice(0, 24)}${opt.text.length > 24 ? "…" : ""}` : playerPrediction}
+                </span>
+              );
+            })()}
+          </div>
+        );
+      })()}
+
+      {broadcast && (
+        <div style={{ position:"fixed", top:0, left:0, right:0, zIndex:9999,
+          background:"linear-gradient(135deg,#0c4a6e,#0f172a)",
+          borderBottom:"2px solid #38bdf8", padding:"12px 20px",
+          animation:"slidedown 0.4s ease", display:"flex", alignItems:"center", gap:12 }}>
+          <span style={{ fontSize:18 }}>📢</span>
+          <span style={{ color:"#e0f2fe", fontWeight:600, fontSize:12 }}>{broadcast.text}</span>
+          <button onClick={()=>setBroadcast(null)}
+            style={{ marginLeft:"auto", background:"none", border:"none", color:"#94a3b8", cursor:"pointer", fontSize:16 }}>×</button>
+        </div>
+      )}
+
+      {roundEndActive && (
+        <div style={{ position:"fixed", inset:0, zIndex:400, background:"rgba(2,8,23,0.9)",
+          display:"flex", alignItems:"center", justifyContent:"center", flexDirection:"column", gap:16 }}>
+          <div style={{ fontFamily:"'Syne',sans-serif", fontSize:36, fontWeight:900,
+            color:gamePhase==="buffer"?"#38bdf8":"#fbbf24" }}>
+            {gamePhase==="ended"?"🏆 COMPETITION OVER":gamePhase==="buffer"?"⏳ BUFFER PERIOD":"ROUND COMPLETE"}
+          </div>
+          {gamePhase==="buffer" && bufMins!=null && (
+            <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:48, color:"#38bdf8" }}>
+              {String(bufMins).padStart(2,"0")}:{String(bufSecs).padStart(2,"0")}
+            </div>
+          )}
+          <div style={{ width:400 }}>
+            <LeaderboardPanel entries={sharedLB} teams={teams} initCash={initCash}
+              highlight={currentTeam?.name} showDetail mode={gamePhase === "ended" ? "final" : "live"} />
+          </div>
+        </div>
+      )}
+
+      {/* Header */}
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
+        padding:"10px 18px", borderBottom:"1px solid #1e293b",
+        background:"#020817", position:"sticky", top:0, zIndex:100 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+          <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:24,
+            background:"linear-gradient(135deg,#00f5c4,#38bdf8)",
+            WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent" }}>BULL PIT</div>
+          <div style={{ width:7, height:7, borderRadius:"50%", flexShrink:0,
+            background:gamePhase==="running"?"#00f5c4":gamePhase==="paused"?"#fbbf24":gamePhase==="buffer"?"#38bdf8":"#64748b",
+            animation:gamePhase==="running"?"pulse 2s infinite":"none" }} />
+          <div style={{ display:"flex", flexDirection:"column", gap:1 }}>
+            <span style={{ fontSize:9, color:"#475569", letterSpacing:"0.1em" }}>
+              {ROUND_LABELS[roundNum-1] || `Round ${roundNum}`} · {gamePhase.toUpperCase()}
+            </span>
+            <span style={{ fontSize:8, color:"#334155" }}>
+              R{roundNum}/{TOTAL_ROUNDS} · {Math.floor(roundDur/60)}min round · {BUFFER_SECS}s buffer
+            </span>
+          </div>
+          {timerMins!=null && gamePhase==="running" && (
+            <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:22, lineHeight:1,
+              color: timerMins<1?"#ef4444":timerMins<3?"#fbbf24":"#94a3b8",
+              animation: timerMins<1?"pulse 0.5s infinite":timerMins<3?"pulse 2s infinite":"none" }}>
+              {String(timerMins).padStart(2,"0")}:{String(timerSecs).padStart(2,"0")}
+            </div>
+          )}
+          {bufMins!=null && gamePhase==="buffer" && (
+            <div style={{ fontSize:11, fontWeight:700, color:"#38bdf8" }}>
+              ⏳ {String(bufMins).padStart(2,"0")}:{String(bufSecs).padStart(2,"0")}
+            </div>
+          )}
+        </div>
+        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+          {myRank>0 && <span style={{ fontSize:10, padding:"3px 8px", borderRadius:4,
+            background:"#0f172a", border:"1px solid #1e293b", color:"#64748b" }}>
+            RANK #{myRank}/{sharedLB.length}
+          </span>}
+          <div style={{ textAlign:"right" }}>
+            <div style={{ fontSize:10, color:currentTeam?.color, fontWeight:700 }}>{currentTeam?.name}</div>
+            <div style={{ fontWeight:700, fontSize:13, color:analytics.totalPnL>=0?"#00f5c4":"#ef4444" }}>
+              {fmtUSD(totalVal)} {analytics.totalPnL>=0?"▲":"▼"}{fmtUSD(Math.abs(analytics.totalPnL))}
+            </div>
+          </div>
+          <button onClick={handleExitToLogin} style={{ padding:"5px 10px", background:"#0f172a",
+            border:"1px solid #1e293b", color:"#475569", borderRadius:5,
+            cursor:"pointer", fontFamily:"inherit", fontSize:10 }}>← EXIT</button>
+        </div>
+      </div>
+
+      {/* Ticker strip */}
+      <div style={{ background:"#040d1a", borderBottom:"1px solid #0f172a",
+        padding:"5px 0", overflow:"hidden", whiteSpace:"nowrap" }}>
+        <div style={{ display:"inline-flex", gap:20, animation:"ticker 60s linear infinite" }}>
+          {[...ALL_STOCKS,...ALL_STOCKS].map((s,i) => {
+            const p=prices[s.ticker]||0, prev=prevPrices[s.ticker]||p;
+            const chg=((p-prev)/(prev||1))*100;
+            return (
+              <span key={i} style={{ fontSize:11, display:"inline-flex", gap:5 }}>
+                <span style={{ color:s.color, fontWeight:700 }}>{s.ticker}</span>
+                <span style={{ color:"#64748b" }}>{fmtUSD(p)}</span>
+                <span style={{ color:chg>=0?"#00f5c4":"#ef4444" }}>{chg>=0?"▲":"▼"}{fmt(Math.abs(chg))}%</span>
+              </span>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Nav */}
+      <div style={{ display:"flex", borderBottom:"1px solid #1e293b", padding:"0 18px", overflowX:"auto" }}>
+        {["market","derivatives","portfolio","leaderboard","news"].map(t => (
+          <button key={t} onClick={()=>setTab(t)} style={{
+            padding:"10px 14px", background:"none", border:"none",
+            color:tab===t?"#00f5c4":"#475569", cursor:"pointer",
+            borderBottom:tab===t?"2px solid #00f5c4":"2px solid transparent",
+            fontSize:10, letterSpacing:"0.08em", textTransform:"uppercase",
+            fontFamily:"inherit", fontWeight:tab===t?700:400, whiteSpace:"nowrap" }}>{t}</button>
+        ))}
+      </div>
+
+      {(activePortfolioAlert || (analytics.grossExposure > 0 && marginStatus !== "safe")) && (
+        <div style={{
+          margin:"14px 18px 0",
+          padding:"12px 14px",
+          borderRadius:10,
+          border:`1px solid ${portfolioAlertTone}55`,
+          background: portfolioAlertBackground
+        }}>
+          <div style={{ display:"flex", justifyContent:"space-between", gap:12, alignItems:"center", flexWrap:"wrap" }}>
+            <div>
+              <div style={{ fontSize:10, fontWeight:800, letterSpacing:"0.1em", color:portfolioAlertTone }}>
+                {portfolioAlertTitle}
+              </div>
+              <div style={{ fontSize:11, color:"#cbd5e1", marginTop:4 }}>
+                {activePortfolioAlert?.text || `Maintenance buffer is ${fmt(analytics.marginBufferPct, 1)}%. Keep net equity above maintenance margin.`}
+              </div>
+            </div>
+            <div style={{ fontSize:10, color:"#94a3b8", textAlign:"right", lineHeight:1.6 }}>
+              <div>Net Equity: {fmtUSD(analytics.netEquity)}</div>
+              <div>Margin Buffer: {(analytics.marginBuffer >= 0 ? "+" : "") + fmtUSD(analytics.marginBuffer)}</div>
+              <div>
+                Carry Cost: {fmtUSD(analytics.totalCarryCost)}
+                {marginGraceSecs > 0 ? <span style={{ color:"#fbbf24" }}> · Auto-deleverage in {marginGraceSecs}s</span> : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div style={{ padding:"18px", maxWidth:1200, margin:"0 auto" }}>
+
+        {/* ── MARKET TAB ── */}
+        {tab === "market" && (
+          <>
+            {/* Sector filter + Search */}
+            <div style={{ display:"flex", gap:8, marginBottom:16, flexWrap:"wrap", alignItems:"center" }}>
+              <input value={marketSearch} onChange={e=>setMarketSearch(e.target.value)}
+                placeholder="Search stocks…"
+                style={{ padding:"7px 12px", background:"#0f172a", border:"1px solid #1e293b",
+                  color:"#f1f5f9", borderRadius:7, fontFamily:"inherit", fontSize:12, width:160 }} />
+              <button onClick={()=>setActiveSector("all")}
+                style={{ padding:"6px 12px", background:activeSector==="all"?"#1e293b":"#0a0f1e",
+                  border:`1px solid ${activeSector==="all"?"#64748b":"#1e293b"}`,
+                  color:activeSector==="all"?"#f1f5f9":"#475569", borderRadius:6,
+                  cursor:"pointer", fontFamily:"inherit", fontSize:10, fontWeight:700 }}>ALL</button>
+              {SECTORS.map(sec => (
+                <button key={sec.id} onClick={()=>setActiveSector(sec.id)}
+                  style={{ padding:"6px 10px", background:activeSector===sec.id?`${sec.color}20`:"#0a0f1e",
+                    border:`1px solid ${activeSector===sec.id?sec.color:"#1e293b"}`,
+                    color:activeSector===sec.id?sec.color:"#475569", borderRadius:6,
+                    cursor:"pointer", fontFamily:"inherit", fontSize:10, fontWeight:700 }}>
+                  {sec.icon} {sec.label.split(" ")[0]}
+                </button>
+              ))}
+            </div>
+
+            {/* ── TOP GAINERS & LOSERS ── */}
+            {(()=>{
+              const ranked = ALL_STOCKS.map(st => {
+                const p=prices[st.ticker]||0, h=history[st.ticker]||[], open=h[0]||p;
+                const chg=open?((p-open)/open)*100:0;
+                return {...st,p,chg};
+              }).filter(st=>st.p>0);
+              const gainers=[...ranked].sort((a,b)=>b.chg-a.chg).slice(0,5);
+              const losers=[...ranked].sort((a,b)=>a.chg-b.chg).slice(0,5);
+              // renderMover is a plain function (not a React component) — no hooks, no remount issue
+              const renderMover=(st,isGainer)=>{
+                const pos=holdings[st.ticker];
+                const heldLong=longQty(pos);
+                const heldShort=shortQty(pos);
+                const qBuy=canTrade&&(st.p * (1 + tradeSpreadRate))<=buyingPower&&heldShort===0;
+                const qSell=canTrade&&heldLong>0;
+                const qAlt=heldShort>0 ? canTrade : (canTrade&&heldLong===0&&(st.p * (1 + tradeSpreadRate))<=shortCapacity);
+                const accentColor=isGainer?"#00f5c4":"#ef4444";
+                return (
+                  <div key={st.ticker} style={{
+                    background:"#0a0f1e",
+                    border:`1px solid ${isGainer?"#00f5c420":"#ef444420"}`,
+                    borderLeft:`3px solid ${accentColor}`,
+                    borderRadius:10,padding:"10px 12px",
+                    display:"flex",alignItems:"center",gap:10,cursor:"pointer"
+                  }} onClick={()=>setDetailStock(st.ticker)}>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontWeight:800,color:st.color,fontSize:13}}>{st.ticker}</div>
+                      <div style={{fontSize:9,color:"#334155",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:90}}>{st.name}</div>
+                    </div>
+                    <Spark data={(history[st.ticker]||[]).slice(-20)} color={accentColor} w={50} h={22}/>
+                    <div style={{textAlign:"right",flexShrink:0}}>
+                      <div style={{fontSize:12,fontWeight:700,color:"#f1f5f9"}}>{fmtUSD(st.p)}</div>
+                      <div style={{fontSize:11,fontWeight:800,color:accentColor}}>{isGainer?"▲ +":"▼ "}{fmt(Math.abs(st.chg))}%</div>
+                    </div>
+                    <div style={{display:"flex",flexDirection:"column",gap:3,flexShrink:0}} onClick={e=>e.stopPropagation()}>
+                      <button onClick={()=>execBuy(st.ticker,1)} disabled={!qBuy} style={{padding:"3px 8px",fontSize:9,fontWeight:800,background:qBuy?"#00f5c422":"#0f172a",border:`1px solid ${qBuy?"#00f5c4":"#1e293b"}`,color:qBuy?"#00f5c4":"#334155",borderRadius:4,cursor:qBuy?"pointer":"not-allowed",fontFamily:"inherit"}}>▲ BUY</button>
+                      <button onClick={()=>execSell(st.ticker,1)} disabled={!qSell} style={{padding:"3px 8px",fontSize:9,fontWeight:800,background:qSell?"#ef444422":"#0f172a",border:`1px solid ${qSell?"#ef4444":"#1e293b"}`,color:qSell?"#ef4444":"#334155",borderRadius:4,cursor:qSell?"pointer":"not-allowed",fontFamily:"inherit"}}>▼ SELL</button>
+                      <button onClick={()=>heldShort>0?execCover(st.ticker,1):execShort(st.ticker,1)} disabled={!qAlt} style={{padding:"3px 8px",fontSize:9,fontWeight:800,background:qAlt?(heldShort>0?"#22c55e22":"#f9731622"):"#0f172a",border:`1px solid ${qAlt?(heldShort>0?"#22c55e":"#f97316"):"#1e293b"}`,color:qAlt?(heldShort>0?"#22c55e":"#f97316"):"#334155",borderRadius:4,cursor:qAlt?"pointer":"not-allowed",fontFamily:"inherit"}}>{heldShort>0?"↗ COVER":"↘ SHORT"}</button>
+                    </div>
+                  </div>
+                );
+              };
+              return (
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:20}}>
+                  <div style={{background:"#030810",border:"1px solid #0d1f10",borderRadius:12,overflow:"hidden"}}>
+                    <div style={{padding:"10px 14px",borderBottom:"1px solid #0d1f10",display:"flex",alignItems:"center",gap:8}}>
+                      <span style={{fontSize:14}}>🚀</span>
+                      <span style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:13,color:"#00f5c4"}}>TOP GAINERS</span>
+                      <span style={{marginLeft:"auto",fontSize:9,color:"#334155"}}>SESSION %</span>
+                    </div>
+                    <div style={{padding:"8px 10px",display:"flex",flexDirection:"column",gap:6}}>
+                      {gainers.map(st=>renderMover(st,true))}
+                    </div>
+                  </div>
+                  <div style={{background:"#030810",border:"1px solid #1f0d0d",borderRadius:12,overflow:"hidden"}}>
+                    <div style={{padding:"10px 14px",borderBottom:"1px solid #1f0d0d",display:"flex",alignItems:"center",gap:8}}>
+                      <span style={{fontSize:14}}>📉</span>
+                      <span style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:13,color:"#ef4444"}}>TOP LOSERS</span>
+                      <span style={{marginLeft:"auto",fontSize:9,color:"#334155"}}>SESSION %</span>
+                    </div>
+                    <div style={{padding:"8px 10px",display:"flex",flexDirection:"column",gap:6}}>
+                      {losers.map(st=>renderMover(st,false))}
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Stock detail modal */}
+            {detailStock && (() => {
+              const ds = ALL_STOCKS.find(x => x.ticker === detailStock);
+              const dsec = SECTORS.find(x => x.id === ds?.sectorId);
+              return (
+                <StockDetailModal
+                  stock={ds}
+                  sector={dsec}
+                  price={prices[detailStock]||0}
+                  prevPrice={prevPrices[detailStock]||0}
+                  history={history[detailStock]||[]}
+                  assetBeta={calcTickerAssetBeta(detailStock, history)}
+                  holdings={holdings}
+                  cash={cash}
+                  buyingPower={buyingPower}
+                  restrictedCash={restrictedCash}
+                  marginStatus={marginStatus}
+                  tradeSpreadRate={tradeSpreadRate}
+                  canTrade={canTrade}
+                  onBuy={execBuy}
+                  onSell={execSell}
+                  onShort={execShort}
+                  onCover={execCover}
+                  onClose={() => setDetailStock(null)}
+                  transactions={transactions}
+                  aiLog={aiLog}
+                  orderFlow={displayOrderFlowSnapshot[detailStock]}
+                />
+              );
+            })()}
+
+            {/* Stock grid */}
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))", gap:8, marginBottom:14 }}>
+              {filteredStocks.map(s => {
+                const p=prices[s.ticker]||0, h=history[s.ticker]||[], prev=prevPrices[s.ticker]||p;
+                const sessionChg=h[0]?((p-h[0])/h[0])*100:0;
+                const tickChg=((p-prev)/(prev||1))*100;
+                const isSel=selTicker===s.ticker;
+                const flow = displayOrderFlowSnapshot[s.ticker];
+                const flowDisplay = getOrderFlowDisplay(flow);
+                const pos = holdings[s.ticker];
+                const heldLong = longQty(pos);
+                const heldShort = shortQty(pos);
+                const canQuickBuy  = canTrade && (p * (1 + tradeSpreadRate)) <= buyingPower && heldShort === 0;
+                const canQuickSell = canTrade && heldLong > 0;
+                const canQuickAlt  = heldShort > 0
+                  ? canTrade
+                  : canTrade && heldLong === 0 && (p * (1 + tradeSpreadRate)) <= shortCapacity;
+                return (
+                  <div key={s.ticker} style={{
+                    background:"#0a0f1e", border:`1px solid ${isSel?s.color:"#111827"}`,
+                    borderRadius:10, padding:"12px 14px", cursor:"pointer",
+                    boxShadow:isSel?`0 0 20px ${s.color}18`:"none", transition:"all 0.2s",
+                    position:"relative" }}
+                    onClick={()=>setSelTicker(isSel?null:s.ticker)}>
+                    <div style={{ display:"flex", justifyContent:"space-between", marginBottom:4 }}>
+                      <div>
+                        <div style={{ fontWeight:800, color:s.color, fontSize:13 }}>{s.ticker}</div>
+                        <div style={{ fontSize:9, color:"#334155", maxWidth:90,
+                          overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{s.name}</div>
+                      </div>
+                      <div style={{ textAlign:"right" }}>
+                        <div style={{ fontWeight:700, fontSize:13 }}>{fmtUSD(p)}</div>
+                        <div style={{ fontSize:10, color:tickChg>=0?"#00f5c4":"#ef4444" }}>
+                          {tickChg>=0?"▲":"▼"}{fmt(Math.abs(tickChg))}%
+                        </div>
+                      </div>
+                    </div>
+                    <Spark data={h.slice(-30)} color={s.color} h={24} />
+                    <div style={{ marginTop:6 }}>
+                      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", fontSize:8, marginBottom:4 }}>
+                        <span style={{ color:"#00f5c4", fontWeight:700 }}>{flow?.buyPct ?? 50}% BUY</span>
+                        <span style={{ color:flowDisplay.color, fontWeight:800, letterSpacing:"0.08em" }}>{flowDisplay.label}</span>
+                        <span style={{ color:"#ef4444", fontWeight:700 }}>{flow?.sellPct ?? 50}% SELL</span>
+                      </div>
+                      <div style={{ position:"relative", height:5, borderRadius:999, background:"#111827", overflow:"hidden" }}>
+                        <div style={{ position:"absolute", inset:"0 auto 0 0", width:`${flow?.buyPct ?? 50}%`, background:"#00f5c4" }} />
+                        <div style={{ position:"absolute", inset:"0 0 0 auto", width:`${flow?.sellPct ?? 50}%`, background:"#ef4444" }} />
+                      </div>
+                    </div>
+                    <div style={{ display:"flex", justifyContent:"space-between", marginTop:5, fontSize:9 }}>
+                      {s.totalMarket ? (
+                        <span style={{ fontSize:8, padding:"1px 5px", borderRadius:3,
+                          background:"#e879f920", border:"1px solid #e879f960",
+                          color:"#e879f9", fontWeight:800 }}>ALL MARKET</span>
+                      ) : s.crossSector ? (
+                        <span style={{ fontSize:8, padding:"1px 5px", borderRadius:3,
+                          background:"#e879f915", border:"1px solid #e879f940",
+                          color:"#e879f9", fontWeight:700 }}>CROSS-SECTOR</span>
+                      ) : (
+                        <SectorBadge sectorId={s.sectorId} small />
+                      )}
+                      {heldLong>0 && <span style={{ color:s.color }}>L ×{heldLong}</span>}
+                      {heldShort>0 && <span style={{ color:"#fca5a5" }}>S ×{heldShort}</span>}
+                    </div>
+
+                    {/* ── Card action row ── */}
+                    <div style={{ display:"flex", gap:5, marginTop:8 }}
+                      onClick={e => e.stopPropagation()}>
+                      {/* Detail button */}
+                      <button
+                        onClick={() => setDetailStock(s.ticker)}
+                        style={{
+                          flex:1, padding:"5px 0", fontSize:9, fontWeight:700,
+                          background:"#0f172a", border:`1px solid ${s.color}44`,
+                          color:s.color, borderRadius:5, cursor:"pointer", fontFamily:"inherit",
+                          letterSpacing:"0.06em"
+                        }}>
+                        ⬡ DETAILS
+                      </button>
+                      {/* Quick BUY */}
+                      <button
+                        onClick={() => execBuy(s.ticker, 1)}
+                        disabled={!canQuickBuy}
+                        style={{
+                          flex:1, padding:"5px 0", fontSize:9, fontWeight:800,
+                          background: canQuickBuy ? "#00f5c422" : "#0f172a",
+                          border:`1px solid ${canQuickBuy ? "#00f5c4" : "#1e293b"}`,
+                          color: canQuickBuy ? "#00f5c4" : "#334155",
+                          borderRadius:5, cursor: canQuickBuy ? "pointer" : "not-allowed",
+                          fontFamily:"inherit"
+                        }}>
+                        ▲ BUY
+                      </button>
+                      {/* Quick SELL */}
+                      <button
+                        onClick={() => execSell(s.ticker, 1)}
+                        disabled={!canQuickSell}
+                        style={{
+                          flex:1, padding:"5px 0", fontSize:9, fontWeight:800,
+                          background: canQuickSell ? "#ef444422" : "#0f172a",
+                          border:`1px solid ${canQuickSell ? "#ef4444" : "#1e293b"}`,
+                          color: canQuickSell ? "#ef4444" : "#334155",
+                          borderRadius:5, cursor: canQuickSell ? "pointer" : "not-allowed",
+                          fontFamily:"inherit"
+                        }}>
+                        ▼ SELL
+                      </button>
+                      <button
+                        onClick={() => heldShort > 0 ? execCover(s.ticker, 1) : execShort(s.ticker, 1)}
+                        disabled={!canQuickAlt}
+                        style={{
+                          flex:1, padding:"5px 0", fontSize:9, fontWeight:800,
+                          background: canQuickAlt ? (heldShort > 0 ? "#22c55e22" : "#f9731622") : "#0f172a",
+                          border:`1px solid ${canQuickAlt ? (heldShort > 0 ? "#22c55e" : "#f97316") : "#1e293b"}`,
+                          color: canQuickAlt ? (heldShort > 0 ? "#22c55e" : "#f97316") : "#334155",
+                          borderRadius:5, cursor: canQuickAlt ? "pointer" : "not-allowed",
+                          fontFamily:"inherit"
+                        }}>
+                        {heldShort > 0 ? "↗ COVER" : "↘ SHORT"}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Trade Panel */}
+            {selTicker && selStock && (
+              <div style={{ background:"#0a0f1e", border:`1px solid ${selStock.color}55`,
+                borderRadius:12, padding:20, marginBottom:12,
+                boxShadow:`0 0 30px ${selStock.color}0d` }}>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:14 }}>
+                  <div>
+                    <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:4 }}>
+                      <span style={{ color:selStock.color, fontWeight:900, fontSize:22 }}>{selTicker}</span>
+                      <SectorBadge sectorId={selStock.sectorId} />
+                    </div>
+                    <div style={{ color:"#64748b", fontSize:12 }}>{selStock.name}</div>
+                    {holdings[selTicker] && (
+                      <div style={{ marginTop:6, fontSize:11, color:"#475569" }}>
+                        Avg cost: {fmtUSD(holdings[selTicker].avgCost)} · {positionSide(holdings[selTicker]) === "short" ? "Short" : "Long"}: {Math.abs(holdings[selTicker].qty)} shares
+                        · Unrealized: {' '}
+                        <span style={{ color:((prices[selTicker]-holdings[selTicker].avgCost)*holdings[selTicker].qty)>=0?"#00f5c4":"#ef4444", fontWeight:700 }}>
+                          {fmtUSD((prices[selTicker]-holdings[selTicker].avgCost)*holdings[selTicker].qty)}
+                          {' '}({(((prices[selTicker]-holdings[selTicker].avgCost)/holdings[selTicker].avgCost)*holdings[selTicker].qty) >= 0 ? "+" : ""}{fmt(Math.abs(((prices[selTicker]-holdings[selTicker].avgCost)/holdings[selTicker].avgCost)*100))}%)
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ textAlign:"right" }}>
+                    <div style={{ fontWeight:900, fontSize:26 }}>{fmtUSD(selPrice)}</div>
+                    <div style={{ fontSize:11, color:"#64748b" }}>
+                      Session: {(() => { const h=history[selTicker]||[],open=h[0]||selPrice,chg=((selPrice-open)/open)*100; return (<span style={{color:chg>=0?"#00f5c4":"#ef4444"}}>{chg>=0?"+":""}{fmt(chg)}%</span>); })()}
+                    </div>
+                  </div>
+                </div>
+                <div style={{ marginBottom:14 }}>
+                  <Spark data={(history[selTicker]||[]).slice(-50)} color={selStock.color} w={undefined} h={50} />
+                </div>
+                <div style={{ marginBottom:14, background:"#020817", border:"1px solid #1e293b", borderRadius:10, padding:"10px 12px" }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:7 }}>
+                    <div style={{ fontSize:9, color:"#475569", letterSpacing:"0.1em", fontWeight:700 }}>
+                      LIVE ORDER FLOW ({Math.round(ORDER_FLOW_WINDOW_MS / 1000)}s)
+                    </div>
+                    <div style={{ fontSize:10, fontWeight:800, color:selectedStockFlowDisplay.color }}>
+                      {selectedStockFlowDisplay.label}
+                    </div>
+                  </div>
+                  <div style={{ position:"relative", height:10, borderRadius:999, background:"#111827", overflow:"hidden" }}>
+                    <div style={{ position:"absolute", inset:"0 auto 0 0", width:`${selectedStockFlow?.buyPct ?? 50}%`, background:"#00f5c4" }} />
+                    <div style={{ position:"absolute", inset:"0 0 0 auto", width:`${selectedStockFlow?.sellPct ?? 50}%`, background:"#ef4444" }} />
+                  </div>
+                  <div style={{ display:"flex", justifyContent:"space-between", marginTop:6, fontSize:10, fontWeight:700 }}>
+                    <span style={{ color:"#00f5c4" }}>{selectedStockFlow?.buyPct ?? 50}% BUY</span>
+                    <span style={{ color:"#ef4444" }}>{selectedStockFlow?.sellPct ?? 50}% SELL</span>
+                  </div>
+                </div>
+                <div style={{ display:"flex", alignItems:"center", gap:12, flexWrap:"wrap" }}>
+                  <div>
+                    <div style={{ fontSize:9, color:"#475569", marginBottom:4 }}>QUANTITY</div>
+                    <input type="number" min={1} value={orderQty}
+                      onChange={e => setOrderQty(Math.max(1,parseInt(e.target.value)||1))}
+                      style={{ width:80, padding:"10px 12px", background:"#020817",
+                        border:"1px solid #1e293b", color:"#f1f5f9",
+                        borderRadius:6, fontSize:15, fontFamily:"inherit" }} />
+                  </div>
+                  <div style={{ fontSize:12, color:"#475569", alignSelf:"flex-end", paddingBottom:8 }}>
+                    = <strong style={{ color:"#f1f5f9" }}>{fmtUSD(buyTotal)}</strong>
+                  </div>
+                  <div style={{ marginLeft:"auto", display:"flex", gap:8, alignSelf:"flex-end" }}>
+                    <button onClick={doBuy} disabled={!canBuy} style={{
+                      padding:"11px 32px", background:canBuy?"#00f5c4":"#1e293b",
+                      color:canBuy?"#020817":"#334155", border:"none", borderRadius:7,
+                      fontWeight:800, cursor:canBuy?"pointer":"not-allowed",
+                      fontFamily:"inherit", fontSize:13 }}>BUY</button>
+                    <button onClick={doSell} disabled={!canSell} style={{
+                      padding:"11px 32px", background:canSell?"#ef4444":"#1e293b",
+                      color:canSell?"#fff":"#334155", border:"none", borderRadius:7,
+                      fontWeight:800, cursor:canSell?"pointer":"not-allowed",
+                      fontFamily:"inherit", fontSize:13 }}>SELL</button>
+                    <button onClick={doShort} disabled={!canShort} style={{
+                      padding:"11px 24px", background:canShort?"#f97316":"#1e293b",
+                      color:canShort?"#fff":"#334155", border:"none", borderRadius:7,
+                      fontWeight:800, cursor:canShort?"pointer":"not-allowed",
+                      fontFamily:"inherit", fontSize:13 }}>SHORT</button>
+                    <button onClick={doCover} disabled={!canCover} style={{
+                      padding:"11px 24px", background:canCover?"#22c55e":"#1e293b",
+                      color:canCover?"#04130a":"#334155", border:"none", borderRadius:7,
+                      fontWeight:800, cursor:canCover?"pointer":"not-allowed",
+                      fontFamily:"inherit", fontSize:13 }}>COVER</button>
+                  </div>
+                </div>
+                <div style={{ marginTop:8, fontSize:10, color:"#475569" }}>
+                  Free cash: {fmtUSD(cash)}
+                  <span style={{ marginLeft:10, color:"#64748b" }}>· Buying power: {fmtUSD(buyingPower)}</span>
+                  <span style={{ marginLeft:10, color:"#64748b" }}>· Short collateral: {fmtUSD(restrictedCash)}</span>
+                  <span style={{ marginLeft:10, color:marginStatus === "call" ? "#ef4444" : marginStatus === "watch" ? "#fbbf24" : "#00f5c4" }}>
+                    · Margin: {marginStatus.toUpperCase()}
+                  </span>
+                  {!canTrade && <span style={{ color:"#ef4444", marginLeft:10 }}>⚠ Trading currently locked</span>}
+                </div>
+              </div>
+            )}
+
+            <div style={{ background:"#060c18", border:"1px solid #1e293b", borderRadius:14, padding:18, marginTop:16 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:14, flexWrap:"wrap" }}>
+                <div>
+                  <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:800, fontSize:16, color:"#fbbf24" }}>
+                    DERIVATIVES HAVE MOVED
+                  </div>
+                  <div style={{ fontSize:11, color:"#64748b", marginTop:4, lineHeight:1.6 }}>
+                    Futures, calls, and puts now live in their own tab, and every listed stock has its own contract set.
+                  </div>
+                </div>
+                <div style={{ textAlign:"right", fontSize:10, color:"#475569", lineHeight:1.7 }}>
+                  <div>Open derivative MTM: <span style={{ color:analytics.derivativeValue >= 0 ? "#00f5c4" : "#ef4444", fontWeight:700 }}>{fmtUSD(analytics.derivativeValue || 0)}</span></div>
+                  <div>Futures Exposure: <span style={{ color:"#fbbf24" }}>{fmtUSD(analytics.futuresExposure || 0)}</span></div>
+                  <div>Options At Risk: <span style={{ color:"#a78bfa" }}>{fmtUSD(analytics.optionExposure || 0)}</span></div>
+                </div>
+              </div>
+              <div style={{ marginTop:12, display:"flex", gap:10, flexWrap:"wrap" }}>
+                <button onClick={() => { setDerivativeSearch(""); setDerivativeSector("all"); setDerivativeKind("all"); setTab("derivatives"); }} style={{
+                  padding:"10px 18px", background:"linear-gradient(135deg,#713f12,#b45309)",
+                  border:"1px solid #f59e0b", borderRadius:8, color:"#fef3c7",
+                  fontWeight:800, cursor:"pointer", fontFamily:"inherit", fontSize:11, letterSpacing:"0.05em"
+                }}>
+                  ⬡ OPEN DERIVATIVES TAB
+                </button>
+                <div style={{ padding:"10px 12px", background:"#0a0f1e", border:"1px solid #1e293b", borderRadius:8, color:"#64748b", fontSize:10 }}>
+                  Use derivatives for stock-specific trades, macro hedges, and round-expiry option plays.
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* ── DERIVATIVES TAB ── */}
+        {tab === "derivatives" && (
+          <div style={{ background:"#060c18", border:"1px solid #1e293b", borderRadius:14, padding:18, marginTop:16 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:12, marginBottom:14, flexWrap:"wrap" }}>
+                <div>
+                  <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:800, fontSize:16, color:"#fbbf24" }}>
+                    FULL DERIVATIVES DESK
+                  </div>
+                  <div style={{ fontSize:11, color:"#64748b", marginTop:4, lineHeight:1.6 }}>
+                    Every listed stock now has a round-expiry future plus a strike ladder of calls and puts.
+                    Teams can trade long or short option legs and deploy preset hedges in one package.
+                  </div>
+                </div>
+                <div style={{ fontSize:10, color:"#475569", lineHeight:1.7, textAlign:"right" }}>
+                  <div>Open derivative MTM: <span style={{ color:analytics.derivativeValue >= 0 ? "#00f5c4" : "#ef4444", fontWeight:700 }}>{fmtUSD(analytics.derivativeValue || 0)}</span></div>
+                  <div>Futures Exposure: <span style={{ color:"#fbbf24" }}>{fmtUSD(analytics.futuresExposure || 0)}</span></div>
+                  <div>Options At Risk: <span style={{ color:"#a78bfa" }}>{fmtUSD(analytics.optionExposure || 0)}</span></div>
+                </div>
+              </div>
+
+              <div style={{ display:"flex", gap:8, marginBottom:14, flexWrap:"wrap", alignItems:"center" }}>
+                <input value={derivativeSearch} onChange={e=>setDerivativeSearch(e.target.value)}
+                  placeholder="Search ticker, company, or contract…"
+                  style={{ padding:"7px 12px", background:"#0f172a", border:"1px solid #1e293b",
+                    color:"#f1f5f9", borderRadius:7, fontFamily:"inherit", fontSize:12, width:220 }} />
+                <button onClick={()=>setDerivativeSector("all")}
+                  style={{ padding:"6px 12px", background:derivativeSector==="all"?"#1e293b":"#0a0f1e",
+                    border:`1px solid ${derivativeSector==="all"?"#64748b":"#1e293b"}`,
+                    color:derivativeSector==="all"?"#f1f5f9":"#475569", borderRadius:6,
+                    cursor:"pointer", fontFamily:"inherit", fontSize:10, fontWeight:700 }}>ALL SECTORS</button>
+                {SECTORS.map(sec => (
+                  <button key={sec.id} onClick={()=>setDerivativeSector(sec.id)}
+                    style={{ padding:"6px 10px", background:derivativeSector===sec.id?`${sec.color}20`:"#0a0f1e",
+                      border:`1px solid ${derivativeSector===sec.id?sec.color:"#1e293b"}`,
+                      color:derivativeSector===sec.id?sec.color:"#475569", borderRadius:6,
+                      cursor:"pointer", fontFamily:"inherit", fontSize:10, fontWeight:700 }}>
+                    {sec.icon} {sec.label.split(" ")[0]}
+                  </button>
+                ))}
+                {[
+                  ["all","ALL TYPES"],
+                  ["future","FUTURES"],
+                  ["call","CALLS"],
+                  ["put","PUTS"],
+                ].map(([id, label]) => (
+                  <button key={id} onClick={()=>setDerivativeKind(id)}
+                    style={{ padding:"6px 10px", background:derivativeKind===id?"#1e293b":"#0a0f1e",
+                      border:`1px solid ${derivativeKind===id?"#fbbf24":"#1e293b"}`,
+                      color:derivativeKind===id?"#fbbf24":"#475569", borderRadius:6,
+                      cursor:"pointer", fontFamily:"inherit", fontSize:10, fontWeight:700 }}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              <div style={{ display:"grid", gridTemplateColumns:"1.55fr 0.95fr", gap:14 }}>
+                <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))", gap:8 }}>
+                  {filteredDerivativeCatalog.map(instrument => {
+                    const quote = instrument.quote;
+                    const position = derivativePositions[instrument.id];
+                    const underlying = ALL_STOCKS.find(stock => stock.ticker === instrument.underlyingTicker);
+                    const isSelected = selectedDerivative?.id === instrument.id;
+                    const color = underlying?.color || "#94a3b8";
+                    const flow = displayOrderFlowSnapshot[instrument.underlyingTicker];
+                    const flowDisplay = getOrderFlowDisplay(flow);
+                    return (
+                      <button key={instrument.id} onClick={() => { setSelectedDerivativeId(instrument.id); setStrategyTicker(instrument.underlyingTicker); }} style={{
+                        textAlign:"left", padding:"12px 13px", borderRadius:10, cursor:"pointer", fontFamily:"inherit",
+                        border:`1px solid ${isSelected ? color : "#1e293b"}`,
+                        background:isSelected ? `${color}14` : "#0a0f1e",
+                        boxShadow:isSelected ? `0 0 22px ${color}18` : "none"
+                      }}>
+                        <div style={{ display:"flex", justifyContent:"space-between", gap:8, marginBottom:6 }}>
+                          <div>
+                            <div style={{ fontSize:12, fontWeight:800, color }}>{instrument.underlyingTicker}</div>
+                            <div style={{ fontSize:9, color:"#64748b" }}>
+                              {instrument.kind === "future"
+                                ? "ROUND FUTURE"
+                                : `${instrument.kind.toUpperCase()} · ${fmtUSD(instrument.strike || 0)}`}
+                            </div>
+                          </div>
+                          {position ? (
+                            <span style={{ fontSize:8, padding:"2px 6px", borderRadius:999, background:"#00f5c420", color:"#00f5c4", fontWeight:800 }}>
+                              {formatDerivativePositionLabel(position)} ×{position.qty}
+                            </span>
+                          ) : null}
+                        </div>
+                        <div style={{ fontSize:10, color:"#94a3b8", lineHeight:1.6 }}>
+                          <div>Bid {fmtUSD(quote?.bid || 0)} · Ask {fmtUSD(quote?.ask || 0)}</div>
+                          <div>Spot {fmtUSD(quote?.spot || 0)}{instrument.kind !== "future" ? ` · Strike ${fmtUSD(instrument.strike || 0)}` : ""}</div>
+                          <div>Long risk {fmtUSD(getDerivativeRiskEquivalent(quote, "long"))} · Short risk {fmtUSD(getDerivativeRiskEquivalent(quote, "short"))}</div>
+                          <div style={{ color:flowDisplay.color, fontWeight:700 }}>
+                            Flow {flow?.buyPct != null ? `${flow.buyPct}% BUY` : "50% BUY"} · {flowDisplay.label}
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })}
+                  {!filteredDerivativeCatalog.length && (
+                    <div style={{ gridColumn:"1 / -1", padding:"18px 14px", borderRadius:10, border:"1px dashed #334155", color:"#64748b", fontSize:12 }}>
+                      No contracts match the current stock/sector/type filter.
+                    </div>
+                  )}
+                </div>
+
+                <div style={{ display:"grid", gap:14, alignContent:"start" }}>
+                  <div style={{ background:"#0a0f1e", border:"1px solid #111827", borderRadius:12, padding:"14px 16px" }}>
+                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:10, marginBottom:10 }}>
+                      <div>
+                        <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:800, fontSize:15, color:activeStrategyPreset.tone }}>
+                          HEDGE & STRATEGY BUILDER
+                        </div>
+                        <div style={{ fontSize:10, color:"#475569", marginTop:3, lineHeight:1.6 }}>
+                          Build structured hedges and execute them as one server-side package.
+                        </div>
+                      </div>
+                      <div style={{ fontSize:9, color:"#64748b", textAlign:"right", fontWeight:700 }}>
+                        {activeStrategyPreset.label}
+                      </div>
+                    </div>
+
+                    <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:10 }}>
+                      <div>
+                        <div style={{ fontSize:8, color:"#334155", letterSpacing:"0.1em", marginBottom:4 }}>UNDERLYING</div>
+                        <select value={effectiveStrategyTicker} onChange={e => setStrategyTicker(e.target.value)}
+                          style={{ width:"100%", padding:"9px 10px", background:"#020817", border:"1px solid #1e293b", color:"#f1f5f9", borderRadius:6, fontFamily:"inherit", fontSize:12 }}>
+                          {ALL_STOCKS.map(stock => (
+                            <option key={stock.ticker} value={stock.ticker}>{stock.ticker} · {stock.name}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <div style={{ fontSize:8, color:"#334155", letterSpacing:"0.1em", marginBottom:4 }}>LOTS</div>
+                        <input type="number" min={1} value={strategyLots}
+                          onChange={e => setStrategyLots(Math.max(1, parseInt(e.target.value) || 1))}
+                          style={{ width:"100%", padding:"9px 10px", background:"#020817", border:"1px solid #1e293b", color:"#f1f5f9", borderRadius:6, fontFamily:"inherit", fontSize:14 }} />
+                      </div>
+                    </div>
+
+                    <div style={{ marginBottom:10 }}>
+                      <div style={{ fontSize:8, color:"#334155", letterSpacing:"0.1em", marginBottom:4 }}>PRESET</div>
+                      <select value={derivativeStrategyId} onChange={e => setDerivativeStrategyId(e.target.value)}
+                        style={{ width:"100%", padding:"9px 10px", background:"#020817", border:"1px solid #1e293b", color:"#f1f5f9", borderRadius:6, fontFamily:"inherit", fontSize:12 }}>
+                        {DERIVATIVE_STRATEGY_PRESETS.map(preset => (
+                          <option key={preset.id} value={preset.id}>{preset.label}</option>
+                        ))}
+                      </select>
+                      <div style={{ fontSize:10, color:"#64748b", marginTop:6, lineHeight:1.6 }}>
+                        {activeStrategyPreset.description}
+                      </div>
+                    </div>
+
+                    {strategyPreview.error ? (
+                      <div style={{ marginBottom:10, padding:"10px 12px", background:"#2b0b12", border:"1px solid #7f1d1d", borderRadius:8, color:"#fecaca", fontSize:11, lineHeight:1.6 }}>
+                        {strategyPreview.error}
+                      </div>
+                    ) : (
+                      <>
+                        <div style={{ display:"grid", gridTemplateColumns:"repeat(2,minmax(0,1fr))", gap:8, marginBottom:10 }}>
+                          {(strategyPreview.highlights || []).map(card => (
+                            <div key={card.label} style={{ background:"#020817", borderRadius:8, padding:"9px 10px" }}>
+                              <div style={{ fontSize:8, color:"#334155", letterSpacing:"0.1em", marginBottom:4 }}>{card.label}</div>
+                              <div style={{ fontSize:12, fontWeight:800, color:card.tone }}>{card.value}</div>
+                            </div>
+                          ))}
+                        </div>
+
+                        <div style={{ marginBottom:10, padding:"10px 12px", background:"#020817", border:"1px solid #1e293b", borderRadius:8 }}>
+                          <div style={{ fontSize:9, color:"#475569", letterSpacing:"0.1em", marginBottom:8 }}>LEG BREAKDOWN</div>
+                          <div style={{ display:"grid", gap:6 }}>
+                            {strategyPreview.legs?.map(leg => (
+                              <div key={leg.id} style={{ display:"flex", justifyContent:"space-between", gap:8, fontSize:10, color:"#94a3b8" }}>
+                                <span>{leg.side === "short" ? "SELL" : "BUY"} {leg.qty}x {leg.instrument.kind.toUpperCase()} {fmtUSD(leg.instrument.strike || 0)}</span>
+                                <span style={{ color:leg.side === "short" ? "#f97316" : "#38bdf8", fontWeight:700 }}>
+                                  {leg.side === "short" ? "+" : "-"}{fmtUSD(Math.abs(leg.cashflow || 0))}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </>
+                    )}
+
+                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:8 }}>
+                      <div style={{ fontSize:10, color:"#64748b", lineHeight:1.7 }}>
+                        <div>Buying power: <span style={{ color:"#fbbf24", fontWeight:700 }}>{fmtUSD(buyingPower)}</span></div>
+                        <div>Package risk: <span style={{ color:"#f1f5f9", fontWeight:700 }}>{fmtUSD(strategyPreview.totalRisk || 0)}</span></div>
+                      </div>
+                      <button onClick={() => executeDerivativeStrategy(strategyPreview)} disabled={!strategyCanExecute || strategySubmitting} style={{
+                        minWidth:170, padding:"11px 14px", border:"none", borderRadius:7,
+                        background:(strategyCanExecute && !strategySubmitting) ? `linear-gradient(135deg,${activeStrategyPreset.tone},#f8fafc)` : "#1e293b",
+                        color:(strategyCanExecute && !strategySubmitting) ? "#020817" : "#334155", fontWeight:800, cursor:(strategyCanExecute && !strategySubmitting) ? "pointer" : "not-allowed", fontFamily:"inherit",
+                        opacity: strategySubmitting ? 0.8 : 1
+                      }}>
+                        {strategySubmitting ? "SUBMITTING..." : `EXECUTE ${activeStrategyPreset.label.toUpperCase()}`}
+                      </button>
+                    </div>
+                    {strategyExecutionState && (
+                      <div style={{
+                        marginTop:10,
+                        padding:"9px 11px",
+                        borderRadius:8,
+                        fontSize:10,
+                        fontWeight:700,
+                        letterSpacing:"0.04em",
+                        background: strategyExecutionState.type === "success"
+                          ? "rgba(2,44,34,0.36)"
+                          : strategyExecutionState.type === "error"
+                            ? "rgba(69,10,10,0.34)"
+                            : "rgba(30,41,59,0.55)",
+                        border:`1px solid ${
+                          strategyExecutionState.type === "success"
+                            ? "#00f5c444"
+                            : strategyExecutionState.type === "error"
+                              ? "#ef444455"
+                              : "#47556966"
+                        }`,
+                        color: strategyExecutionState.type === "success"
+                          ? "#86efac"
+                          : strategyExecutionState.type === "error"
+                            ? "#fca5a5"
+                            : "#cbd5e1"
+                      }}>
+                        {strategyExecutionState.text}
+                      </div>
+                    )}
+                  </div>
+
+                  <div style={{ background:"#0a0f1e", border:"1px solid #111827", borderRadius:12, padding:"14px 16px" }}>
+                    {selectedDerivative && selectedDerivativeQuote ? (
+                      <>
+                        <div style={{ display:"flex", justifyContent:"space-between", gap:10, marginBottom:10 }}>
+                          <div>
+                            <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:800, fontSize:15, color:"#f1f5f9" }}>
+                              {selectedDerivative.label}
+                            </div>
+                            <div style={{ fontSize:10, color:"#475569", marginTop:3 }}>
+                              Expires automatically at the end of Round {selectedDerivative.round}
+                            </div>
+                          </div>
+                          <div style={{ textAlign:"right" }}>
+                            <div style={{ fontSize:11, color:"#94a3b8" }}>Underlying</div>
+                            <div style={{ fontWeight:800, color:"#fbbf24" }}>{selectedDerivative.underlyingTicker}</div>
+                            <div style={{ fontSize:9, color:selectedDerivativeFlowDisplay.color, marginTop:4, fontWeight:700 }}>
+                              {selectedDerivativeFlowDisplay.label}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div style={{ display:"grid", gridTemplateColumns:"repeat(2,minmax(0,1fr))", gap:8, marginBottom:12 }}>
+                          {[
+                            { l:"SPOT", v:fmtUSD(selectedDerivativeQuote.spot || 0), c:"#f1f5f9" },
+                            { l:"MARK", v:fmtUSD(selectedDerivativeQuote.mark || 0), c:"#38bdf8" },
+                            { l:"BID / ASK", v:`${fmtUSD(selectedDerivativeQuote.bid || 0)} / ${fmtUSD(selectedDerivativeQuote.ask || 0)}`, c:"#94a3b8" },
+                            { l:"LONG RISK", v:fmtUSD(getDerivativeRiskEquivalent(selectedDerivativeQuote, "long")), c:"#fbbf24" },
+                            { l:"SHORT RISK", v:fmtUSD(getDerivativeRiskEquivalent(selectedDerivativeQuote, "short")), c:"#f97316" },
+                            { l:"STRIKE", v:selectedDerivative.kind === "future" ? "—" : fmtUSD(selectedDerivative.strike || 0), c:"#a78bfa" },
+                            { l:"TIME VALUE", v:fmtUSD(selectedDerivativeQuote.timeValue || 0), c:"#22c55e" },
+                            { l:"FLOW BIAS", v:selectedDerivativeFlowDisplay.label, c:selectedDerivativeFlowDisplay.color },
+                          ].map(card => (
+                            <div key={card.l} style={{ background:"#020817", borderRadius:8, padding:"9px 10px" }}>
+                              <div style={{ fontSize:8, color:"#334155", letterSpacing:"0.1em", marginBottom:4 }}>{card.l}</div>
+                              <div style={{ fontSize:12, fontWeight:800, color:card.c }}>{card.v}</div>
+                            </div>
+                          ))}
+                        </div>
+
+                        <div style={{ marginBottom:12, background:"#020817", border:"1px solid #1e293b", borderRadius:8, padding:"9px 10px" }}>
+                          <div style={{ display:"flex", justifyContent:"space-between", fontSize:8, color:"#334155", letterSpacing:"0.1em", marginBottom:6 }}>
+                            <span>LIVE ORDER FLOW WINDOW</span>
+                            <span>{Math.round(ORDER_FLOW_WINDOW_MS / 1000)}s</span>
+                          </div>
+                          <div style={{ position:"relative", height:8, borderRadius:999, background:"#1e293b", overflow:"hidden" }}>
+                            <div style={{ position:"absolute", inset:"0 auto 0 0", width:`${selectedDerivativeFlow?.buyPct ?? 50}%`, background:"#00f5c4" }} />
+                            <div style={{ position:"absolute", inset:"0 0 0 auto", width:`${selectedDerivativeFlow?.sellPct ?? 50}%`, background:"#ef4444" }} />
+                          </div>
+                          <div style={{ display:"flex", justifyContent:"space-between", marginTop:6, fontSize:10, fontWeight:700 }}>
+                            <span style={{ color:"#00f5c4" }}>{selectedDerivativeFlow?.buyPct ?? 50}% BUY</span>
+                            <span style={{ color:"#ef4444" }}>{selectedDerivativeFlow?.sellPct ?? 50}% SELL</span>
+                          </div>
+                        </div>
+
+                        {selectedDerivativePosition ? (
+                          <div style={{ marginBottom:12, padding:"10px 12px", borderRadius:8, background:"#020817", border:"1px solid #1e293b" }}>
+                            <div style={{ fontSize:9, color:"#00f5c4", fontWeight:800, letterSpacing:"0.1em", marginBottom:6 }}>OPEN POSITION</div>
+                            <div style={{ fontSize:10, color:"#94a3b8", lineHeight:1.7 }}>
+                              <div>{formatDerivativePositionLabel(selectedDerivativePosition)} · {selectedDerivativePosition.qty} contract(s)</div>
+                              <div>Avg entry: {fmtUSD(selectedDerivativePosition.avgCost || 0)} · MTM: <span style={{ color:(analytics.derivativeOpenPnL?.[selectedDerivative.id]?.unrealized || 0) >= 0 ? "#00f5c4" : "#ef4444", fontWeight:700 }}>{fmtUSD(analytics.derivativeOpenPnL?.[selectedDerivative.id]?.unrealized || 0)}</span></div>
+                            </div>
+                          </div>
+                        ) : null}
+
+                        <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:12 }}>
+                          <div>
+                            <div style={{ fontSize:9, color:"#475569", marginBottom:4 }}>CONTRACTS</div>
+                            <input type="number" min={1} value={derivativeQty}
+                              onChange={e => setDerivativeQty(Math.max(1, parseInt(e.target.value) || 1))}
+                              style={{ width:90, padding:"9px 10px", background:"#020817", border:"1px solid #1e293b", color:"#f1f5f9", borderRadius:6, fontFamily:"inherit", fontSize:14 }} />
+                          </div>
+                          <div style={{ fontSize:11, color:"#64748b", lineHeight:1.7 }}>
+                            <div>Long risk: <span style={{ color:"#f1f5f9", fontWeight:700 }}>{fmtUSD(derivativeLongOrderExposure)}</span></div>
+                            <div>Short risk: <span style={{ color:"#f1f5f9", fontWeight:700 }}>{fmtUSD(derivativeShortOrderExposure)}</span></div>
+                            <div>Buying power: <span style={{ color:"#fbbf24", fontWeight:700 }}>{fmtUSD(buyingPower)}</span></div>
+                          </div>
+                        </div>
+
+                        <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+                          <button onClick={() => openDerivativePosition(selectedDerivative, derivativeQty, "long")} disabled={!derivativeCanOpenLong} style={{
+                            flex:1, minWidth:120, padding:"10px 0", border:"none", borderRadius:7,
+                            background:derivativeCanOpenLong ? (selectedDerivative.kind === "future" ? "#00f5c4" : (selectedDerivative.kind === "call" ? "#38bdf8" : "#a78bfa")) : "#1e293b",
+                            color:derivativeCanOpenLong ? "#020817" : "#334155", fontWeight:800, cursor:derivativeCanOpenLong ? "pointer" : "not-allowed", fontFamily:"inherit"
+                          }}>
+                            {selectedDerivative.kind === "future" ? "LONG FUTURE" : selectedDerivative.kind === "call" ? "BUY CALL" : "BUY PUT"}
+                          </button>
+                          <button onClick={() => openDerivativePosition(selectedDerivative, derivativeQty, "short")} disabled={!derivativeCanOpenShort} style={{
+                            flex:1, minWidth:120, padding:"10px 0", border:"none", borderRadius:7,
+                            background:derivativeCanOpenShort ? "#f97316" : "#1e293b",
+                            color:derivativeCanOpenShort ? "#fff" : "#334155", fontWeight:800, cursor:derivativeCanOpenShort ? "pointer" : "not-allowed", fontFamily:"inherit"
+                          }}>
+                            {selectedDerivative.kind === "future" ? "SHORT FUTURE" : selectedDerivative.kind === "call" ? "SELL CALL" : "SELL PUT"}
+                          </button>
+                          <button onClick={() => closeDerivativePosition(selectedDerivative.id, derivativeQty)} disabled={!derivativeCanClose} style={{
+                            flex:1, minWidth:120, padding:"10px 0", border:"none", borderRadius:7,
+                            background:derivativeCanClose ? "#ef4444" : "#1e293b",
+                            color:derivativeCanClose ? "#fff" : "#334155", fontWeight:800, cursor:derivativeCanClose ? "pointer" : "not-allowed", fontFamily:"inherit"
+                          }}>CLOSE</button>
+                        </div>
+                      </>
+                    ) : (
+                      <div style={{ color:"#334155", fontSize:12 }}>No derivative contracts available.</div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+        )}
+
+        {/* ── PORTFOLIO TAB ── */}
+        {tab === "portfolio" && (
+          <div>
+            {/* Stock detail modal accessible from portfolio too */}
+            {detailStock && (() => {
+              const ds = ALL_STOCKS.find(x => x.ticker === detailStock);
+              const dsec = SECTORS.find(x => x.id === ds?.sectorId);
+              return (
+                <StockDetailModal
+                  stock={ds} sector={dsec}
+                  price={prices[detailStock]||0}
+                  prevPrice={prevPrices[detailStock]||0}
+                  history={history[detailStock]||[]}
+                  assetBeta={calcTickerAssetBeta(detailStock, history)}
+                  holdings={holdings} cash={cash} buyingPower={buyingPower}
+                  restrictedCash={restrictedCash} marginStatus={marginStatus}
+                  tradeSpreadRate={tradeSpreadRate} canTrade={canTrade}
+                  onBuy={execBuy} onSell={execSell}
+                  onShort={execShort} onCover={execCover}
+                  onClose={() => setDetailStock(null)}
+                  transactions={transactions}
+                  aiLog={aiLog}
+                  orderFlow={displayOrderFlowSnapshot[detailStock]}
+                />
+              );
+            })()}
+            {/* Summary cards */}
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))", gap:10, marginBottom:20 }}>
+              {[
+                { l:"NET EQUITY",     v:fmtUSD(totalVal),              c:"#f1f5f9" },
+                { l:"FREE CASH",      v:fmtUSD(cash),                  c:"#38bdf8" },
+                { l:"SHORT COLLATERAL", v:fmtUSD(restrictedCash),      c:"#f97316" },
+                { l:"CARRY COST",     v:fmtUSD(analytics.totalCarryCost), c:analytics.totalCarryCost > 0 ? "#ef4444" : "#94a3b8" },
+                { l:"UNREALIZED P&L",v:(analytics.totalUnrealized>=0?"+":"")+fmtUSD(analytics.totalUnrealized), c:analytics.totalUnrealized>=0?"#00f5c4":"#ef4444" },
+                { l:"REALIZED P&L",  v:(analytics.totalRealized>=0?"+":"")+fmtUSD(analytics.totalRealized), c:analytics.totalRealized>=0?"#00f5c4":"#ef4444" },
+                { l:"DERIVATIVES MTM", v:(analytics.derivativeValue>=0?"+":"")+fmtUSD(analytics.derivativeValue), c:analytics.derivativeValue>=0?"#fbbf24":"#ef4444" },
+                { l:"MARGIN BUFFER", v:(analytics.marginBuffer>=0?"+":"")+fmtUSD(analytics.marginBuffer), c:analytics.marginBuffer>=0?"#22c55e":"#ef4444" },
+                { l:"BUYING POWER",  v:fmtUSD(analytics.buyingPower), c:"#fbbf24" },
+                { l:"ASSET BETA",    v:fmt(analytics.averageAssetBeta, 2), c:"#c4b5fd" },
+                { l:"PORTFOLIO BETA",v:fmt(analytics.portfolioBeta, 2), c:"#ddd6fe" },
+              ].map(c => (
+                <div key={c.l} style={{ background:"#0a0f1e", border:"1px solid #111827", borderRadius:10, padding:"14px 16px" }}>
+                  <div style={{ fontSize:9, color:"#334155", letterSpacing:"0.12em", marginBottom:6 }}>{c.l}</div>
+                  <div style={{ fontWeight:800, fontSize:18, color:c.c }}>{c.v}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Score breakdown */}
+            {(() => {
+              const shouldIncludeLiveRound = (
+                gamePhase === "running" &&
+                activeLedgerRoundRef.current &&
+                lastFinalizedRoundRef.current !== activeLedgerRoundRef.current
+              );
+              const liveRound = shouldIncludeLiveRound
+                ? buildRoundScoreSnapshot({
+                    round: activeLedgerRoundRef.current || roundNum,
+                    startingCapital: roundStartValueRef.current || initCash || INITIAL_CASH,
+                    cash,
+                    restrictedCash,
+                    holdings,
+                    derivativePositions,
+                    derivativeQuoteMap,
+                    prices,
+                    history,
+                    transactions: combinedTransactions,
+                    ballStartPrice: roundBallStartPriceRef.current || BALL_BASE,
+                    prediction: {
+                      shown: roundPredictionShownRef.current,
+                      answered: roundPredictionAnsweredRef.current,
+                      correct: roundPredictionCorrectRef.current,
+                    },
+                    accruedBorrowCost,
+                    accruedFundingCost,
+                    roundBorrowCost: Math.max(0, accruedBorrowCost - (roundBorrowCostBaseRef.current || 0)),
+                    roundFundingCost: Math.max(0, accruedFundingCost - (roundFundingCostBaseRef.current || 0)),
+                    avgMarginBufferPct: roundMarginBufferSamplesRef.current > 0
+                      ? roundMarginBufferSumRef.current / roundMarginBufferSamplesRef.current
+                      : analytics.marginBufferPct,
+                    marginBreaches: roundMarginBreachesRef.current || 0,
+                  })
+                : null;
+              const displayLedger = {
+                ...sanitizeScoreLedger(scoreLedger),
+                maxDrawdownOverall: Math.max(scoreLedger.maxDrawdownOverall || 0, maxDrawdown || 0),
+              };
+              const snapshots = [...displayLedger.completedRounds, ...(liveRound ? [liveRound] : [])];
+              const summary = summarizeScoreSnapshots(snapshots);
+              const entry = {
+                total: totalVal, cash,
+                netEquity: totalVal,
+                uniqueSectors: summary.uniqueSectors,
+                closedTrades: summary.closedTrades,
+                wins:        summary.wins,
+                maxDrawdown: Math.max(displayLedger.maxDrawdownOverall || 0, 1),
+                predAsked:   summary.predShown,
+                predTotal:   summary.predAnswered,
+                predCorrect: summary.predCorrect,
+                marginBufferPct: summary.avgMarginBufferPct ?? analytics.marginBufferPct,
+                marginBreaches: summary.marginBreaches || 0,
+                totalBorrowCost: summary.totalBorrowCost || 0,
+                totalFundingCost: summary.totalFundingCost || 0,
+                totalCarryCost: (summary.totalBorrowCost || 0) + (summary.totalFundingCost || 0),
+                currentRound: roundNum,
+                assetBeta:   summary.assetBeta != null ? summary.assetBeta : analytics.averageAssetBeta,
+                portfolioBeta: summary.portfolioBeta != null ? summary.portfolioBeta : analytics.portfolioBeta,
+                beta:        summary.portfolioBeta != null ? summary.portfolioBeta : analytics.portfolioBeta,
+                ballReturn:  compoundPercentSeries(snapshots.map(round => round.ballReturn)) ?? calcBallReturn(prices),
+                roundReturns: summary.roundReturns,
+                scoreLedger: displayLedger,
+                liveRound,
+              };
+              const sc = calcScore(entry, initCash);
+
+              const TierHeader = ({ label, color, pts, max }) => (
+                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
+                  marginBottom:8, paddingBottom:6, borderBottom:`1px solid ${color}22` }}>
+                  <span style={{ fontSize:9, fontWeight:800, color, letterSpacing:"0.12em" }}>{label}</span>
+                  <span style={{ fontSize:12, fontWeight:800, color }}>
+                    {fmt(pts, 1)} <span style={{ fontSize:9, color:"#475569" }}>/ {max} pts</span>
+                  </span>
+                </div>
+              );
+
+              const Row = ({ label, formula, value, pts, max, color }) => {
+                const pct = Math.min(100, (pts / max) * 100);
+                return (
+                  <div style={{ marginBottom:8 }}>
+                    <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
+                      <div>
+                        <span style={{ fontSize:10, color:"#94a3b8", fontWeight:700 }}>{label}</span>
+                        <span style={{ fontSize:9, color:"#334155", marginLeft:6 }}>{formula}</span>
+                      </div>
+                      <div style={{ textAlign:"right" }}>
+                        <span style={{ fontSize:11, fontWeight:800, color }}>{value}</span>
+                        <span style={{ fontSize:9, color:"#475569", marginLeft:6 }}>{fmt(pts,1)}/{max}pt</span>
+                      </div>
+                    </div>
+                    <div style={{ height:4, background:"#0f172a", borderRadius:2 }}>
+                      <div style={{ width:`${pct}%`, height:"100%", background:color,
+                        borderRadius:2, transition:"width 0.6s",
+                        boxShadow:`0 0 6px ${color}88` }} />
+                    </div>
+                  </div>
+                );
+              };
+
+              return (
+                <div style={{ background:"linear-gradient(135deg,#0a0f1e,#060c18)",
+                  border:"1px solid #111827", borderRadius:12, padding:16, marginBottom:20 }}>
+
+                  {/* Title + total */}
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16 }}>
+                    <div style={{ fontSize:10, color:"#475569", letterSpacing:"0.12em" }}>YOUR SCORE BREAKDOWN</div>
+                    <div style={{ display:"flex", alignItems:"baseline", gap:4 }}>
+                      <span style={{ fontFamily:"'Syne',sans-serif", fontWeight:900, fontSize:28, color:"#fbbf24" }}>
+                        {fmt(sc.score, 1)}
+                      </span>
+                      <span style={{ fontSize:10, color:"#475569" }}>/ 105 pts</span>
+                    </div>
+                  </div>
+
+                  {/* Tier bars at top */}
+                  <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:6, marginBottom:16 }}>
+                    {[
+                      { l:"PERFORMANCE",      pts:sc.tier1, max:35, c:"#00f5c4" },
+                      { l:"CAPITAL DISC.",    pts:sc.tier2, max:40, c:"#a78bfa" },
+                      { l:"MARKET CRAFT",     pts:sc.tier3, max:30, c:"#fbbf24" },
+                    ].map(t => (
+                      <div key={t.l} style={{ background:"#020817", borderRadius:8, padding:"10px 12px", textAlign:"center" }}>
+                        <div style={{ fontSize:8, color:"#475569", letterSpacing:"0.1em", marginBottom:4 }}>{t.l}</div>
+                        <div style={{ fontSize:20, fontWeight:800, color:t.c }}>{fmt(t.pts,1)}</div>
+                        <div style={{ fontSize:9, color:"#334155" }}>/ {t.max} pts</div>
+                        <div style={{ height:3, background:"#0f172a", borderRadius:2, marginTop:6 }}>
+                          <div style={{ width:`${(t.pts/t.max)*100}%`, height:"100%",
+                            background:t.c, borderRadius:2, transition:"width 0.6s" }} />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Tier 1 — Performance */}
+                  <div style={{ background:"#020817", borderRadius:10, padding:"12px 14px", marginBottom:8 }}>
+                    <TierHeader label="TIER 1 — PERFORMANCE" color="#00f5c4" pts={sc.tier1} max={35} />
+                    <Row label="Net Return"    formula="compounded locked round return after carry" value={`${sc.absoluteReturn >= 0 ? "+" : ""}${fmt(sc.absoluteReturn)}%`} pts={sc.t1a} max={20} color="#00f5c4" />
+                    <Row label="Alpha vs BALL" formula="compounded return − compounded BALL"       value={`${sc.alpha >= 0 ? "+" : ""}${fmt(sc.alpha)}%`}          pts={sc.t1b} max={15} color="#34d399" />
+                  </div>
+
+                  {/* Tier 2 — Capital Discipline */}
+                  <div style={{ background:"#020817", borderRadius:10, padding:"12px 14px", marginBottom:8 }}>
+                    <TierHeader label="TIER 2 — CAPITAL DISCIPLINE" color="#a78bfa" pts={sc.tier2} max={40} />
+                    <Row label="Drawdown Control"   formula="lower max drawdown = more points" value={`${fmt(sc.maxDrawdown, 1)}% DD`} pts={sc.t2a} max={15} color="#a78bfa" />
+                    <Row label="Margin Discipline"  formula="avg locked margin buffer % − breach penalties" value={`${sc.marginBufferPct >= 0 ? "+" : ""}${fmt(sc.marginBufferPct, 1)}%`} pts={sc.t2b} max={15} color="#c4b5fd" />
+                    <Row label="Funding Efficiency" formula="borrow + funding carry drag" value={`${fmt(sc.carryDragPct, 2)}% carry`} pts={sc.t2c} max={10} color="#ddd6fe" />
+                    <div style={{ marginTop:8, padding:"8px 10px", borderRadius:8, background:"#0a0f1e", border:"1px solid #1e293b" }}>
+                      <div style={{ display:"grid", gridTemplateColumns:"repeat(2,minmax(0,1fr))", gap:8, fontSize:10 }}>
+                        <div style={{ display:"flex", justifyContent:"space-between", gap:10 }}>
+                          <span style={{ color:"#ddd6fe", fontWeight:700 }}>Borrow Cost</span>
+                          <span style={{ color:"#f1f5f9", fontWeight:700 }}>{fmtUSD(sc.totalBorrowCost || 0)}</span>
+                        </div>
+                        <div style={{ display:"flex", justifyContent:"space-between", gap:10 }}>
+                          <span style={{ color:"#ddd6fe", fontWeight:700 }}>Funding Cost</span>
+                          <span style={{ color:"#f1f5f9", fontWeight:700 }}>{fmtUSD(sc.totalFundingCost || 0)}</span>
+                        </div>
+                        <div style={{ display:"flex", justifyContent:"space-between", gap:10 }}>
+                          <span style={{ color:"#ddd6fe", fontWeight:700 }}>Asset Beta</span>
+                          <span style={{ color:"#f1f5f9", fontWeight:700 }}>{fmt(sc.assetBeta, 2)}</span>
+                        </div>
+                        <div style={{ display:"flex", justifyContent:"space-between", gap:10 }}>
+                          <span style={{ color:"#ddd6fe", fontWeight:700 }}>Portfolio Beta</span>
+                          <span style={{ color:"#f1f5f9", fontWeight:700 }}>{fmt(sc.portfolioBeta, 2)}</span>
+                        </div>
+                      </div>
+                      <div style={{ fontSize:9, color:"#475569", marginTop:4 }}>
+                        Asset beta is computed per asset as cov(asset, BALL) / var(BALL). Each round portfolio beta is Σ(weight × asset beta), and the score uses the average locked round beta.
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Tier 3 — Market Craft */}
+                  <div style={{ background:"#020817", borderRadius:10, padding:"12px 14px" }}>
+                    <TierHeader label="TIER 3 — MARKET CRAFT" color="#fbbf24" pts={sc.tier3} max={30} />
+                    <Row label="Crisis Alpha" formula="average alpha in R3, R6, R7" value={`${sc.crisisAlpha >= 0 ? "+" : ""}${fmt(sc.crisisAlpha, 2)}%`} pts={sc.t3a} max={10} color="#fbbf24" />
+                    <Row label="Win Rate" formula="wins / closed trades" value={`${fmt(sc.winRate, 0)}%`} pts={sc.t3b} max={5} color="#fcd34d" />
+                    <Row label="Diversification" formula="unique sectors traded / 9" value={`${sc.sectors} / 9 sectors`} pts={sc.t3c} max={5} color="#fde68a" />
+                    <Row label="Prediction Accuracy" formula="correct / answered" value={`${sc.predCorrectTotal}/${sc.predAnsweredTotal || "—"}`} pts={sc.t3d} max={5} color="#fef3c7" />
+                    <Row label="Prediction Participation" formula="answered / questions shown" value={`${sc.predAnsweredTotal}/${sc.predShownTotal || "—"}`} pts={sc.t3e} max={5} color="#f8fafc" />
+                  </div>
+
+                </div>
+              );
+            })()}
+
+            {/* Open Positions by sector */}
+            <div style={{ marginBottom:20 }}>
+              <div style={{ fontSize:10, color:"#475569", letterSpacing:"0.12em", marginBottom:12 }}>OPEN POSITIONS</div>
+              {Object.keys(holdings).length === 0 ? (
+                <div style={{ color:"#334155", fontSize:12, padding:"12px 0" }}>No open positions. Go to Market tab to start trading.</div>
+              ) : (
+                SECTORS.map(sec => {
+                  const secHoldings = Object.entries(analytics.openPnL).filter(([t]) => ALL_STOCKS.find(s=>s.ticker===t)?.sectorId===sec.id);
+                  if (!secHoldings.length) return null;
+                  return (
+                    <div key={sec.id} style={{ marginBottom:12 }}>
+                      <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8 }}>
+                        <span style={{ fontSize:12 }}>{sec.icon}</span>
+                        <span style={{ fontSize:11, color:sec.color, fontWeight:700 }}>{sec.label}</span>
+                        <div style={{ flex:1, height:1, background:"#111827" }} />
+                      </div>
+                      {secHoldings.map(([ticker, pos]) => {
+                        const stk = ALL_STOCKS.find(s=>s.ticker===ticker);
+                        const pct = analytics.grossExposure>0 ? clamp((Math.abs(pos.value)/analytics.grossExposure)*100,0,100):0;
+                        return (
+                          <div key={ticker} style={{ background:"#0a0f1e", border:"1px solid #111827",
+                            borderRadius:10, padding:"12px 14px", marginBottom:6 }}>
+                            <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", marginBottom:8 }}>
+                              <div>
+                                <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                                  <span style={{ color:sec.color, fontWeight:800, fontSize:14 }}>{ticker}</span>
+                                  <span style={{ fontSize:10, color:pos.side==="short"?"#fca5a5":"#475569" }}>
+                                    {pos.side === "short" ? "Short" : "Long"} {Math.abs(pos.qty)} shares
+                                  </span>
+                                </div>
+                                <div style={{ fontSize:10, color:"#334155" }}>{stk?.name}</div>
+                              </div>
+                              <div style={{ textAlign:"right" }}>
+                                <div style={{ fontWeight:700, fontSize:15 }}>{fmtUSD(pos.value)}</div>
+                                <div style={{ fontSize:11, fontWeight:700,
+                                  color:pos.unrealized>=0?"#00f5c4":"#ef4444" }}>
+                                  {pos.unrealized>=0?"▲ +":"▼ "}{fmtUSD(Math.abs(pos.unrealized))}
+                                  {' '}({pos.pct>=0?"+":""}{fmt(pos.pct)}%)
+                                </div>
+                              </div>
+                            </div>
+                            <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:6, marginBottom:6, fontSize:10 }}>
+                              <div style={{ color:"#64748b" }}>Avg Cost: <span style={{ color:"#94a3b8" }}>{fmtUSD(pos.avgCost)}</span></div>
+                              <div style={{ color:"#64748b" }}>Cur Price: <span style={{ color:"#94a3b8" }}>{fmtUSD(pos.curPrice)}</span></div>
+                              <div style={{ color:"#64748b" }}>Weight: <span style={{ color:"#94a3b8" }}>{fmt(pct)}%</span></div>
+                              <div style={{ color:"#64748b" }}>Asset Beta: <span style={{ color:"#ddd6fe" }}>{pos.assetBeta != null ? fmt(pos.assetBeta, 2) : "—"}</span></div>
+                            </div>
+                            <div style={{ height:3, background:"#1e293b", borderRadius:2 }}>
+                              <div style={{ width:`${pct}%`, height:"100%",
+                                background:pos.unrealized>=0?sec.color:"#ef4444",
+                                borderRadius:2, transition:"width 0.6s" }} />
+                            </div>
+                            {/* Position actions */}
+                            <div style={{ display:"flex", gap:6, marginTop:10 }}>
+                              <button onClick={() => { setDetailStock(ticker); setTab("market"); }}
+                                style={{ flex:1, padding:"6px 0", fontSize:9, fontWeight:700,
+                                  background:"#0f172a", border:`1px solid ${sec.color}44`,
+                                  color:sec.color, borderRadius:5, cursor:"pointer", fontFamily:"inherit" }}>
+                                ⬡ VIEW DETAILS
+                              </button>
+                              {pos.side === "short" ? (
+                                <>
+                                  <button onClick={() => execCover(ticker, 1)} disabled={!canTrade}
+                                    style={{ flex:1, padding:"6px 0", fontSize:9, fontWeight:800,
+                                      background: canTrade ? "#22c55e22":"#0f172a",
+                                      border:`1px solid ${canTrade ? "#22c55e":"#1e293b"}`,
+                                      color: canTrade ? "#22c55e":"#334155",
+                                      borderRadius:5, cursor: canTrade ? "pointer":"not-allowed",
+                                      fontFamily:"inherit" }}>↗ COVER 1</button>
+                                  <button onClick={() => execCover(ticker, Math.abs(pos.qty))} disabled={!canTrade}
+                                    style={{ flex:1, padding:"6px 0", fontSize:9, fontWeight:800,
+                                      background: canTrade ? "#14532d33":"#0f172a",
+                                      border:`1px solid ${canTrade ? "#22c55e":"#1e293b"}`,
+                                      color: canTrade ? "#bbf7d0":"#334155",
+                                      borderRadius:5, cursor: canTrade ? "pointer":"not-allowed",
+                                      fontFamily:"inherit" }}>✕ COVER ALL</button>
+                                </>
+                              ) : (
+                                <>
+                                  <button onClick={() => execBuy(ticker, 1)} disabled={!canTrade || ((prices[ticker]||0) * (1 + tradeSpreadRate)) > buyingPower}
+                                    style={{ flex:1, padding:"6px 0", fontSize:9, fontWeight:800,
+                                      background: canTrade && ((prices[ticker]||0) * (1 + tradeSpreadRate))<=buyingPower ? "#00f5c422":"#0f172a",
+                                      border:`1px solid ${canTrade && ((prices[ticker]||0) * (1 + tradeSpreadRate))<=buyingPower ? "#00f5c4":"#1e293b"}`,
+                                      color: canTrade && ((prices[ticker]||0) * (1 + tradeSpreadRate))<=buyingPower ? "#00f5c4":"#334155",
+                                      borderRadius:5, cursor: canTrade && ((prices[ticker]||0) * (1 + tradeSpreadRate))<=buyingPower ? "pointer":"not-allowed",
+                                      fontFamily:"inherit" }}>▲ BUY 1</button>
+                                  <button onClick={() => execSell(ticker, 1)} disabled={!canTrade}
+                                    style={{ flex:1, padding:"6px 0", fontSize:9, fontWeight:800,
+                                      background: canTrade ? "#ef444422":"#0f172a",
+                                      border:`1px solid ${canTrade ? "#ef4444":"#1e293b"}`,
+                                      color: canTrade ? "#ef4444":"#334155",
+                                      borderRadius:5, cursor: canTrade ? "pointer":"not-allowed",
+                                      fontFamily:"inherit" }}>▼ SELL 1</button>
+                                  <button onClick={() => execSell(ticker, pos.qty)} disabled={!canTrade}
+                                    style={{ flex:1, padding:"6px 0", fontSize:9, fontWeight:800,
+                                      background: canTrade ? "#7f1d1d33":"#0f172a",
+                                      border:`1px solid ${canTrade ? "#ef4444":"#1e293b"}`,
+                                      color: canTrade ? "#fca5a5":"#334155",
+                                      borderRadius:5, cursor: canTrade ? "pointer":"not-allowed",
+                                      fontFamily:"inherit" }}>✕ SELL ALL</button>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            <div style={{ marginBottom:20 }}>
+              <div style={{ fontSize:10, color:"#475569", letterSpacing:"0.12em", marginBottom:12 }}>DERIVATIVE BOOK</div>
+              {Object.keys(analytics.derivativeOpenPnL || {}).length === 0 ? (
+                <div style={{ color:"#334155", fontSize:12, padding:"12px 0" }}>No open derivative positions. Use the Derivatives tab to trade futures and options.</div>
+              ) : (
+                Object.entries(analytics.derivativeOpenPnL).map(([instrumentId, pos]) => {
+                  const underlying = ALL_STOCKS.find(stock => stock.ticker === pos.underlyingTicker);
+                  const exposurePct = analytics.grossExposure > 0 ? clamp(((pos.exposure || 0) / analytics.grossExposure) * 100, 0, 100) : 0;
+                  return (
+                    <div key={instrumentId} style={{ background:"#0a0f1e", border:"1px solid #111827", borderRadius:10, padding:"12px 14px", marginBottom:6 }}>
+                      <div style={{ display:"flex", justifyContent:"space-between", gap:12, marginBottom:8 }}>
+                        <div>
+                          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                            <span style={{ color:underlying?.color || "#fbbf24", fontWeight:800, fontSize:13 }}>{pos.label}</span>
+                            <span style={{ fontSize:9, color:"#475569" }}>{formatDerivativePositionLabel(pos)}</span>
+                          </div>
+                          <div style={{ fontSize:10, color:"#334155" }}>{pos.underlyingTicker} · {underlying?.name}</div>
+                        </div>
+                        <div style={{ textAlign:"right" }}>
+                          <div style={{ fontWeight:800, fontSize:14, color:"#f1f5f9" }}>{fmtUSD(pos.currentValue || 0)}</div>
+                          <div style={{ fontSize:11, fontWeight:700, color:(pos.unrealized || 0) >= 0 ? "#00f5c4" : "#ef4444" }}>
+                            {(pos.unrealized || 0) >= 0 ? "▲ +" : "▼ "}{fmtUSD(Math.abs(pos.unrealized || 0))}
+                          </div>
+                        </div>
+                      </div>
+                      <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:6, marginBottom:6, fontSize:10 }}>
+                        <div style={{ color:"#64748b" }}>Qty: <span style={{ color:"#94a3b8" }}>{pos.qty}</span></div>
+                        <div style={{ color:"#64748b" }}>Entry: <span style={{ color:"#94a3b8" }}>{fmtUSD(pos.avgCost || 0)}</span></div>
+                        <div style={{ color:"#64748b" }}>Mark: <span style={{ color:"#94a3b8" }}>{fmtUSD(pos.mark || 0)}</span></div>
+                        <div style={{ color:"#64748b" }}>Risk: <span style={{ color:"#fbbf24" }}>{fmtUSD(pos.exposure || 0)}</span></div>
+                      </div>
+                      <div style={{ height:3, background:"#1e293b", borderRadius:2, marginBottom:10 }}>
+                        <div style={{ width:`${exposurePct}%`, height:"100%", background:underlying?.color || "#fbbf24", borderRadius:2 }} />
+                      </div>
+                      <div style={{ display:"flex", gap:6 }}>
+                        <button onClick={() => { setDerivativeSearch(""); setDerivativeSector("all"); setDerivativeKind("all"); setSelectedDerivativeId(instrumentId); setStrategyTicker(pos.underlyingTicker); setTab("derivatives"); }}
+                          style={{ flex:1, padding:"6px 0", fontSize:9, fontWeight:700, background:"#0f172a", border:`1px solid ${(underlying?.color || "#fbbf24")}44`, color:underlying?.color || "#fbbf24", borderRadius:5, cursor:"pointer", fontFamily:"inherit" }}>
+                          ⬡ GO TO DESK
+                        </button>
+                        <button onClick={() => closeDerivativePosition(instrumentId, 1)} disabled={!canTrade}
+                          style={{ flex:1, padding:"6px 0", fontSize:9, fontWeight:800, background:canTrade ? "#ef444422" : "#0f172a", border:`1px solid ${canTrade ? "#ef4444" : "#1e293b"}`, color:canTrade ? "#ef4444" : "#334155", borderRadius:5, cursor:canTrade ? "pointer" : "not-allowed", fontFamily:"inherit" }}>
+                          CLOSE 1
+                        </button>
+                        <button onClick={() => closeDerivativePosition(instrumentId, pos.qty)} disabled={!canTrade}
+                          style={{ flex:1, padding:"6px 0", fontSize:9, fontWeight:800, background:canTrade ? "#7f1d1d33" : "#0f172a", border:`1px solid ${canTrade ? "#ef4444" : "#1e293b"}`, color:canTrade ? "#fecaca" : "#334155", borderRadius:5, cursor:canTrade ? "pointer" : "not-allowed", fontFamily:"inherit" }}>
+                          CLOSE ALL
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            {/* Transaction History */}
+            <div>
+              <div style={{ fontSize:10, color:"#475569", letterSpacing:"0.12em", marginBottom:12 }}>
+                TRANSACTION HISTORY ({transactions.length} trades)
+              </div>
+              {transactions.length === 0 ? (
+                <div style={{ color:"#334155", fontSize:12 }}>No transactions yet.</div>
+              ) : (
+                <div style={{ background:"#0a0f1e", border:"1px solid #111827", borderRadius:12, overflow:"hidden" }}>
+                  {/* Table header */}
+                  <div style={{ display:"grid",
+                    gridTemplateColumns:"80px 70px 90px 80px 80px 80px 80px 100px",
+                    gap:0, padding:"10px 14px", background:"#060c18",
+                    fontSize:9, color:"#334155", letterSpacing:"0.1em", borderBottom:"1px solid #111827" }}>
+                    {["TIME","TYPE","TICKER","QTY","PRICE","AVG COST","P&L","P&L %"].map(h => (
+                      <div key={h}>{h}</div>
+                    ))}
+                  </div>
+                  <div style={{ maxHeight:400, overflowY:"auto" }}>
+                    {transactions.map((tx, i) => {
+                      const stk = ALL_STOCKS.find(s => s.ticker===tx.ticker);
+                      const isClosed = tx.type==="SELL" || tx.type==="COVER";
+                      const isBearish = tx.type==="SELL" || tx.type==="SHORT";
+                      return (
+                        <div key={tx.id||i} style={{
+                          display:"grid",
+                          gridTemplateColumns:"80px 70px 90px 80px 80px 80px 80px 100px",
+                          gap:0, padding:"10px 14px",
+                          borderBottom:"1px solid #060c18",
+                          background:i%2===0?"#0a0f1e":"#080d18",
+                          fontSize:11, alignItems:"center"
+                        }}>
+                          <div style={{ color:"#475569", fontSize:9 }}>{tx.time}</div>
+                          <div style={{ fontWeight:700,
+                            color:isBearish?"#ef4444":"#00f5c4" }}>
+                            {tx.type}
+                          </div>
+                          <div style={{ display:"flex", flexDirection:"column", gap:2 }}>
+                            <span style={{ color:stk?.color||"#94a3b8", fontWeight:700 }}>{tx.ticker}</span>
+                            <SectorBadge sectorId={tx.sectorId} small />
+                          </div>
+                          <div style={{ color:"#94a3b8" }}>{tx.qty}</div>
+                          <div style={{ color:"#f1f5f9", fontWeight:600 }}>{fmtUSD(tx.price)}</div>
+                          <div style={{ color:"#64748b" }}>
+                            {tx.type==="SELL" ? fmtUSD(tx.avgCostAtSell||0)
+                              : tx.type==="COVER" ? fmtUSD(tx.avgCostAtCover||0)
+                              : tx.type==="SHORT" ? fmtUSD(tx.avgCostAtShort||tx.price)
+                              : fmtUSD(tx.avgCostAtBuy||tx.price)}
+                          </div>
+                          <div style={{ color:isClosed?(tx.gain>=0?"#00f5c4":"#ef4444"):"#475569", fontWeight:700 }}>
+                            {isClosed ? (tx.gain>=0?"+":"")+fmtUSD(tx.gain||0) : "—"}
+                          </div>
+                          <div style={{ color:isClosed?(tx.gainPct>=0?"#00f5c4":"#ef4444"):"#475569", fontWeight:700 }}>
+                            {isClosed ? (tx.gainPct>=0?"+":"")+fmt(tx.gainPct||0)+"%" : "—"}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {/* Realized P&L summary */}
+                  {analytics.totalRealized !== 0 && (
+                    <div style={{ padding:"10px 14px", borderTop:"1px solid #111827",
+                      display:"flex", justifyContent:"space-between", alignItems:"center",
+                      background:"#060c18" }}>
+                      <span style={{ fontSize:10, color:"#475569" }}>
+                        {transactions.filter(t => (t.type === "SELL" || t.type === "COVER") && calcClosedTradeGain(t) > 0).length}W / {transactions.filter(t => (t.type === "SELL" || t.type === "COVER") && calcClosedTradeGain(t) <= 0).length}L on {transactions.filter(t=>t.type==="SELL" || t.type==="COVER").length} closed trades
+                      </span>
+                      <span style={{ fontSize:12, fontWeight:800,
+                        color:transactions.filter(t => t.type === "SELL" || t.type === "COVER").reduce((sum, trade) => sum + calcClosedTradeGain(trade), 0) >= 0 ? "#00f5c4" : "#ef4444" }}>
+                        Stock Realized P&L: {(() => {
+                          const stockRealized = transactions.filter(t => t.type === "SELL" || t.type === "COVER").reduce((sum, trade) => sum + calcClosedTradeGain(trade), 0);
+                          return `${stockRealized >= 0 ? "+" : ""}${fmtUSD(stockRealized)}`;
+                        })()}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div style={{ marginTop:20 }}>
+              <div style={{ fontSize:10, color:"#475569", letterSpacing:"0.12em", marginBottom:12 }}>
+                DERIVATIVE BLOTTER ({derivativeTransactions.length} trades)
+              </div>
+              {derivativeTransactions.length === 0 ? (
+                <div style={{ color:"#334155", fontSize:12 }}>No derivative trades yet.</div>
+              ) : (
+                <div style={{ background:"#0a0f1e", border:"1px solid #111827", borderRadius:12, overflow:"hidden" }}>
+                  <div style={{ display:"grid", gridTemplateColumns:"80px 90px 110px 80px 80px 90px 80px 90px", gap:0, padding:"10px 14px", background:"#060c18", fontSize:9, color:"#334155", letterSpacing:"0.1em", borderBottom:"1px solid #111827" }}>
+                    {["TIME","TYPE","UNDERLYING","QTY","PRICE","ENTRY","P&L","P&L %"].map(head => <div key={head}>{head}</div>)}
+                  </div>
+                  <div style={{ maxHeight:300, overflowY:"auto" }}>
+                    {derivativeTransactions.map((tx, index) => {
+                      const isClose = tx.type === "DERIV_CLOSE" || tx.type === "DERIV_EXPIRE";
+                      return (
+                        <div key={tx.id || index} style={{ display:"grid", gridTemplateColumns:"80px 90px 110px 80px 80px 90px 80px 90px", gap:0, padding:"10px 14px", borderBottom:"1px solid #060c18", background:index % 2 === 0 ? "#0a0f1e" : "#080d18", fontSize:11, alignItems:"center" }}>
+                          <div style={{ color:"#475569", fontSize:9 }}>{tx.time}</div>
+                          <div style={{ color:isClose ? "#ef4444" : "#38bdf8", fontWeight:700 }}>
+                            {tx.type.replace("DERIV_", "")}{tx.side ? ` ${tx.side.toUpperCase()}` : ""}
+                          </div>
+                          <div style={{ display:"flex", flexDirection:"column", gap:2 }}>
+                            <span style={{ color:"#f1f5f9", fontWeight:700 }}>{tx.underlyingTicker}</span>
+                            <span style={{ color:"#475569", fontSize:9 }}>{tx.label}</span>
+                          </div>
+                          <div style={{ color:"#94a3b8" }}>{tx.qty}</div>
+                          <div style={{ color:"#f1f5f9", fontWeight:600 }}>{fmtUSD(tx.price || 0)}</div>
+                          <div style={{ color:"#64748b" }}>{fmtUSD(tx.avgCostAtOpen || tx.price || 0)}</div>
+                          <div style={{ color:isClose ? ((tx.gain || 0) >= 0 ? "#00f5c4" : "#ef4444") : "#475569", fontWeight:700 }}>
+                            {isClose ? ((tx.gain || 0) >= 0 ? "+" : "") + fmtUSD(tx.gain || 0) : "—"}
+                          </div>
+                          <div style={{ color:isClose ? ((tx.gainPct || 0) >= 0 ? "#00f5c4" : "#ef4444") : "#475569", fontWeight:700 }}>
+                            {isClose ? `${(tx.gainPct || 0) >= 0 ? "+" : ""}${fmt(tx.gainPct || 0)}%` : "—"}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ── LEADERBOARD TAB ── */}
+        {tab === "leaderboard" && (
+          <div style={{ maxWidth:700 }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
+              <div style={{ fontSize:10, color:"#475569", letterSpacing:"0.1em" }}>
+                COMPETITION LEADERBOARD · R{roundNum}/{TOTAL_ROUNDS}
+              </div>
+              <div style={{ fontSize:9, color:"#334155" }}>
+                {gamePhase === "ended" ? "Final 105-point composite score" : "Live rank by net equity"}
+              </div>
+            </div>
+            <LeaderboardPanel entries={sharedLB} teams={teams} initCash={initCash}
+              highlight={currentTeam?.name} showDetail mode={gamePhase === "ended" ? "final" : "live"} />
+          </div>
+        )}
+
+        {/* ── NEWS TAB ── */}
+        {tab === "news" && (
+          <div style={{ maxWidth:640 }}>
+            <div style={{ fontSize:10, color:"#475569", letterSpacing:"0.12em", marginBottom:14 }}>
+              TEAM NEWSWIRE · ROUND-WISE DISRUPTIONS & MARKET UPDATES
+            </div>
+            {news.length === 0 ? (
+              <div style={{ color:"#334155", fontSize:12 }}>Round briefings, disruptions, and ticker news will appear here.</div>
+            ) : newsRoundGroups.map(([roundKey, items]) => (
+              <div key={roundKey} style={{ marginBottom:22 }}>
+                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
+                  <div style={{ fontSize:10, color:"#94a3b8", letterSpacing:"0.12em", fontWeight:800 }}>
+                    {roundKey === "general" ? "GENERAL MARKET FEED" : `ROUND ${roundKey}`}
+                  </div>
+                  <div style={{ fontSize:9, color:"#334155" }}>
+                    {items.length} item{items.length === 1 ? "" : "s"}
+                  </div>
+                </div>
+                <div style={{ background:"#060c18", border:"1px solid #111827", borderRadius:12, overflow:"hidden" }}>
+                  {items.map((n, i) => {
+                    const stk = ALL_STOCKS.find(s => s.ticker === n.ticker);
+                    const tone = n.sentiment === "bull"
+                      ? "#00f5c4"
+                      : n.sentiment === "bear"
+                        ? "#ef4444"
+                        : "#38bdf8";
+                    return (
+                      <div key={`${roundKey}-${n.ticker}-${n.time || i}-${i}`} style={{
+                        borderLeft:`3px solid ${tone}`,
+                        padding:"12px 14px 14px 12px",
+                        borderBottom:i === items.length - 1 ? "none" : "1px solid #0f172a",
+                        background:i % 2 === 0 ? "#0a0f1e" : "#080d18",
+                      }}>
+                        <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:5, flexWrap:"wrap" }}>
+                          {!n.hideTicker && (
+                            <span style={{ color:stk?.color||"#94a3b8", fontWeight:800 }}>{n.ticker}</span>
+                          )}
+                          {!n.hideTicker && n.sectorId && <SectorBadge sectorId={n.sectorId} small />}
+                          {n.tag && (
+                            <span style={{ fontSize:8, padding:"1px 6px", borderRadius:4,
+                              background:"#0f172a", border:"1px solid #1e293b", color:"#94a3b8",
+                              letterSpacing:"0.08em" }}>
+                              {n.tag}
+                            </span>
+                          )}
+                          <span style={{ color:"#475569", fontSize:10 }}>{n.time}</span>
+                        </div>
+                        <div style={{ fontSize:13, color:"#e2e8f0", lineHeight:1.5, fontWeight:500 }}>{n.headline}</div>
+                        {n.detail && <div style={{ fontSize:11, color:"#64748b", marginTop:6, lineHeight:1.5 }}>{n.detail}</div>}
+                        {Array.isArray(n.playerClues) && n.playerClues.length > 0 && (
+                          <div style={{ marginTop:8, display:"grid", gap:5 }}>
+                            {n.playerClues.slice(0, 3).map((clue, clueIndex) => (
+                              <div key={`${clueIndex}:${clue}`} style={{ display:"flex", gap:7, fontSize:10, color:"#94a3b8", lineHeight:1.5 }}>
+                                <span style={{ color:"#38bdf8", fontWeight:800, flexShrink:0 }}>{clueIndex + 1}.</span>
+                                <span>{clue}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {n.macroQuestion && (
+                          <div style={{ marginTop:8, padding:"8px 10px", background:"#0f172a", border:"1px solid #1e293b", borderRadius:8 }}>
+                            <div style={{ fontSize:8, color:"#fbbf24", fontWeight:800, letterSpacing:"0.12em", marginBottom:4 }}>
+                              TEAM CHALLENGE
+                            </div>
+                            <div style={{ fontSize:10, color:"#e5e7eb", lineHeight:1.6 }}>{n.macroQuestion}</div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+
+
+// ─── BROADCAST INLINE (avoiding hook-in-callback issue) ───────────────────────
+function ManualDisruption({ stocks, prices, onPublish }) {
+  const empty = () => ({ ticker: stocks[0]?.ticker || "", impact: 15, headline: "", detail: "" });
+  const [entries, setEntries] = useState([empty()]);
+  const [publishing, setPublishing] = useState(false);
+  const [published, setPublished] = useState(false);
+
+  const upd = (i, field, val) =>
+    setEntries(prev => prev.map((e, idx) => idx === i ? { ...e, [field]: val } : e));
+
+  const add    = () => setEntries(prev => [...prev, empty()]);
+  const remove = i  => setEntries(prev => prev.filter((_, idx) => idx !== i));
+
+  async function handlePublish() {
+    const valid = entries.filter(e => e.ticker && e.headline.trim());
+    if (!valid.length) return;
+    setPublishing(true);
+    const events = valid.map(e => ({
+      ticker:   e.ticker,
+      headline: e.headline.trim(),
+      detail:   e.detail.trim(),
+      impact:   Number(e.impact) || 0,
+    }));
+    await onPublish(events);
+    setPublishing(false);
+    setPublished(true);
+    setTimeout(() => setPublished(false), 3000);
+  }
+
+  const inputStyle = {
+    width:"100%", padding:"7px 9px", background:"#020817",
+    border:"1px solid #1e293b", color:"#f1f5f9",
+    borderRadius:5, fontFamily:"inherit", fontSize:11, outline:"none"
+  };
+  const labelStyle = { fontSize:8, color:"#475569", letterSpacing:"0.1em", marginBottom:3 };
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+      {entries.map((entry, i) => {
+        const stk = stocks.find(s => s.ticker === entry.ticker);
+        const isPos = Number(entry.impact) >= 0;
+        return (
+          <div key={i} style={{
+            background:"#0a0f1e",
+            border:`1px solid ${isPos ? "#00f5c430" : "#ef444430"}`,
+            borderLeft:`3px solid ${isPos ? "#00f5c4" : "#ef4444"}`,
+            borderRadius:8, padding:"10px 12px"
+          }}>
+            {/* Row 1: Ticker + Impact */}
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr auto", gap:6, marginBottom:8 }}>
+              <div>
+                <div style={labelStyle}>TICKER</div>
+                <select value={entry.ticker}
+                  onChange={e => upd(i, "ticker", e.target.value)}
+                  style={{ ...inputStyle, cursor:"pointer" }}>
+                  {stocks.map(s => (
+                    <option key={s.ticker} value={s.ticker}
+                      style={{ background:"#0f172a" }}>
+                      {s.ticker} — {s.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <div style={labelStyle}>IMPACT %</div>
+                <div style={{ display:"flex", gap:4 }}>
+                  {[-30,-15,-10,10,15,30].map(v => (
+                    <button key={v} onClick={() => upd(i,"impact",v)}
+                      style={{
+                        flex:1, padding:"5px 0", fontSize:9, fontWeight:800,
+                        background: entry.impact===v ? (v>0?"#00f5c422":"#ef444422") : "#0f172a",
+                        border:`1px solid ${entry.impact===v ? (v>0?"#00f5c4":"#ef4444") : "#1e293b"}`,
+                        color: v>0?"#00f5c4":"#ef4444",
+                        borderRadius:4, cursor:"pointer", fontFamily:"inherit"
+                      }}>
+                      {v>0?"+":""}{v}%
+                    </button>
+                  ))}
+                </div>
+                <input type="number" value={entry.impact}
+                  onChange={e => upd(i,"impact",e.target.value)}
+                  style={{ ...inputStyle, marginTop:4 }}
+                  placeholder="Custom %…"/>
+              </div>
+              <div style={{ display:"flex", alignItems:"flex-end", paddingBottom:2 }}>
+                {entries.length > 1 && (
+                  <button onClick={() => remove(i)}
+                    style={{ width:28, height:28, background:"#7f1d1d", border:"none",
+                      borderRadius:5, color:"#fca5a5", cursor:"pointer",
+                      fontSize:13, fontFamily:"inherit" }}>✕</button>
+                )}
+              </div>
+            </div>
+            {/* Row 2: Headline */}
+            <div style={{ marginBottom:6 }}>
+              <div style={labelStyle}>HEADLINE <span style={{ color:"#334155" }}>(max 15 words)</span></div>
+              <input value={entry.headline}
+                onChange={e => upd(i,"headline",e.target.value)}
+                placeholder={isPos
+                  ? `${stk?.name || entry.ticker} surges on major breakthrough…`
+                  : `${stk?.name || entry.ticker} crashes amid crisis…`}
+                style={{ ...inputStyle, border:`1px solid ${entry.headline ? "#334155" : "#1e293b"}` }}
+              />
+            </div>
+            {/* Row 3: Detail */}
+            <div>
+              <div style={labelStyle}>DETAIL <span style={{ color:"#334155" }}>(optional context)</span></div>
+              <input value={entry.detail}
+                onChange={e => upd(i,"detail",e.target.value)}
+                placeholder="One sentence of context for players…"
+                style={inputStyle}
+              />
+            </div>
+          </div>
+        );
+      })}
+
+      {/* Add entry */}
+      <button onClick={add}
+        style={{ padding:"7px", background:"#0f172a",
+          border:"1px solid #1e293b", borderRadius:6,
+          color:"#475569", cursor:"pointer", fontFamily:"inherit",
+          fontSize:10, fontWeight:700 }}>
+        + ADD ANOTHER STOCK
+      </button>
+
+      {/* Publish */}
+      <button onClick={handlePublish} disabled={publishing || !entries.some(e=>e.headline.trim())}
+        style={{
+          padding:"10px", fontWeight:800, fontSize:11, letterSpacing:"0.06em",
+          background: published
+            ? "linear-gradient(135deg,#166534,#15803d)"
+            : "linear-gradient(135deg,#7f1d1d,#dc2626)",
+          border:"none", borderRadius:7, color:"#fff",
+          cursor: publishing ? "wait" : "pointer", fontFamily:"inherit",
+          opacity: !entries.some(e=>e.headline.trim()) ? 0.4 : 1,
+          transition:"all 0.3s"
+        }}>
+        {published ? "✓ DISRUPTION PUBLISHED!" : publishing ? "⏳ PUBLISHING…" : "🚨 PUBLISH DISRUPTION NEWS"}
+      </button>
+    </div>
+  );
+}
+
+
+function BroadcastInline({ onSend }) {
+  const [msg, setMsg] = useState("");
+  const QUICK = [
+    "⚠️ Market volatility ahead — trade carefully!",
+    "🏆 Final 3 minutes! Lock in your positions.",
+    "📊 Leaderboard updated — check your rank!",
+    "🔔 Disruption news incoming — watch for shocks!",
+    "🚨 Round ending soon — review your portfolio!",
+  ];
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:7 }}>
+      <textarea value={msg} onChange={e=>setMsg(e.target.value)} placeholder="Custom message…" rows={3}
+        style={{ width:"100%", padding:"9px 11px", background:"#0f172a", border:"1px solid #1e293b",
+          color:"#f1f5f9", borderRadius:7, fontFamily:"inherit", fontSize:12, resize:"vertical" }} />
+      <button onClick={()=>{if(msg.trim()){onSend(msg.trim());setMsg("");}}}
+        style={{ padding:"9px", background:"#0c4a6e", border:"1px solid #38bdf8", borderRadius:6,
+          color:"#38bdf8", cursor:"pointer", fontFamily:"inherit", fontSize:11, fontWeight:700 }}>
+        📢 SEND BROADCAST
+      </button>
+      <div style={{ fontSize:9, color:"#334155", marginTop:2, marginBottom:2 }}>QUICK ALERTS</div>
+      {QUICK.map(q => (
+        <button key={q} onClick={()=>onSend(q)}
+          style={{ padding:"7px 10px", background:"#0f172a", border:"1px solid #1e293b",
+            borderRadius:5, color:"#94a3b8", cursor:"pointer",
+            textAlign:"left", fontFamily:"inherit", fontSize:10 }}>{q}</button>
+      ))}
+    </div>
+  );
+}

@@ -1,0 +1,409 @@
+BULL PIT
+Game Rulebook and GM Guide
+Version: March 30, 2026
+
+======================================================================
+1. GAME OVERVIEW
+======================================================================
+
+Bull Pit is a live team trading game built around an America-focused
+macro storyline. Teams trade stocks, shorts, futures, options, and
+defined-risk hedge packages across seven connected rounds.
+
+Core format
+- Up to 60 teams
+- Starting capital: $100,000 per team
+- Seven rounds with no capital reset
+- Carry model: gains, losses, borrow cost, and funding drag carry forward
+- Live leaderboard during play; final winner decided by locked scorecard
+
+What makes this version different
+- Disruptions are inference-driven. The player-facing disruption screen
+  does not directly reveal the affected sectors or stocks.
+- Teams must infer exposure from the macro bulletin, price action, news,
+  order flow, and their own economic reasoning.
+- After every round, each team gets a private 5-second derivative
+  settlement window showing only that team's expired derivative results.
+
+
+======================================================================
+2. WIN CONDITION
+======================================================================
+
+The final winner is the team with the highest locked composite score
+after Round 7. During the game, teams are ranked live by net equity, but
+final placement uses the 105-point scorecard plus tie-breakers.
+
+
+======================================================================
+3. WHAT TEAMS CAN DO
+======================================================================
+
+Teams can:
+- Buy stocks
+- Sell long positions
+- Short stocks
+- Cover shorts
+- Trade round-expiry futures
+- Trade round-expiry calls and puts
+- Use Hedge and Strategy Builder packages such as protective puts,
+  collars, spreads, and iron condors when their buying power allows it
+- Answer prediction market questions when the GM opens them
+
+Important trade mechanics
+- Long buys consume cash
+- Short sales lock proceeds as restricted collateral
+- Borrow and funding costs accumulate across rounds
+- Trades fill with a spread that widens in stress rounds
+- Margin rules tighten in later rounds
+
+
+======================================================================
+4. ROUND FLOW
+======================================================================
+
+Every round follows the same broad structure:
+
+1. Buffer opener
+- The next round begins with a full-screen macro bulletin.
+- Players see the storyline, clues, and challenge question if one is
+  attached.
+- They do not see direct ticker or sector hints on this screen.
+
+2. Team inference phase
+- Teams interpret the bulletin and decide where the market impact is most
+  likely to land.
+- They should use price movement, news, order flow, and the round regime
+  to confirm or reject their thesis.
+
+3. Live trading round
+- Teams trade throughout the round.
+- Silent storyline beats may post into News mid-round without a full-screen
+  interruption.
+
+4. Round expiry and settlement
+- At round end, contracts expiring that round are settled automatically.
+- Each team sees a private 5-second settlement window showing:
+  - contract label
+  - long or short side
+  - quantity
+  - settlement price
+  - realized value
+  - net P&L
+  - cash effect
+
+5. Transition to next round
+- After the settlement window, the normal inter-round buffer continues.
+- The next macro bulletin then frames the incoming round.
+
+
+======================================================================
+5. DISRUPTIONS AND STORYLINE RULES
+======================================================================
+
+Player-facing disruptions are intentionally indirect.
+
+What players do see
+- Headline
+- Macro summary
+- Inference clues
+- Optional challenge question
+
+What players do not see
+- Direct stock list
+- Direct sector list
+- Explicit "winners" and "losers" labels
+
+GM principle
+- Do not over-explain. Let teams do the inference work.
+- The challenge is not reading ticker hints. The challenge is connecting
+  macro cause to market consequence.
+
+
+======================================================================
+6. ROUND GUIDE
+======================================================================
+
+Round 1: The Hawk Returns
+- Volatility: 0.80x
+- Initial margin: 40%
+- Maintenance margin: 35%
+- Borrow rate: 0.5%
+- Funding rate: 0.3%
+- Spread multiplier: 1.00x
+- Theme: A surprise Fed shock resets the cost of capital across America.
+- GM note: Open with the rate-hike shock and remind teams that there is no
+  reset, only margin, borrow cost, and funding stress.
+
+Round 2: Silicon Iron Curtain
+- Volatility: 1.10x
+- Initial margin: 45%
+- Maintenance margin: 40%
+- Borrow rate: 0.7%
+- Funding rate: 0.5%
+- Spread multiplier: 1.10x
+- Theme: Washington hardens industrial policy and export controls.
+- GM note: Let teams infer winners and losers from the event rather than
+  naming tickers on screen.
+
+Round 3: Oil Strait Crisis
+- Volatility: 1.35x
+- Sentiment lock: Bear
+- Initial margin: 55%
+- Maintenance margin: 50%
+- Borrow rate: 1.2%
+- Funding rate: 0.9%
+- Spread multiplier: 1.35x
+- Theme: A shipping shock drives oil higher and liquidity lower.
+- GM note: This is the first real stress test. Over-leverage should hurt.
+
+Round 4: Debt Ceiling Roulette
+- Volatility: 1.25x
+- Initial margin: 50%
+- Maintenance margin: 45%
+- Borrow rate: 1.0%
+- Funding rate: 0.8%
+- Spread multiplier: 1.25x
+- Theme: Treasury stress and brinkmanship rattle funding markets.
+- GM note: Reward balance-sheet discipline and optionality.
+
+Round 5: Election-Year America
+- Volatility: 1.15x
+- Leaderboard hidden: Yes
+- Initial margin: 52%
+- Maintenance margin: 46%
+- Borrow rate: 1.1%
+- Funding rate: 0.9%
+- Spread multiplier: 1.15x
+- Theme: Subsidies, regulation, and election rhetoric scramble leadership.
+- GM note: Keep the board hidden and force conviction under uncertainty.
+
+Round 6: Credit Crack
+- Volatility: 1.70x
+- Initial margin: 60%
+- Maintenance margin: 55%
+- Borrow rate: 1.6%
+- Funding rate: 1.3%
+- Spread multiplier: 1.50x
+- Theme: Credit spreads blow out and recession fear hardens.
+- GM note: Weak balance sheets and crowded leverage should get punished.
+
+Round 7: America Reprices
+- Volatility: 2.00x
+- Initial margin: 65%
+- Maintenance margin: 60%
+- Borrow rate: 2.0%
+- Funding rate: 1.7%
+- Spread multiplier: 1.60x
+- Theme: Growth, inflation, geopolitics, and policy credibility reprice at
+  once.
+- GM note: The finale should feel like a repricing of the whole game.
+
+
+======================================================================
+7. DERIVATIVES AND HEDGE PACKAGES
+======================================================================
+
+Every listed Bull Pit stock has round-expiry derivatives.
+
+Available instruments
+- Futures
+- Calls
+- Puts
+
+General principles
+- Futures settle to mark; P&L flows through cash
+- Options settle to intrinsic value at expiry
+- Long options can expire worthless
+- Short options can create negative cash settlements
+
+Hedge and Strategy Builder
+- Protective Put
+- Collar
+- Vertical spreads
+- Iron Condor
+
+Execution rule
+- Multi-leg hedge packages execute as a single server-side package, not as
+  separate naked-leg trades.
+- Defined-risk packages use package-level risk for validation.
+
+Settlement window rule
+- After each round, the team-specific 5-second settlement panel appears
+  before the normal next-round disruption view.
+- This panel is private to each team.
+
+
+======================================================================
+8. MARGIN, BORROW, AND FUNDING
+======================================================================
+
+Short proceeds
+- Cash raised from shorting is restricted collateral, not free cash.
+
+Margin requirement
+- Each round has its own initial and maintenance margin.
+- Buying power depends on net equity and gross exposure.
+
+Margin call
+- If net equity falls below maintenance margin, a warning window begins.
+- Grace period: 12 seconds
+
+Auto-deleveraging
+- If the team does not restore maintenance margin in time, the game closes
+  the largest gross exposures first until the account is compliant again.
+
+Carry model
+- There is no forced equal-cash restart between rounds.
+- Borrow cost and funding drag continue to compound.
+
+
+======================================================================
+9. PREDICTION MARKET
+======================================================================
+
+At selected times, the GM can open a prediction question tied to the
+round's macro concept.
+
+Rules
+- Teams answer once per question
+- Correct answers earn a capital bonus
+- The feature rewards economic reasoning, not speed alone
+
+GM guidance
+- Open the prediction market during the buffer when you want teams engaged
+  but not yet trading
+- Keep the reveal clean and brief
+
+
+======================================================================
+10. POWER-UP CARDS
+======================================================================
+
+The GM has five one-time-use intervention cards.
+
+1. Tsunami
+- Entire market crashes 15% instantly
+
+2. Moon Shot
+- One random stock surges 40% for 60 seconds
+
+3. Circuit Breaker
+- Market-wide halt for 45 seconds
+
+4. Sector Rotation
+- One sector rallies 12% while another drops 12%
+
+5. Political Shock
+- Fires a macro-economic political event mid-round
+
+Usage principle
+- Power-ups should sharpen the narrative, not replace it.
+
+
+======================================================================
+11. SCORING
+======================================================================
+
+Final placement uses a 105-point scorecard.
+
+Tier 1: Performance (35 pts)
+- Net Return: 20 pts
+- Alpha vs BALL: 15 pts
+
+Tier 2: Capital Discipline (40 pts)
+- Drawdown Control: 15 pts
+- Margin Discipline: 15 pts
+- Funding Efficiency: 10 pts
+
+Tier 3: Market Craft (30 pts)
+- Crisis Alpha: 10 pts
+- Win Rate: 5 pts
+- Sector Diversification: 5 pts
+- Prediction Accuracy: 5 pts
+- Prediction Participation: 5 pts
+
+Scorecard principle
+- Live leaderboard is not the final result.
+- Final scoring rewards return quality, risk control, and macro judgment.
+
+
+======================================================================
+12. TIEBREAKERS
+======================================================================
+
+Tie-breakers apply in this order:
+1. Higher ending net equity
+2. Higher crisis alpha
+3. Fewer margin breaches
+4. Lower max drawdown
+5. Earlier last-trade timestamp
+
+
+======================================================================
+13. GM OPERATING CHECKLIST
+======================================================================
+
+Before the event
+- Confirm all teams can log in
+- Confirm the central display is visible
+- Confirm the GM controls are working
+- Confirm the derivatives tab and strategy builder are live
+
+At the start of each round
+- Announce the round name and macro theme
+- Remind teams of any special rule changes
+- Do not reveal the exact stocks or sectors impacted by the disruption
+
+During the round
+- Let silent storyline beats land through News
+- Avoid adding random generic shocks unless you want a deliberate power-up
+- Watch for margin stress and confusion around settlement
+
+At the end of each round
+- Let derivatives settle
+- Allow the 5-second team-specific settlement window to play
+- Move into the next round buffer and bulletin
+
+For Round 5
+- Keep the leaderboard hidden on all public displays
+
+For the final round
+- Let the settlement window play before teams fully absorb the ending board
+
+
+======================================================================
+14. PLAYER QUICK REFERENCE
+======================================================================
+
+Read the disruption like a macro clue, not a stock tip.
+
+Ask:
+- Which business models gain pricing power here?
+- Which balance sheets get stressed?
+- Which sectors depend on rates, energy, policy, logistics, or funding?
+- Does price action confirm the thesis?
+
+Risk reminders
+- Shorts use collateral
+- Later rounds punish leverage harder
+- A hedge package may be safer than a naked directional position
+- Round-expiry derivatives settle automatically
+
+Best practice
+- Enter with a thesis
+- Size with discipline
+- Re-check margin after every major move
+- Use the settlement window to learn what actually paid off
+
+
+======================================================================
+15. FILES
+======================================================================
+
+Source text:
+/Users/anushbaidya/Desktop/bullpit/docs/bullpit-rulebook.txt
+
+Printable PDF:
+/Users/anushbaidya/Desktop/bullpit/docs/bullpit-rulebook.pdf
+

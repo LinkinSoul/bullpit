@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bull Pit</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #020817; }
+    #loading {
+      position: fixed; inset: 0; background: #020817;
+      display: flex; align-items: center; justify-content: center;
+      flex-direction: column; gap: 16px;
+      font-family: monospace; color: #475569; font-size: 14px;
+    }
+    #loading .logo {
+      font-size: 48px; font-weight: 900; color: #00f5c4;
+      letter-spacing: 0.1em;
+    }
+  </style>
+</head>
+<body>
+  <div id="loading">
+    <div class="logo">BULL PIT</div>
+    <div>Loading simulation...</div>
+  </div>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+  <script>
+    (() => {
+      let authToken = "";
+
+      const authHeaders = (extra = {}) => (
+        authToken
+          ? { ...extra, Authorization: `Bearer ${authToken}` }
+          : extra
+      );
+
+      const setToken = (token) => {
+        authToken = token || "";
+      };
+
+      window.storage = {
+        setToken,
+        clearToken() {
+          setToken("");
+        },
+        async get(key) {
+          try {
+            const r = await fetch(`/store?key=${encodeURIComponent(key)}`, {
+              headers: authHeaders(),
+            });
+            if (!r.ok) return null;
+            const d = await r.json();
+            return d.value !== null ? { value: d.value } : null;
+          } catch { return null; }
+        },
+        async set(key, value) {
+          try {
+            const r = await fetch("/store", {
+              method: "POST",
+              headers: authHeaders({ "Content-Type": "application/json" }),
+              body: JSON.stringify({ key, value }),
+            });
+            if (!r.ok) return null;
+            return { value };
+          } catch { return null; }
+        },
+        async delete(key) {
+          try {
+            const r = await fetch(`/store?key=${encodeURIComponent(key)}`, {
+              method: "DELETE",
+              headers: authHeaders(),
+            });
+            if (!r.ok) return null;
+            return { deleted: true };
+          } catch { return null; }
+        },
+        async list(prefix) {
+          try {
+            const r = await fetch(`/store?prefix=${encodeURIComponent(prefix || "")}`, {
+              headers: authHeaders(),
+            });
+            if (!r.ok) return { keys: [] };
+            const d = await r.json();
+            return { keys: d.keys };
+          } catch { return { keys: [] }; }
+        },
+      };
+
+      window.auth = {
+        async request(path, options = {}) {
+          const headers = authHeaders(options.headers || {});
+          return fetch(path, { ...options, headers });
+        },
+        async loginTeam(name, password) {
+          try {
+            const r = await fetch("/auth/team", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ name, password }),
+            });
+            const d = await r.json();
+            if (!r.ok || !d?.token) return d;
+            setToken(d.token);
+            return d;
+          } catch {
+            return { ok: false, error: "Unable to reach the server." };
+          }
+        },
+        async loginGM(password) {
+          try {
+            const r = await fetch("/auth/gm", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ password }),
+            });
+            const d = await r.json();
+            if (!r.ok || !d?.token) return d;
+            setToken(d.token);
+            return d;
+          } catch {
+            return { ok: false, error: "Unable to reach the server." };
+          }
+        },
+        logout() {
+          setToken("");
+        },
+      };
+    })();
+  </script>
+
+  <script type="text/javascript" data-presets="react" src="/stock-market-sim-v6.js?v=20260330-06"></script>
+
+  <script>
+    // Wait for the JSX to load, then mount the React app
+    window.addEventListener("load", () => {
+      document.getElementById("loading").style.display = "none";
+      const root = document.getElementById("root");
+      if (typeof App !== "undefined") {
+        ReactDOM.createRoot(root).render(React.createElement(App));
+      } else {
+        root.innerHTML = '<div style="color:red;padding:40px;font-family:monospace">Error: App not found. Check the browser console (F12) for details.</div>';
+      }
+    });
+  </script>
+</body>
+</html>
